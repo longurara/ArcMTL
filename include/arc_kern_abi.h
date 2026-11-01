@@ -20,6 +20,7 @@
 #define ARC_XE_FN_PIN_SURFACE_GGTT          "arcPinSurfaceGgtt"
 #define ARC_XE_FN_UNPIN_SURFACE_GGTT        "arcUnpinSurfaceGgtt"
 #define ARC_XE_FN_GET_UTILIZATION           "arcGetGpuUtilization"
+#define ARC_XE_FN_NEW_ACCEL_CLIENT          "arcXeNewAccelClient"
 
 struct ArcScanoutInfoReq {
     uint32_t version;

@@ -10,6 +10,7 @@
 #include <kern/clock.h>
 
 OSDefineMetaClassAndStructors(ArcXeUserClient, IOUserClient)
+OSDefineMetaClassAndStructors(IOAccelArcXeBridge, ArcXeUserClient)
 
 /* ============================================================================
  * 1. Client Lifecycle & Resource Cleanup
@@ -31,8 +32,18 @@ bool ArcXeUserClient::start(IOService *provider)
 {
     if (!IOUserClient::start(provider))
         return false;
-    fOwner = OSDynamicCast(ArcXeService, provider);
+    if (!fOwner)
+        fOwner = OSDynamicCast(ArcXeService, provider);
     return fOwner != nullptr;
+}
+
+bool IOAccelArcXeBridge::start(IOService *provider)
+{
+    if (!fOwner)
+        fOwner = OSDynamicCast(ArcXeService, provider);
+    if (!fOwner)
+        return false;
+    return IOUserClient::start(provider);
 }
 
 void ArcXeUserClient::releaseUserPtrBinds(uint32_t vmId, uint64_t gpuVa, uint64_t rangeSize, bool allInVm)

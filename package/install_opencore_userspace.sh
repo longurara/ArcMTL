@@ -84,6 +84,11 @@ echo ""
 echo "[1/5] Checking running ArcXe & NullMoth kexts in kernel..."
 kmutil showloaded --list-only 2>/dev/null | grep -E "com\.arc\.|com\.nullmoth\." || \
     kextstat 2>/dev/null | grep -E "com\.arc\.|com\.nullmoth\." || true
+LATEST_WS_CRASH="$(ls -1t /Library/Logs/DiagnosticReports/WindowServer*.ips 2>/dev/null | head -n 1 || true)"
+if [ -n "$LATEST_WS_CRASH" ]; then
+    echo "      [diag] Most recent WindowServer report: $LATEST_WS_CRASH"
+    grep -E '"termination"|"exception"|"asi"|"faultingThread"' "$LATEST_WS_CRASH" 2>/dev/null | head -n 4 || true
+fi
 
 echo ""
 echo "[2/5] Installing GuC v70 firmware & diagnostic tools..."

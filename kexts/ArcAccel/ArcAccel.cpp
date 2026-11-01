@@ -43,6 +43,7 @@
 #include "arcaccel_stubs.h"
 
 #include "../../include/arc_regs_mtl.h"
+#include "../../include/arc_uapi.h"
 #include "../../include/arc_kern_abi.h"
 
 #define AALOG(fmt, ...) do { kprintf("ArcAccel: " fmt "\n", ##__VA_ARGS__); IOLog("ArcAccel: " fmt "\n", ##__VA_ARGS__); } while (0)
@@ -193,8 +194,15 @@ public:
 OSDefineMetaClassAndStructors(ArcMemoryMap, IOAccelMemoryMap)
 
 /* ============================================================================
- * 2. ArcAccel (IOGraphicsAccelerator2)
+ * 2. ArcAccel (IOGraphicsAccelerator2) & Sandbox UserClient Carriers
  * ============================================================================ */
+
+static constexpr unsigned kArcCarriers = 32;
+
+class IOAccelArcXeCarrier : public IOService {
+    OSDeclareDefaultStructors(IOAccelArcXeCarrier)
+};
+OSDefineMetaClassAndStructors(IOAccelArcXeCarrier, IOService)
 
 class ArcAccel : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(ArcAccel)
@@ -207,6 +215,10 @@ public:
     ArcDisplayMachine          *fDM                 = nullptr;
     IOBufferMemoryDescriptor   *fStamps             = nullptr;
     IORangeAllocator           *fRanges[32]         = {};
+    IOAccelArcXeCarrier        *fCarriers[kArcCarriers] = {};
+    volatile SInt32             fCarrierNext        = 0;
+    ArcDisplayPipe             *fPipes[kArcMaxFB]   = {};
+    unsigned                    fPipeCount          = 0;
     IOLock                     *fRegLock            = nullptr;
     IONotifier                 *fFBNote             = nullptr;
     OSObject                   *fSavedMetalPlugin   = nullptr;
@@ -219,6 +231,7 @@ public:
     const OSSymbol             *fSymGetScanout      = nullptr;
     const OSSymbol             *fSymFlipSurface     = nullptr;
     const OSSymbol             *fSymPinGgtt         = nullptr;
+    const OSSymbol             *fSymNewClient       = nullptr;
 
     /* 17 Required Pure-Virtual Vendor Overrides on IOGraphicsAccelerator2 */
     uint64_t getStampMemory(unsigned int *countOut) APPLE_KEXT_OVERRIDE {
@@ -293,7 +306,13 @@ public:
 
     void teardownDevice(IOPCIDevice *) APPLE_KEXT_OVERRIDE {}
 
-    OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE    { return OSTypeAlloc(ArcDisplayPipe); }
+    OSObject *newDisplayPipe() APPLE_KEXT_OVERRIDE {
+        ArcDisplayPipe *p = OSTypeAlloc(ArcDisplayPipe);
+        if (p && fPipeCount < kArcMaxFB)
+            fPipes[fPipeCount++] = p;
+        AALOG("newDisplayPipe() -> %p (slot %u)", p, fPipeCount ? (fPipeCount - 1u) : 0u);
+        return p;
+    }
     OSObject *newDisplayMachine() APPLE_KEXT_OVERRIDE {
         ArcDisplayMachine *dm = OSTypeAlloc(ArcDisplayMachine);
         fDM = dm;
@@ -317,31 +336,123 @@ public:
         if (fArcXe && !fArcXe->isInactive())
             return fArcXe;
         OSSafeReleaseNULL(fArcXe);
-        if (!fPCI) return nullptr;
-        if (OSIterator *it = fPCI->getClientIterator()) {
-            while (OSObject *o = it->getNextObject()) {
-                IOService *s = OSDynamicCast(IOService, o);
-                if (s && s->metaCast("ArcXeService") && !s->isInactive()) {
-                    s->retain();
-                    fArcXe = s;
-                    break;
+        if (fPCI) {
+            if (OSIterator *it = fPCI->getClientIterator()) {
+                while (OSObject *o = it->getNextObject()) {
+                    IOService *s = OSDynamicCast(IOService, o);
+                    if (s && s->metaCast("ArcXeService") && !s->isInactive()) {
+                        s->retain();
+                        fArcXe = s;
+                        break;
+                    }
                 }
+                it->release();
             }
-            it->release();
+        }
+        if (!fArcXe) {
+            if (OSDictionary *m = serviceMatching(ARCXE_IOKIT_SERVICE_NAME)) {
+                fArcXe = waitForMatchingService(m, 50ULL * 1000ULL * 1000ULL);
+                m->release();
+            }
         }
         return fArcXe;
     }
 
-    IOService *pipeFramebuffer(const void *pipe, unsigned *idxOut) {
+    /*
+     * Sandbox-Safe UserClient Bridge:
+     * WindowServer (com.apple.WindowServer.sb) and App Sandbox allow opening IOAccel* user clients
+     * on an IOGraphicsAccelerator2 / IOAccelerator service, whereas opening ArcXeService directly is
+     * denied by Seatbelt. Opens with ARC_XE_ACCEL_OPEN_TYPE ('AR' << 16) instantiate IOAccelArcXeBridge
+     * via ArcXeService and attach it to one of our 32 IOAccelArcXeCarrier child services.
+     */
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
+                           IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+        if ((type & 0xFFFF0000u) != ARC_XE_ACCEL_OPEN_TYPE) {
+            return IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
+        }
+        if (!handler)
+            return kIOReturnBadArgument;
+
+        IOService *xe = getArcXeService();
+        if (!xe) {
+            AALOG("newUserClient(0x%x): ArcXeService not found", (unsigned)type);
+            return kIOReturnNotAttached;
+        }
+        if (!fSymNewClient)
+            fSymNewClient = OSSymbol::withCStringNoCopy(ARC_XE_FN_NEW_ACCEL_CLIENT);
+        if (!fSymNewClient)
+            return kIOReturnNoMemory;
+
+        IOUserClient *uc = nullptr;
+        IOReturn rc = xe->callPlatformFunction(
+            fSymNewClient, false,
+            reinterpret_cast<void *>(owningTask),
+            reinterpret_cast<void *>(static_cast<uintptr_t>(type & 0xFFFFu)),
+            &uc, nullptr);
+        if (rc != kIOReturnSuccess || !uc) {
+            AALOG("newUserClient(0x%x): ArcXeService refused bridge client (0x%x)", (unsigned)type, (unsigned)rc);
+            return (rc != kIOReturnSuccess) ? rc : kIOReturnNoResources;
+        }
+
+        IOService *carrier = nullptr;
+        const unsigned startIdx = static_cast<unsigned>(OSIncrementAtomic(&fCarrierNext));
+        for (unsigned i = 0; i < kArcCarriers && !carrier; i++)
+            carrier = fCarriers[(startIdx + i) % kArcCarriers];
+        if (!carrier) {
+            AALOG("newUserClient(0x%x): no IOAccelArcXeCarrier available", (unsigned)type);
+            uc->release();
+            return kIOReturnNoResources;
+        }
+        if (!uc->attach(carrier)) {
+            AALOG("newUserClient(0x%x): attach to carrier failed", (unsigned)type);
+            uc->release();
+            return kIOReturnInternalError;
+        }
+        if (!uc->start(carrier)) {
+            AALOG("newUserClient(0x%x): start on carrier failed", (unsigned)type);
+            uc->detach(carrier);
+            uc->release();
+            return kIOReturnInternalError;
+        }
+
+        AALOGV("newUserClient(0x%x) -> %s attached under ArcAccel carrier",
+               (unsigned)type, uc->getMetaClass()->getClassName());
+        *handler = uc;
+        return kIOReturnSuccess;
+    }
+
+    IOService *pipeFramebuffer(const ArcDisplayPipe *pipe, unsigned *idxOut) {
         if (!pipe) return nullptr;
+        /* 1. Exact pipe object match from newDisplayPipe() creation order (zero offset assumptions) */
+        for (unsigned i = 0; i < fPipeCount && i < kArcMaxFB; i++) {
+            if (fPipes[i] == pipe && fFBs[i]) {
+                if (idxOut) *idxOut = i;
+                return fFBs[i];
+            }
+        }
+        /* 2. IOAccelDisplayPipe internal IOFramebuffer* slot (+0x98) */
         IOService *fb = *reinterpret_cast<IOService *const volatile *>(
                             reinterpret_cast<const uint8_t *>(pipe) + 0x98);
-        if (!fb) return nullptr;
-        for (unsigned i = 0; i < kArcMaxFB; i++) {
-            if (fFBs[i] == fb) {
-                if (idxOut) *idxOut = i;
+        if (fb) {
+            for (unsigned i = 0; i < kArcMaxFB; i++) {
+                if (fFBs[i] == fb) {
+                    if (idxOut) *idxOut = i;
+                    return fb;
+                }
+            }
+            if (fb->metaCast("ArcFB")) {
+                if (idxOut) *idxOut = 0;
                 return fb;
             }
+        }
+        /* 3. Deterministic single-head fallback */
+        if (fFBs[0] && !fFBs[1]) {
+            if (idxOut) *idxOut = 0;
+            return fFBs[0];
+        }
+        if (fFB && !fFBs[1]) {
+            if (idxOut) *idxOut = 0;
+            return fFB;
         }
         return nullptr;
     }
@@ -406,36 +517,51 @@ public:
         fDM->display_mode_did_change(0);
     }
 
+    void recordPublishedFb(IOService *newService) {
+        if (!newService) return;
+        unsigned idx = 0;
+        if (OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex")))
+            idx = num->unsigned32BitValue();
+
+        if (idx < kArcMaxFB) {
+            newService->retain();
+            if (OSCompareAndSwapPtr(nullptr, newService, reinterpret_cast<void *volatile *>(&fFBs[idx]))) {
+                OSBitOrAtomic(1u << idx, &gArcHeadsPublished);
+                if (idx == 0) {
+                    newService->retain();
+                    if (!OSCompareAndSwapPtr(nullptr, newService, reinterpret_cast<void *volatile *>(&fFB)))
+                        newService->release();
+                }
+            } else {
+                newService->release();
+            }
+        }
+    }
+
     unsigned registerPendingLocked(const char *why) {
         if (!fDM) return 0;
         unsigned added = 0;
-        const uint8_t *dm = reinterpret_cast<const uint8_t *>(fDM);
         for (unsigned i = 0; i < kArcMaxFB; i++) {
             IOService *fb = fFBs[i];
             if (!fb) break;
             if (fFBRegistered & (1u << i)) continue;
 
             const unsigned before = fDM->getFramebufferCount();
-            bool alreadyInDm = false;
-            for (unsigned s = 0; s < before && s < 16; s++) {
-                void *existingPipe = *reinterpret_cast<void *const volatile *>(dm + 0x88 + 8 * s);
-                if (existingPipe) {
-                    IOService *pfb = *reinterpret_cast<IOService *const volatile *>(
-                                         reinterpret_cast<const uint8_t *>(existingPipe) + 0x98);
-                    if (pfb == fb) {
-                        alreadyInDm = true;
-                        fFBRegistered |= (1u << i);
-                        gArcHeadsRegistered = fFBRegistered;
-                        gArcHeadsPiped |= (1u << i);
-                        added++;
-                        AALOG("%s: head %u (%s) already bound by family sweep to pipe %u (%p)",
-                              why, i, fb->getName(), s, existingPipe);
-                        break;
-                    }
-                }
-            }
-            if (alreadyInDm)
+            /*
+             * Because ArcFB (IOProbeScore=65000) attaches before ArcAccel (IOProbeScore=40000),
+             * IOGraphicsAccelerator2::start() normally sweeps ArcFB into fDM automatically
+             * (before > i). Recognize family-swept heads directly without relying on private
+             * IOAccelLegacyDisplayMachine ivar offsets that differ between Sequoia and Tahoe.
+             */
+            if (i < before) {
+                fFBRegistered |= (1u << i);
+                gArcHeadsRegistered = fFBRegistered;
+                gArcHeadsPiped |= (1u << i);
+                added++;
+                AALOG("%s: head %u (%s) already bound by family sweep (dm_count=%u, pipes=%u)",
+                      why, i, fb->getName(), before, fPipeCount);
                 continue;
+            }
 
             AALOG("%s: calling found_framebuffer(%s head %u) count_before=%u", why, fb->getName(), i, before);
             fDM->found_framebuffer(reinterpret_cast<IOFramebuffer *>(fb));
@@ -443,19 +569,14 @@ public:
             fFBRegistered |= (1u << i);
             gArcHeadsRegistered = fFBRegistered;
 
-            if (after != before + 1) {
+            if (after <= before) {
                 AALOG("%s: head %u not added by family (%u -> %u)", why, i, before, after);
-                break;
-            }
-            void *pipe = (before < 16) ? *reinterpret_cast<void *const volatile *>(dm + 0x88 + 8 * before) : nullptr;
-            if (!pipe) {
-                *reinterpret_cast<volatile uint32_t *>(const_cast<uint8_t *>(dm) + 0x108) = before;
-                AALOG("%s: NULL pipe stored in slot %u; rolled back count", why, before);
                 break;
             }
             gArcHeadsPiped |= (1u << i);
             added++;
-            AALOG("%s: head %u bound to pipe %u (%p)", why, i, before, pipe);
+            AALOG("%s: head %u bound via found_framebuffer (%u -> %u, pipes=%u)",
+                  why, i, before, after, fPipeCount);
         }
         return added;
     }
@@ -465,6 +586,7 @@ public:
             publishDisplayPipeCapabilities(true);
         deliverModeChange();
         gArcAccelArmed = 1;
+        setProperty("ArcAccelArmed", kOSBooleanTrue);
         if (fSavedMetalPlugin && !getProperty("MetalPluginName")) {
             setProperty("MetalPluginName", fSavedMetalPlugin);
             AALOG("MetalPluginName restored -> WindowServer & apps can now load ArcMTLDriver.bundle");
@@ -477,28 +599,13 @@ public:
         ArcAccel *me = static_cast<ArcAccel *>(target);
         if (!me || !newService) return true;
 
-        unsigned idx = 0;
-        if (OSNumber *num = OSDynamicCast(OSNumber, newService->getProperty("IOFBDependentIndex")))
-            idx = num->unsigned32BitValue();
-
-        if (idx < kArcMaxFB) {
-            newService->retain();
-            if (OSCompareAndSwapPtr(nullptr, newService, reinterpret_cast<void *volatile *>(&me->fFBs[idx]))) {
-                OSBitOrAtomic(1u << idx, &gArcHeadsPublished);
-                if (idx == 0) {
-                    newService->retain();
-                    if (!OSCompareAndSwapPtr(nullptr, newService, reinterpret_cast<void *volatile *>(&me->fFB)))
-                        newService->release();
-                }
-            } else {
-                newService->release();
-            }
-        }
-
-        AALOG("ArcFB head %u (%s) published", idx, newService->getName());
+        me->recordPublishedFb(newService);
+        AALOG("ArcFB (%s) published notification (dm_count=%u)",
+              newService->getName(), me->fDM ? me->fDM->getFramebufferCount() : 0u);
         if (!me->fManualFbArm) {
             if (me->fRegLock) IOLockLock(me->fRegLock);
-            if (me->registerPendingLocked("fbPublished") > 0)
+            const unsigned added = me->registerPendingLocked("fbPublished");
+            if (added > 0 || (!gArcAccelArmed && me->fFBs[0] && me->fDM && me->fDM->getFramebufferCount() > 0))
                 me->armDesktopAcceleratorLocked();
             if (me->fRegLock) IOLockUnlock(me->fRegLock);
         } else {
@@ -592,6 +699,20 @@ public:
         gArcEnableHook = &ArcAccel::enableFromHook;
         fRegLock       = IOLockAlloc();
 
+        /* Create 32 IOAccelArcXeCarrier child nodes for sandbox-safe IOAccelArcXeBridge user clients */
+        unsigned carriersReady = 0;
+        for (unsigned i = 0; i < kArcCarriers; i++) {
+            IOAccelArcXeCarrier *c = OSTypeAlloc(IOAccelArcXeCarrier);
+            if (!c) break;
+            if (!c->init()) { c->release(); break; }
+            if (!c->attach(this)) { c->release(); break; }
+            if (!c->start(this)) { c->detach(this); c->release(); break; }
+            fCarriers[i] = c;
+            carriersReady++;
+        }
+        AALOG("DisplayMachine fb count after family sweep = %u (pipes=%u, carriers=%u/%u)",
+              fDM ? fDM->getFramebufferCount() : 0u, fPipeCount, carriersReady, kArcCarriers);
+
         enableFromHook("start");
         arcAccelInstallSysctls();
 
@@ -636,12 +757,30 @@ public:
             return true;
         }
 
-        /* Primary Desktop Mode (`arcaccel=1`): withhold MetalPluginName briefly until ArcFB registers its pipe */
+        /* Primary Desktop Mode (`arcaccel=1`): check for already-attached ArcFB children first */
+        if (OSIterator *cit = pci->getClientIterator()) {
+            while (OSObject *co = cit->getNextObject()) {
+                IOService *cs = OSDynamicCast(IOService, co);
+                if (cs && cs->metaCast("ArcFB") && !cs->isInactive())
+                    recordPublishedFb(cs);
+            }
+            cit->release();
+        }
+
         if (OSObject *mp = getProperty("MetalPluginName")) {
             mp->retain();
             fSavedMetalPlugin = mp;
-            removeProperty("MetalPluginName");
+            if (fManualFbArm || !fFBs[0])
+                removeProperty("MetalPluginName");
         }
+
+        if (!fManualFbArm && fFBs[0]) {
+            if (fRegLock) IOLockLock(fRegLock);
+            registerPendingLocked("start");
+            armDesktopAcceleratorLocked();
+            if (fRegLock) IOLockUnlock(fRegLock);
+        }
+
         registerService();
 
         if (OSDictionary *fbMatch = serviceMatching("ArcFB")) {
@@ -649,6 +788,8 @@ public:
                                               &ArcAccel::fbPublished, this, nullptr, 0);
             fbMatch->release();
         }
+        AALOG("READY in Primary Desktop Mode (armed=%d, fbs_published=0x%x, pipes=%u)",
+              gArcAccelArmed, gArcHeadsPublished, fPipeCount);
         return true;
     }
 
@@ -657,11 +798,20 @@ public:
             fFBNote->remove();
             fFBNote = nullptr;
         }
+        for (unsigned i = 0; i < kArcCarriers; i++) {
+            if (fCarriers[i]) {
+                fCarriers[i]->stop(this);
+                fCarriers[i]->detach(this);
+                fCarriers[i]->release();
+                fCarriers[i] = nullptr;
+            }
+        }
         OSSafeReleaseNULL(fArcXe);
         OSSafeReleaseNULL(fSavedMetalPlugin);
         if (fSymGetScanout)  { fSymGetScanout->release();  fSymGetScanout  = nullptr; }
         if (fSymFlipSurface) { fSymFlipSurface->release(); fSymFlipSurface = nullptr; }
         if (fSymPinGgtt)     { fSymPinGgtt->release();     fSymPinGgtt     = nullptr; }
+        if (fSymNewClient)   { fSymNewClient->release();   fSymNewClient   = nullptr; }
         for (unsigned i = 0; i < kArcMaxFB; i++) {
             if (fFBs[i]) {
                 fFBs[i]->release();

@@ -520,9 +520,10 @@ IOReturn ArcXeService::newUserClient(task_t owningTask, void *securityID, UInt32
 {
     if (!handler) return kIOReturnBadArgument;
 
-    ArcXeUserClient *client = new ArcXeUserClient;
+    IOAccelArcXeBridge *client = OSTypeAlloc(IOAccelArcXeBridge);
     if (!client) return kIOReturnNoMemory;
 
+    client->setOwner(this);
     if (!client->initWithTask(owningTask, securityID, type, properties)) {
         client->release();
         return kIOReturnError;
@@ -545,6 +546,26 @@ IOReturn ArcXeService::callPlatformFunction(const OSSymbol *functionName, bool w
                                             void *param1, void *param2, void *param3, void *param4)
 {
     if (functionName) {
+        if (functionName->isEqualTo(ARC_XE_FN_NEW_ACCEL_CLIENT)) {
+            auto **out = reinterpret_cast<IOUserClient **>(param3);
+            if (!out) return kIOReturnBadArgument;
+            *out = nullptr;
+            if (fStopping || isInactive()) return kIOReturnNotReady;
+
+            IOAccelArcXeBridge *uc = OSTypeAlloc(IOAccelArcXeBridge);
+            if (!uc) return kIOReturnNoMemory;
+            uc->setOwner(this);
+            if (!uc->initWithTask(reinterpret_cast<task_t>(param1), nullptr,
+                                  static_cast<UInt32>(reinterpret_cast<uintptr_t>(param2)), nullptr)) {
+                uc->release();
+                AXELOG("bridge initWithTask(type=%u) failed",
+                       static_cast<unsigned>(reinterpret_cast<uintptr_t>(param2)));
+                return kIOReturnNoResources;
+            }
+            *out = uc;
+            return kIOReturnSuccess;
+        }
+
         if (functionName->isEqualTo(ARC_XE_FN_PIN_SURFACE_GGTT)) {
             auto *req = static_cast<ArcPinGgttReq *>(param1);
             if (!req || req->version != ARC_KERN_ABI_VERSION || !req->iomem_desc || req->size == 0)

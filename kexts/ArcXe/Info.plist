@@ -31,7 +31,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOUserClientClass</key>
-			<string>ArcXeUserClient</string>
+			<string>IOAccelArcXeBridge</string>
 			<key>IOPCIMatch</key>
 			<string>0x7d558086 0x7d408086 0x7d418086 0x7d458086 0x7d518086 0x7d608086 0x7d678086 0x7dd18086 0x7dd58086</string>
 			<key>IOProbeScore</key>

@@ -265,8 +265,10 @@ struct ArcUserPtrBind {
 class ArcXeUserClient : public IOUserClient {
     OSDeclareDefaultStructors(ArcXeUserClient)
 
-private:
+protected:
     ArcXeService               *fOwner              = nullptr;
+
+private:
     task_t                      fTask               = nullptr;
     IOLock                     *fClientLock         = nullptr;
 
@@ -282,6 +284,7 @@ private:
     void          releaseUserPtrBinds(uint32_t vmId, uint64_t gpuVa, uint64_t rangeSize, bool allInVm);
 
 public:
+    void     setOwner(ArcXeService *owner) { fOwner = owner; }
     bool     initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties) override;
     bool     start(IOService *provider) override;
     IOReturn clientClose() override;
@@ -291,4 +294,15 @@ public:
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                             IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
+};
+
+/*
+ * IOAccel*-prefixed user client bridge subclass for WindowServer & macOS Seatbelt sandboxes:
+ * Seatbelt iokit-open rules in com.apple.WindowServer.sb and App Sandbox permit opening user
+ * clients matching ^IOAccel.* attached under an IOAccelerator / IOGraphicsAccelerator2 service.
+ */
+class IOAccelArcXeBridge : public ArcXeUserClient {
+    OSDeclareDefaultStructors(IOAccelArcXeBridge)
+public:
+    bool start(IOService *provider) override;
 };

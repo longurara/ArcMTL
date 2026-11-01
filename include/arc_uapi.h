@@ -18,6 +18,8 @@ extern "C" {
 #endif
 
 #define ARCXE_IOKIT_SERVICE_NAME            "ArcXeService"
+#define ARC_ACCEL_IOKIT_SERVICE_NAME        "ArcAccel"
+#define ARC_XE_ACCEL_OPEN_TYPE              0x41520000u  /* 'AR' << 16: opens IOAccelArcXeBridge via ArcAccel */
 #define ARCXE_UAPI_VERSION                  1u
 
 /* IOConnectCallMethod Selectors */

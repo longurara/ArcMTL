@@ -90,26 +90,84 @@ static struct ArcFdSession *lookup_session_locked(int fd)
     return NULL;
 }
 
-static io_service_t find_arcxe_service(void)
+/*
+ * Open an IOKit connection to ArcXeUserClient / IOAccelArcXeBridge:
+ *   1. Try ArcAccel (IOGraphicsAccelerator2 / IOAccelerator) with ARC_XE_ACCEL_OPEN_TYPE first.
+ *      macOS WindowServer (com.apple.WindowServer.sb) and App Sandbox Seatbelt profiles allow
+ *      iokit-open on IOAccel* user clients attached under an IOAccelerator service, whereas
+ *      direct opens on non-IOAccelerator services are rejected with kIOReturnNotPermitted.
+ *   2. Fall back to ArcXeService directly when ArcAccel is disabled (e.g. safe Stage-1 CLI tests).
+ */
+static kern_return_t arc_xnu_open_iokit_connection(io_service_t *out_svc, io_connect_t *out_conn)
 {
-    CFMutableDictionaryRef match = IOServiceMatching(ARCXE_IOKIT_SERVICE_NAME);
-    if (!match) return IO_OBJECT_NULL;
-    return IOServiceGetMatchingService(kIOMainPortDefault, match);
-}
+    *out_svc  = IO_OBJECT_NULL;
+    *out_conn = IO_OBJECT_NULL;
 
-int arc_xnu_open_device(void)
-{
-    io_service_t svc = find_arcxe_service();
-    if (svc == IO_OBJECT_NULL) {
-        errno = ENODEV;
-        return -1;
+    CFMutableDictionaryRef match = IOServiceMatching(ARC_ACCEL_IOKIT_SERVICE_NAME);
+    if (match) {
+        io_service_t accel = IOServiceGetMatchingService(kIOMainPortDefault, match);
+        if (accel != IO_OBJECT_NULL) {
+            io_connect_t conn = IO_OBJECT_NULL;
+            kern_return_t kr = IOServiceOpen(accel, mach_task_self(), ARC_XE_ACCEL_OPEN_TYPE, &conn);
+            if (kr == KERN_SUCCESS && conn != IO_OBJECT_NULL) {
+                *out_svc  = accel;
+                *out_conn = conn;
+                return KERN_SUCCESS;
+            }
+            IOObjectRelease(accel);
+        }
     }
+
+    match = IOServiceMatching(ARCXE_IOKIT_SERVICE_NAME);
+    if (!match)
+        return KERN_FAILURE;
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, match);
+    if (svc == IO_OBJECT_NULL)
+        return KERN_FAILURE;
 
     io_connect_t conn = IO_OBJECT_NULL;
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
     if (kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) {
         IOObjectRelease(svc);
-        errno = EACCES;
+        return (kr != KERN_SUCCESS) ? kr : KERN_FAILURE;
+    }
+
+    *out_svc  = svc;
+    *out_conn = conn;
+    return KERN_SUCCESS;
+}
+
+/*
+ * Allocate a sandbox-safe owned POSIX descriptor for Mesa's fd table (dup/close/fcntl):
+ *   - WindowServer & GPU sandboxes forbid O_RDWR on /dev/null; try O_RDONLY first.
+ *   - Tighter sandboxes that forbid /dev/null altogether allow an anonymous EOF pipe().
+ */
+static int arc_xnu_alloc_token_fd(void)
+{
+    int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0)
+        return fd;
+
+    int ends[2];
+    if (pipe(ends) != 0)
+        return -1;
+    close(ends[1]);
+    if (fcntl(ends[0], F_SETFD, FD_CLOEXEC) < 0) {
+        int saved = errno;
+        close(ends[0]);
+        errno = saved;
+        return -1;
+    }
+    return ends[0];
+}
+
+int arc_xnu_open_device(void)
+{
+    io_service_t svc  = IO_OBJECT_NULL;
+    io_connect_t conn = IO_OBJECT_NULL;
+    kern_return_t kr  = arc_xnu_open_iokit_connection(&svc, &conn);
+    if (kr != KERN_SUCCESS || conn == IO_OBJECT_NULL) {
+        errno = (kr == kIOReturnNotPermitted || kr == kIOReturnNotPrivileged) ? EACCES : ENODEV;
         return -1;
     }
 
@@ -123,8 +181,8 @@ int arc_xnu_open_device(void)
         return -1;
     }
 
-    /* Allocate a real POSIX descriptor so dup/close/fcntl in Mesa work natively */
-    int fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    /* Allocate a real sandbox-safe POSIX descriptor so dup/close/fcntl in Mesa work natively */
+    int fd = arc_xnu_alloc_token_fd();
     if (fd < 0) {
         IOServiceClose(conn);
         IOObjectRelease(svc);
@@ -1292,19 +1350,17 @@ static drmDevicePtr alloc_single_arc_drm_device(const struct ArcXeQueryDeviceOut
 int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices)
 {
     (void)flags;
-    io_service_t svc = find_arcxe_service();
-    if (svc == IO_OBJECT_NULL)
+    io_service_t svc  = IO_OBJECT_NULL;
+    io_connect_t conn = IO_OBJECT_NULL;
+    if (arc_xnu_open_iokit_connection(&svc, &conn) != KERN_SUCCESS || conn == IO_OBJECT_NULL)
         return 0;
 
-    io_connect_t conn = IO_OBJECT_NULL;
     struct ArcXeQueryDeviceOut q = {0};
     size_t out_sz = sizeof(q);
     bool ok = false;
-    if (IOServiceOpen(svc, mach_task_self(), 0, &conn) == KERN_SUCCESS && conn != IO_OBJECT_NULL) {
-        if (IOConnectCallStructMethod(conn, kArcXeMethodQueryDevice, NULL, 0, &q, &out_sz) == KERN_SUCCESS)
-            ok = (q.vendor_id == 0x8086);
-        IOServiceClose(conn);
-    }
+    if (IOConnectCallStructMethod(conn, kArcXeMethodQueryDevice, NULL, 0, &q, &out_sz) == KERN_SUCCESS)
+        ok = (q.vendor_id == 0x8086);
+    IOServiceClose(conn);
     IOObjectRelease(svc);
     if (!ok) return 0;
 

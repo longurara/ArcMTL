@@ -67,24 +67,57 @@ def transform_common(text: str) -> str:
 
 
 def transform_device_m(text: str) -> str:
-    # Fix WindowServer vendor check: ArcMTLDevice's legitimate vendor is 0x8086, not 0x10de.
-    # When debug.arcaccel_headless == 1 (Dual-GPU mode), WindowServer still returns false;
-    # when debug.arcaccel_headless == 0 (Standalone Arc mode), WindowServer is permitted
-    # subject to !WindowServer (debug.arcaccelfb == 1) in arcmtl-allow.txt.
+    # 1. Sandbox-safe IORegistry fallback for nvmtl_accel_armed() & headless check:
+    #    App-sandboxed desktop processes (ControlCenter, NotificationCenter, WallpaperAgent, Spotlight,
+    #    Safari/Chrome helpers, and Seatbelt-restricted daemons) may get EPERM on sysctlbyname("debug.*"),
+    #    whereas IORegistryEntryCreateCFProperty on ArcAccel ("ArcAccelArmed" / "ArcAccelHeadless") is
+    #    globally allowed by Seatbelt iokit-get-properties.
+    text = re.sub(
+        r"static\s+bool\s+nvmtl_accel_armed\s*\(\s*void\s*\)\s*\{[^}]*\}",
+        "static bool arcmtl_accel_registry_flag(CFStringRef key)\n"
+        "{\n"
+        "    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(\"ArcAccel\"));\n"
+        "    if (!s) return false;\n"
+        "    CFTypeRef v = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);\n"
+        "    IOObjectRelease(s);\n"
+        "    if (!v) return false;\n"
+        "    bool ok = (CFGetTypeID(v) == CFBooleanGetTypeID()) && CFBooleanGetValue((CFBooleanRef)v);\n"
+        "    CFRelease(v);\n"
+        "    return ok;\n"
+        "}\n"
+        "static bool nvmtl_accel_armed(void)\n"
+        "{\n"
+        "    int v = 0; size_t n = sizeof v;\n"
+        "    if (sysctlbyname(\"debug.arcaccelfb\", &v, &n, NULL, 0) == 0) return v != 0;\n"
+        "    return arcmtl_accel_registry_flag(CFSTR(\"ArcAccelArmed\"));\n"
+        "}",
+        text,
+        count=1,
+    )
+
+    # 2. Fix WindowServer vendor & headless check: ArcMTLDevice's legitimate vendor is 0x8086, not 0x10de.
+    #    When debug.arcaccel_headless == 1 (Dual-GPU headless mode), WindowServer returns false;
+    #    when debug.arcaccel_headless == 0 (Primary Arc Desktop mode), WindowServer is permitted
+    #    subject to !WindowServer (nvmtl_accel_armed() == true) in arcmtl-allow.txt.
+    text = re.sub(
+        r'\(\s*sysctlbyname\(\s*"debug\.arcaccel_headless"\s*,\s*&hv\s*,\s*&hn\s*,\s*NULL\s*,\s*0\s*\)\s*==\s*0\s*&&\s*hv\s*\)',
+        '(sysctlbyname("debug.arcaccel_headless", &hv, &hn, NULL, 0) == 0 ? (hv != 0) : arcmtl_accel_registry_flag(CFSTR("ArcAccelHeadless")))',
+        text,
+    )
     text = re.sub(
         r'(!strcmp\(\s*me\s*,\s*"WindowServer"\s*\)\s*&&\s*\(\s*nvmtl_vk_vendor\(\)\s*!=\s*)0x10de',
         r"\g<1>0x8086",
         text,
     )
 
-    # Allow ARCMTL_ENABLE env var and our staged CLI test binaries without allow-list file
+    # 3. Allow ARCMTL_ENABLE env var and our staged CLI test binaries without allow-list file
     text = text.replace(
         'if (getenv("NVMTL_ENABLE")) return true;',
         'if (getenv("ARCMTL_ENABLE") || getenv("NVMTL_ENABLE")) return true;\n'
         '    if (!strcmp(me, "mtl_offscreen_test") || !strcmp(me, "vk_offscreen_test") || !strcmp(me, "arc_probe")) return true;',
     )
 
-    # Chromium / Electron ANGLE Metal override for Intel GPUs
+    # 4. Chromium / Electron ANGLE Metal override for Intel GPUs
     text = text.replace('"disableMetalOnNvidia"', '"disableMetalOnIntel"')
 
     return REQUIRED_NOTICE_BANNER + text
@@ -163,14 +196,30 @@ def transform_vk_c(text: str) -> str:
         '    const char *e = getenv("NVMTL_ICD_LIB"); if (e && access(e, R_OK) == 0) return e;',
     )
 
-    # 3. Fix nvmtl_gpu_headless(): do not force h = 1 solely because vendor != 0x10de;
-    # let debug.arcaccel_headless control Dual-GPU headless vs Standalone Arc display mode.
+    # 3. Enable sandbox-safe _open -> nvmtl_icd_open rebind on Intel 0x8086 as well as 0x10de
+    text = text.replace(
+        "if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import",
+        "if (nvmtl_vk_vendor() == 0x8086) { int rb = nvmtl_rebind_import",
+    )
+
+    # 4. Fix nvmtl_gpu_headless(): do not force h = 1 solely because vendor != 0x10de;
+    # let debug.arcaccel_headless (with sandbox-safe IORegistry ArcAccelHeadless fallback)
+    # control Dual-GPU headless vs Primary Arc display mode.
     text = text.replace(
         "if (h < 0 && nvmtl_vk_vendor() != 0x10de)",
         "if (h < 0 && nvmtl_vk_vendor() != 0x8086)",
     )
+    text = text.replace(
+        'h = sysctlbyname("debug.arcaccel_headless", &v, &n, NULL, 0) == 0 && v;',
+        'if (sysctlbyname("debug.arcaccel_headless", &v, &n, NULL, 0) == 0) { h = (v != 0); } '
+        'else { io_service_t _as = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("ArcAccel")); '
+        'CFTypeRef _av = _as ? IORegistryEntryCreateCFProperty(_as, CFSTR("ArcAccelHeadless"), kCFAllocatorDefault, 0) : NULL; '
+        'if (_as) IOObjectRelease(_as); '
+        'h = (_av && CFGetTypeID(_av) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)_av)) ? 1 : 0; '
+        'if (_av) CFRelease(_av); }',
+    )
 
-    # 4. Isolate accelerator surface-wait query from NVAccel -> ArcAccel
+    # 5. Isolate accelerator surface-wait query from NVAccel -> ArcAccel
     text = text.replace('IOServiceMatching("NVAccel")', 'IOServiceMatching("ArcAccel")')
     text = text.replace('"NVAccelSurfaceWait"', '"ArcAccelSurfaceWait"')
 
@@ -232,6 +281,12 @@ def run_self_test() -> None:
     sample_dev = (
         '@interface NVMTLDevice : MTLIOAccelDevice\n@end\n'
         '#import "NVMTLObjects.h"\n'
+        'static bool nvmtl_accel_armed(void)\n'
+        '{\n'
+        '    int v = 0; size_t n = sizeof v;\n'
+        '    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;\n'
+        '    return v != 0;\n'
+        '}\n'
         'if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de || '
         '(sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) return false;\n'
         'if (getenv("NVMTL_ENABLE")) return true;\n'
@@ -243,6 +298,8 @@ def run_self_test() -> None:
     out_dev = transform_device_m(transform_common(sample_dev))
     assert "@interface ArcMTLDevice" in out_dev
     assert '#import "ArcMTLObjects.h"' in out_dev
+    assert 'CFSTR("ArcAccelArmed")' in out_dev
+    assert 'CFSTR("ArcAccelHeadless")' in out_dev
     assert "nvmtl_vk_vendor() != 0x8086" in out_dev
     assert '"debug.arcaccel_headless"' in out_dev
     assert '"/Library/GPUBundles/arcmtl-allow.txt"' in out_dev
@@ -255,13 +312,17 @@ def run_self_test() -> None:
         'uint16_t nvmtl_vk_vendor(void)\n{\n    return 0x10de;\n}\n'
         'const char *e = getenv("NVMTL_ICD_LIB"); if (e && access(e, R_OK) == 0) return e;\n'
         'case 0x8086: return "/Library/GPUBundles/nvmtl/libvulkan_intel.dylib";\n'
+        'if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import(p, "_open", f); }\n'
         'if (h < 0 && nvmtl_vk_vendor() != 0x10de) { h = 1; }\n'
+        'h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;\n'
     )
     out_vk = transform_vk_c(transform_common(sample_vk))
     assert "return 0x8086;" in out_vk
     assert '"/Library/GPUBundles/arcmtl/libvulkan_intel.dylib"' in out_vk
     assert 'getenv("ARCMTL_ICD_LIB")' in out_vk
+    assert "if (nvmtl_vk_vendor() == 0x8086) { int rb = nvmtl_rebind_import" in out_vk
     assert "nvmtl_vk_vendor() != 0x8086" in out_vk
+    assert 'CFSTR("ArcAccelHeadless")' in out_vk
     print("[adapt_arc_plugin] Self-test PASSED.")
 
 
