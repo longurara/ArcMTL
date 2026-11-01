@@ -231,9 +231,13 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
          | ARC_PPGTT_PTE_PAT1;
 }
 
-/* GGTT Layout Boundaries */
+/* GGTT Layout Boundaries & AuxCCS / TLB Invalidation Registers */
 #define ARC_GGTT_WOPCM_RESERVED_BASE        0x01800000u  /* Start dynamic GGTT allocs at 24 MiB (above WOPCM + GOP) */
 #define ARC_GUC_GGTT_TOP                    0xFEE00000u  /* Top of GuC-accessible GGTT */
+#define ARC_REG_GFX_AUX_TABLE_BASE_LO       0x004200u
+#define ARC_REG_CCS_AUX_INV                 0x004208u
+#define ARC_REG_BCS_AUX_TABLE_BASE_LO       0x004210u
+#define   ARC_AUX_INV                       (1u << 0)
 #define ARC_REG_GTCR                        0x004274u    /* Global TLB Invalidate */
 #define   ARC_GTCR_INVALIDATE               (1u << 0)
 

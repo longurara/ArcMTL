@@ -88,6 +88,7 @@ static unsigned gArcHeadsRegistered = 0;
 static unsigned gArcHeadsPiped      = 0;
 static volatile SInt64 gCntArcFlips = 0;
 static volatile SInt64 gCntArcCopies= 0;
+static volatile SInt64 gCntArcBlank = 0;
 static volatile SInt64 gCntArcEmpty = 0;
 static volatile SInt64 gCntArcFail  = 0;
 static volatile SInt64 gCntArcResNew= 0;
@@ -430,7 +431,7 @@ public:
                 return fFBs[i];
             }
         }
-        /* 2. IOAccelDisplayPipe internal IOFramebuffer* slot (+0x98) */
+        /* 2. IOAccelDisplayPipe internal IOFramebuffer* slot (+0x98): pointer-equality only (never dereference raw slot) */
         IOService *fb = *reinterpret_cast<IOService *const volatile *>(
                             reinterpret_cast<const uint8_t *>(pipe) + 0x98);
         if (fb) {
@@ -439,10 +440,6 @@ public:
                     if (idxOut) *idxOut = i;
                     return fb;
                 }
-            }
-            if (fb->metaCast("ArcFB")) {
-                if (idxOut) *idxOut = 0;
-                return fb;
             }
         }
         /* 3. Deterministic single-head fallback */
@@ -1102,25 +1099,47 @@ IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
      * Used if -arcnoflip is passed, or pitch is not 64-byte aligned, or source is an ArcResource.
      */
     if (!scan.kva || scan.pitch < 4) {
-        OSAddAtomic64(1, &gCntArcFail);
+        const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+        if (fn <= 6)
+            AALOG("iop fail #%lld: scanout kva not ready (kva=%p pitch=%u)", (long long)fn, scan.kva, scan.pitch);
         return kIOReturnNotReady;
     }
 
     const uint8_t *srcBytes = nullptr;
     uint32_t w = 0, h = 0, pitch = 0;
+    uint32_t pixFmt = 0x42475241u; /* 'BGRA' */
+    uint32_t surfId = 0;
 
     if (s) {
-        if (s->getPixelFormat() != 0x42475241u) {
-            OSAddAtomic64(1, &gCntArcFail);
+        pixFmt = s->getPixelFormat();
+        surfId = s->getSurfaceID();
+        const bool supportedFmt =
+            (pixFmt == 0x42475241u) || /* 'BGRA' (8-bit BGRA8888 LE) */
+            (pixFmt == 0x6C313072u) || /* 'l10r' (10-bit BGR10A2Unorm / A2R10G10B10 LE) */
+            (pixFmt == 0x7231306Bu) || /* 'r10k' (10-bit RGB10A2Unorm / A2B10G10R10 LE) */
+            (pixFmt == 0x00000020u) || /* kCVPixelFormatType_32ARGB (big-endian ARGB) */
+            (pixFmt == 0x52474241u) || /* 'RGBA' */
+            (pixFmt == 0x41424752u);   /* 'ABGR' */
+        if (!supportedFmt) {
+            const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+            if (fn <= 6) {
+                AALOG("iop fail #%lld: unsupported IOSurface#%u fmt=0x%08x (%llux%llu bpr=%llu)",
+                      (long long)fn, surfId, pixFmt,
+                      s->getWidth(), s->getHeight(), s->getBytesPerRow());
+            }
             return kIOReturnUnsupported;
         }
         const uint64_t W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
         IOMemoryDescriptor *md = s->getMemoryDescriptor();
         if (!W || !H || P < 4ULL * W || !md) {
-            OSAddAtomic64(1, &gCntArcFail);
+            const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+            if (fn <= 6) {
+                AALOG("iop fail #%lld: invalid IOSurface#%u geometry (%llux%llu bpr=%llu md=%p)",
+                      (long long)fn, surfId, W, H, P, md);
+            }
             return kIOReturnBadArgument;
         }
-        srcBytes = static_cast<const uint8_t *>(iopMapSurface(s->getSurfaceID(), md, H * P));
+        srcBytes = static_cast<const uint8_t *>(iopMapSurface(surfId, md, H * P));
         w = (uint32_t)W;
         h = (uint32_t)H;
         pitch = (uint32_t)P;
@@ -1137,7 +1156,11 @@ IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     }
 
     if (!srcBytes || !w || !h || pitch < 4) {
-        OSAddAtomic64(1, &gCntArcFail);
+        const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+        if (fn <= 6) {
+            AALOG("iop fail #%lld: unmapped source (surf=%u fmt=0x%08x %ux%u pitch=%u)",
+                  (long long)fn, surfId, pixFmt, w, h, pitch);
+        }
         return kIOReturnBadArgument;
     }
 
@@ -1149,15 +1172,92 @@ IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         a->fFlippedFromBoot[head] = false;
     }
 
-    const uint32_t copyRows  = (h < scan.height) ? h : scan.height;
+    const uint32_t copyRows = (h < scan.height) ? h : scan.height;
+    const uint32_t copyCols = (w < scan.width) ? w : scan.width;
     const uint32_t copyBytes = ((pitch < scan.pitch) ? pitch : scan.pitch) & ~3u;
     uint8_t *dstBytes = static_cast<uint8_t *>(scan.kva);
 
-    for (uint32_t y = 0; y < copyRows; y++) {
-        bcopy(srcBytes + (size_t)y * pitch, dstBytes + (size_t)y * scan.pitch, copyBytes);
+    /* Sample 64 pixels across the incoming surface to distinguish rendered content vs solid black */
+    const uint32_t totalPx = copyRows * copyCols;
+    const uint32_t stepPx  = (totalPx > 64u) ? (totalPx / 64u) : 1u;
+    uint32_t firstSample = 0;
+    bool haveFirst = false, anyNonZero = false, anyVaried = false;
+    for (uint32_t idx = 0; idx < totalPx; idx += stepPx) {
+        const uint32_t sy = idx / (copyCols ? copyCols : 1u);
+        const uint32_t sx = idx % (copyCols ? copyCols : 1u);
+        const uint32_t px = *reinterpret_cast<const uint32_t *>(srcBytes + (size_t)sy * pitch + (size_t)sx * 4u);
+        const uint32_t rgbMask = (pixFmt == 0x6C313072u || pixFmt == 0x7231306Bu) ? 0x3FFFFFFFu
+                               : (pixFmt == 0x00000020u) ? 0xFFFFFF00u : 0x00FFFFFFu;
+        if ((px & rgbMask) != 0u)
+            anyNonZero = true;
+        if (!haveFirst) {
+            firstSample = px;
+            haveFirst   = true;
+        } else if (px != firstSample) {
+            anyVaried = true;
+        }
+    }
+    if (!anyVaried)
+        OSAddAtomic64(1, &gCntArcBlank);
+
+    if (pixFmt == 0x42475241u) {
+        for (uint32_t y = 0; y < copyRows; y++) {
+            bcopy(srcBytes + (size_t)y * pitch, dstBytes + (size_t)y * scan.pitch, copyBytes);
+        }
+    } else if (pixFmt == 0x6C313072u) {
+        /* 'l10r': 10-bit BGR10A2Unorm (bits [9:0]=B, [19:10]=G, [29:20]=R) -> 8-bit XRGB8888 LE */
+        for (uint32_t y = 0; y < copyRows; y++) {
+            const uint32_t *sp = reinterpret_cast<const uint32_t *>(srcBytes + (size_t)y * pitch);
+            uint32_t *dp       = reinterpret_cast<uint32_t *>(dstBytes + (size_t)y * scan.pitch);
+            for (uint32_t x = 0; x < copyCols; x++) {
+                const uint32_t v = sp[x];
+                const uint32_t b = (v >> 2)  & 0xFFu;
+                const uint32_t g = (v >> 12) & 0xFFu;
+                const uint32_t r = (v >> 22) & 0xFFu;
+                dp[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+    } else if (pixFmt == 0x7231306Bu) {
+        /* 'r10k': 10-bit RGB10A2Unorm (bits [9:0]=R, [19:10]=G, [29:20]=B) -> 8-bit XRGB8888 LE */
+        for (uint32_t y = 0; y < copyRows; y++) {
+            const uint32_t *sp = reinterpret_cast<const uint32_t *>(srcBytes + (size_t)y * pitch);
+            uint32_t *dp       = reinterpret_cast<uint32_t *>(dstBytes + (size_t)y * scan.pitch);
+            for (uint32_t x = 0; x < copyCols; x++) {
+                const uint32_t v = sp[x];
+                const uint32_t r = (v >> 2)  & 0xFFu;
+                const uint32_t g = (v >> 12) & 0xFFu;
+                const uint32_t b = (v >> 22) & 0xFFu;
+                dp[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+    } else if (pixFmt == 0x00000020u) {
+        /* 32-bit big-endian ARGB [A, R, G, B] -> 8-bit XRGB8888 LE [B, G, R, 0xFF] */
+        for (uint32_t y = 0; y < copyRows; y++) {
+            const uint8_t *sp = srcBytes + (size_t)y * pitch;
+            uint32_t *dp      = reinterpret_cast<uint32_t *>(dstBytes + (size_t)y * scan.pitch);
+            for (uint32_t x = 0; x < copyCols; x++) {
+                const uint8_t *p = sp + (size_t)x * 4u;
+                dp[x] = 0xFF000000u | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+            }
+        }
+    } else {
+        /* 'RGBA' / 'ABGR' [R, G, B, A] -> 8-bit XRGB8888 LE [B, G, R, 0xFF] */
+        for (uint32_t y = 0; y < copyRows; y++) {
+            const uint8_t *sp = srcBytes + (size_t)y * pitch;
+            uint32_t *dp      = reinterpret_cast<uint32_t *>(dstBytes + (size_t)y * scan.pitch);
+            for (uint32_t x = 0; x < copyCols; x++) {
+                const uint8_t *p = sp + (size_t)x * 4u;
+                dp[x] = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+            }
+        }
     }
 
-    OSAddAtomic64(1, &gCntArcCopies);
+    const SInt64 cn = OSAddAtomic64(1, &gCntArcCopies) + 1;
+    if (cn <= 6 || (cn == 60) || (cn == 300)) {
+        AALOG("iop copy #%lld: surf=%u fmt=0x%08x %ux%u pitch=%u nonzero=%d varied=%d first=0x%08x",
+              (long long)cn, surfId, pixFmt, w, h, pitch,
+              anyNonZero ? 1 : 0, anyVaried ? 1 : 0, firstSample);
+    }
     return kIOReturnSuccess;
 }
 
@@ -1192,6 +1292,8 @@ SYSCTL_QUAD(_debug, OID_AUTO, arcaccel_flips, CTLFLAG_RD | CTLFLAG_LOCKED,
             (SInt64 *)&gCntArcFlips, "Zero-copy UMA IOSurface GGTT page flips completed");
 SYSCTL_QUAD(_debug, OID_AUTO, arcaccel_copies, CTLFLAG_RD | CTLFLAG_LOCKED,
             (SInt64 *)&gCntArcCopies, "Fallback WC scanout frame copies completed");
+SYSCTL_QUAD(_debug, OID_AUTO, arcaccel_blank, CTLFLAG_RD | CTLFLAG_LOCKED,
+            (SInt64 *)&gCntArcBlank, "DisplayPipe frames with uniform/blank pixel sample");
 SYSCTL_QUAD(_debug, OID_AUTO, arcaccel_fail, CTLFLAG_RD | CTLFLAG_LOCKED,
             (SInt64 *)&gCntArcFail, "DisplayPipe transactions refused");
 
@@ -1203,6 +1305,7 @@ static void arcAccelInstallSysctls()
     sysctl_register_oid(&sysctl__debug_arcaccel_flip);
     sysctl_register_oid(&sysctl__debug_arcaccel_flips);
     sysctl_register_oid(&sysctl__debug_arcaccel_copies);
+    sysctl_register_oid(&sysctl__debug_arcaccel_blank);
     sysctl_register_oid(&sysctl__debug_arcaccel_fail);
     gArcSysctlInstalled = true;
 }

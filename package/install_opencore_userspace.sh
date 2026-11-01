@@ -89,6 +89,7 @@ if [ -n "$LATEST_WS_CRASH" ]; then
     echo "      [diag] Most recent WindowServer report: $LATEST_WS_CRASH"
     grep -E '"termination"|"exception"|"asi"|"faultingThread"' "$LATEST_WS_CRASH" 2>/dev/null | head -n 4 || true
 fi
+sysctl debug.arcaccelfb debug.arcaccel_headless debug.arcaccel_copies debug.arcaccel_blank debug.arcaccel_fail 2>/dev/null || true
 
 echo ""
 echo "[2/5] Installing GuC v70 firmware & diagnostic tools..."

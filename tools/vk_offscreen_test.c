@@ -168,6 +168,16 @@ int main(int argc, char **argv)
     LOAD_DEV(vkAllocateMemory);
     LOAD_DEV(vkFreeMemory);
     LOAD_DEV(vkBindBufferMemory);
+    LOAD_DEV(vkCreateImage);
+    LOAD_DEV(vkDestroyImage);
+    LOAD_DEV(vkGetImageMemoryRequirements);
+    LOAD_DEV(vkBindImageMemory);
+    LOAD_DEV(vkCreateImageView);
+    LOAD_DEV(vkDestroyImageView);
+    LOAD_DEV(vkCreateRenderPass);
+    LOAD_DEV(vkDestroyRenderPass);
+    LOAD_DEV(vkCreateFramebuffer);
+    LOAD_DEV(vkDestroyFramebuffer);
     LOAD_DEV(vkMapMemory);
     LOAD_DEV(vkUnmapMemory);
     LOAD_DEV(vkCreateCommandPool);
@@ -176,6 +186,10 @@ int main(int argc, char **argv)
     LOAD_DEV(vkBeginCommandBuffer);
     LOAD_DEV(vkCmdCopyBuffer);
     LOAD_DEV(vkCmdFillBuffer);
+    LOAD_DEV(vkCmdBeginRenderPass);
+    LOAD_DEV(vkCmdEndRenderPass);
+    LOAD_DEV(vkCmdPipelineBarrier);
+    LOAD_DEV(vkCmdCopyImageToBuffer);
     LOAD_DEV(vkEndCommandBuffer);
     LOAD_DEV(vkCreateFence);
     LOAD_DEV(vkDestroyFence);
@@ -264,9 +278,9 @@ int main(int argc, char **argv)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 2,
+        .commandBufferCount = 3,
     };
-    VkCommandBuffer cmds[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkCommandBuffer cmds[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
     CHECK_VK(pvkAllocateCommandBuffers(dev, &cbai, cmds));
 
     VkCommandBufferBeginInfo cbbi = {
@@ -291,7 +305,7 @@ int main(int argc, char **argv)
         .commandBufferCount = 1,
         .pCommandBuffers = &cmds[0],
     };
-    printf("\n  [B1/2] Submitting vkCmdCopyBuffer (64 KiB, pattern=0x%08x) on queue family %u...\n",
+    printf("\n  [B1/3] Submitting vkCmdCopyBuffer (64 KiB, pattern=0x%08x) on queue family %u...\n",
            copy_pattern, qfam);
     CHECK_VK(pvkQueueSubmit(queue, 1, &si0, fence));
     CHECK_VK(pvkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL));
@@ -327,7 +341,7 @@ int main(int argc, char **argv)
         .commandBufferCount = 1,
         .pCommandBuffers = &cmds[1],
     };
-    printf("  [B2/2] Submitting vkCmdFillBuffer (64 KiB, pattern=0x%08x) on queue family %u...\n",
+    printf("  [B2/3] Submitting vkCmdFillBuffer (64 KiB, pattern=0x%08x) on queue family %u...\n",
            pattern, qfam);
     CHECK_VK(pvkQueueSubmit(queue, 1, &si1, fence));
     CHECK_VK(pvkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL));
@@ -347,12 +361,191 @@ int main(int argc, char **argv)
                total_words, total_words, pattern);
     }
 
+    /*
+     * Subtest B3: Optimal-Tiled 3D VkImage RenderPass Clear + vkCmdCopyImageToBuffer Readback
+     * Exercises the exact 3D Color Attachment -> BLORP Image-to-Buffer readback pipeline used
+     * by WindowServer / ArcMTLDriver.bundle on every desktop frame!
+     */
+    const uint32_t img_w = 64, img_h = 64;
+    const uint32_t img_pixels = img_w * img_h;
+    VkImageCreateInfo img_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .extent = { img_w, img_h, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkImage img = VK_NULL_HANDLE;
+    CHECK_VK(pvkCreateImage(dev, &img_ci, NULL, &img));
+
+    VkMemoryRequirements img_mreq;
+    pvkGetImageMemoryRequirements(dev, img, &img_mreq);
+    uint32_t img_mem_idx = UINT32_MAX;
+    for (uint32_t i = 0; i < memp.memoryTypeCount; i++) {
+        if ((img_mreq.memoryTypeBits & (1u << i)) &&
+            (memp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            img_mem_idx = i;
+            break;
+        }
+    }
+    if (img_mem_idx == UINT32_MAX) {
+        for (uint32_t i = 0; i < memp.memoryTypeCount; i++) {
+            if (img_mreq.memoryTypeBits & (1u << i)) {
+                img_mem_idx = i;
+                break;
+            }
+        }
+    }
+    VkMemoryAllocateInfo img_mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = img_mreq.size,
+        .memoryTypeIndex = img_mem_idx,
+    };
+    VkDeviceMemory img_mem = VK_NULL_HANDLE;
+    CHECK_VK(pvkAllocateMemory(dev, &img_mai, NULL, &img_mem));
+    CHECK_VK(pvkBindImageMemory(dev, img, img_mem, 0));
+
+    VkImageViewCreateInfo iv_ci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    VkImageView iv = VK_NULL_HANDLE;
+    CHECK_VK(pvkCreateImageView(dev, &iv_ci, NULL, &iv));
+
+    VkAttachmentDescription att = {
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    };
+    VkAttachmentReference color_ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription subpass = {
+        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_ref,
+    };
+    VkRenderPassCreateInfo rp_ci = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments = &att,
+        .subpassCount = 1,
+        .pSubpasses = &subpass,
+    };
+    VkRenderPass rp = VK_NULL_HANDLE;
+    CHECK_VK(pvkCreateRenderPass(dev, &rp_ci, NULL, &rp));
+
+    VkFramebufferCreateInfo fb_ci = {
+        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+        .renderPass = rp,
+        .attachmentCount = 1,
+        .pAttachments = &iv,
+        .width = img_w,
+        .height = img_h,
+        .layers = 1,
+    };
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    CHECK_VK(pvkCreateFramebuffer(dev, &fb_ci, NULL, &fb));
+
+    for (uint32_t i = 0; i < img_pixels; i++) {
+        words[i] = 0x11223344u;
+    }
+    CHECK_VK(pvkResetFences(dev, 1, &fence));
+
+    VkClearValue clear_val = {
+        .color = { .float32 = { 64.0f / 255.0f, 128.0f / 255.0f, 192.0f / 255.0f, 1.0f } }
+    };
+    VkRenderPassBeginInfo rp_bi = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = rp,
+        .framebuffer = fb,
+        .renderArea = { { 0, 0 }, { img_w, img_h } },
+        .clearValueCount = 1,
+        .pClearValues = &clear_val,
+    };
+    VkImageMemoryBarrier img_bar = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    VkBufferImageCopy bic = {
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { img_w, img_h, 1 },
+    };
+
+    CHECK_VK(pvkBeginCommandBuffer(cmds[2], &cbbi));
+    pvkCmdBeginRenderPass(cmds[2], &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+    pvkCmdEndRenderPass(cmds[2]);
+    pvkCmdPipelineBarrier(cmds[2],
+                          VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          0, 0, NULL, 0, NULL, 1, &img_bar);
+    pvkCmdCopyImageToBuffer(cmds[2], img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &bic);
+    CHECK_VK(pvkEndCommandBuffer(cmds[2]));
+
+    VkSubmitInfo si2 = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmds[2],
+    };
+    printf("  [B3/3] Submitting Optimal-Tiled 3D VkImage RenderPass + vkCmdCopyImageToBuffer (%ux%u BGRA8)...\n",
+           img_w, img_h);
+    CHECK_VK(pvkQueueSubmit(queue, 1, &si2, fence));
+    CHECK_VK(pvkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL));
+
+    uint32_t img_mismatches = 0;
+    for (uint32_t i = 0; i < img_pixels; i++) {
+        const uint32_t px = words[i];
+        const int b = (int)(px & 0xFFu);
+        const int g = (int)((px >> 8) & 0xFFu);
+        const int r = (int)((px >> 16) & 0xFFu);
+        const int a = (int)((px >> 24) & 0xFFu);
+        if (abs(b - 0xC0) > 1 || abs(g - 0x80) > 1 || abs(r - 0x40) > 1 || a != 0xFF) {
+            if (img_mismatches < 4) {
+                fprintf(stderr, "  [MISMATCH B3] pixel[%u]: expected ~0xFF4080C0, got 0x%08x\n", i, px);
+            }
+            img_mismatches++;
+        }
+    }
+    if (img_mismatches == 0) {
+        printf("  [PASS B3] Verified %u / %u rendered BGRA8 pixels == 0x%08x!\n",
+               img_pixels, img_pixels, words[0]);
+    }
+
+    pvkDestroyFramebuffer(dev, fb, NULL);
+    pvkDestroyRenderPass(dev, rp, NULL);
+    pvkDestroyImageView(dev, iv, NULL);
+    pvkDestroyImage(dev, img, NULL);
+    pvkFreeMemory(dev, img_mem, NULL);
+
     int rc = 0;
-    if (copy_mismatches == 0 && mismatches == 0) {
-        printf("\n[PASS] Stage 2 PASSED: Mesa ANV Vulkan 1.3 Copy + Fill executed cleanly on Intel Arc!\n");
+    if (copy_mismatches == 0 && mismatches == 0 && img_mismatches == 0) {
+        printf("\n[PASS] Stage 2 PASSED: Mesa ANV Vulkan 1.3 Buffer + Optimal-Tiled 3D VkImage executed cleanly on Intel Arc!\n");
     } else {
-        fprintf(stderr, "\n[FAIL] Stage 2 FAILED: B1_mismatches=%u, B2_mismatches=%u (of %u words)!\n",
-                copy_mismatches, mismatches, total_words);
+        fprintf(stderr, "\n[FAIL] Stage 2 FAILED: B1=%u, B2=%u, B3_img=%u mismatches!\n",
+                copy_mismatches, mismatches, img_mismatches);
         rc = 12;
     }
 

@@ -321,6 +321,48 @@ def main() -> None:
     )
     replace_once(
         anv_pdev,
+        "   struct intel_device_info devinfo;\n"
+        "   if (!intel_get_device_info_from_fd(fd, &devinfo, 9, -1)) {\n"
+        "      result = VK_ERROR_INCOMPATIBLE_DRIVER;\n"
+        "      goto fail_fd;\n"
+        "   }",
+        "   struct intel_device_info devinfo;\n"
+        "   if (!intel_get_device_info_from_fd(fd, &devinfo, 9, -1)) {\n"
+        "      result = VK_ERROR_INCOMPATIBLE_DRIVER;\n"
+        "      goto fail_fd;\n"
+        "   }\n"
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_XNU_NO_AUX_CCS: Disable multi-process global AuxCCS page table\n"
+        "    * (GFX_AUX_TABLE_BASE_ADDR 0x4200 / CCS_AUX_INV 0x4208) by default so\n"
+        "    * all 3D VkImage render targets and sampled textures render directly\n"
+        "    * into uncompressed coherent UMA tiles (ISL_AUX_USAGE_NONE).\n"
+        "    */\n"
+        "   {\n"
+        '      const char *aux_env = getenv("ARCMTL_AUX_CCS");\n'
+        "      if (!(aux_env && aux_env[0] == '1')) {\n"
+        "         intel_debug |= DEBUG_NO_CCS;\n"
+        "         devinfo.has_aux_map = false;\n"
+        "         devinfo.has_flat_ccs = false;\n"
+        "      }\n"
+        "   }\n"
+        "#endif",
+        "ARCXE_XNU_NO_AUX_CCS",
+    )
+    replace_once(
+        anv_pdev,
+        "   intel_common_update_device_info(fd, &device->info);",
+        "   intel_common_update_device_info(fd, &device->info);\n"
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_XNU_NO_AUX_CCS_POST */\n"
+        "   if (INTEL_DEBUG(DEBUG_NO_CCS)) {\n"
+        "      device->info.has_aux_map = false;\n"
+        "      device->info.has_flat_ccs = false;\n"
+        "   }\n"
+        "#endif",
+        "ARCXE_XNU_NO_AUX_CCS_POST",
+    )
+    replace_once(
+        anv_pdev,
         "   } else {\n      device->sync_syncobj_type = vk_drm_syncobj_get_type(fd);\n   }",
         "   } else {\n"
         "#ifdef __APPLE__\n"

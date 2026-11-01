@@ -732,6 +732,19 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     const uint64_t seqno = ++q->lastSubmittedSeqno;
     const uint32_t invalScratchGgtt = q->invalScratchGgtt;
 
+    /*
+     * Invalidate GAM Aux-Table TLB while engine is idle between batches (Linux xe_ring_ops.c:52-70)
+     * using a bounded MMIO poll so CS never stalls on MI_SEMAPHORE_WAIT when AuxCCS is disabled.
+     */
+    if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
+        wr32(ARC_REG_CCS_AUX_INV, ARC_AUX_INV);
+        for (uint32_t us = 0; us < 200u; us += 2u) {
+            if ((rd32(ARC_REG_CCS_AUX_INV) & ARC_AUX_INV) == 0u)
+                break;
+            IODelay(2);
+        }
+    }
+
     /* Never allow a multi-dword CS instruction packet to straddle the end of the ring buffer */
     if ((q->ringSize - q->ringTail) < 224u) {
         while (q->ringTail != 0u) {

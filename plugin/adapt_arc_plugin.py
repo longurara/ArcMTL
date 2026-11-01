@@ -158,6 +158,47 @@ def transform_vendor_compiler_m(text: str) -> str:
     return text
 
 
+def transform_objects_m(text: str) -> str:
+    # Default IOSurface upload (nvmtlSurfaceIn) and readback (nvmtlSurfaceOutDirtied:) on Intel Arc UMA
+    # to the 100%-coherent kIOMemoryKernelUserShared staging buffer path (nvmtl_vk_image_write /
+    # nvmtl_vk_image_read) unless ARCMTL_SURFIN_UPLOAD=gpu / ARCMTL_SURFOUT_READBACK=gpu is explicitly
+    # requested. XNU IOSurface mappings use Write-Combining CPU PTEs and unwire across IOSurfaceUnlock,
+    # which can otherwise mismatch GPU L4 WB (PAT[4]) userptr imports without failing VkResult.
+    text, n1 = re.subn(
+        r"static\s+bool\s+nvmtl_surfin_import\s*\(\s*void\s*\)\s*\{[^}]*\}",
+        "static bool nvmtl_surfin_import(void) {\n"
+        "    static int on = -1;\n"
+        "    if (on < 0) {\n"
+        '        const char *u = getenv("ARCMTL_SURFIN_UPLOAD");\n'
+        '        if (!u) u = getenv("NVMTL_SURFIN_UPLOAD");\n'
+        '        on = (u && !strcmp(u, "gpu")) ? 1 : 0;\n'
+        "    }\n"
+        "    return on != 0;\n"
+        "}",
+        text,
+        count=1,
+    )
+    text, n2 = re.subn(
+        r"static\s+bool\s+nvmtl_surfout_import\s*\(\s*void\s*\)\s*\{[^}]*\}",
+        "static bool nvmtl_surfout_import(void) {\n"
+        "    static int on = -1;\n"
+        "    if (on < 0) {\n"
+        '        const char *u = getenv("ARCMTL_SURFOUT_READBACK");\n'
+        '        if (!u) u = getenv("NVMTL_SURFOUT_READBACK");\n'
+        '        on = (u && !strcmp(u, "gpu")) ? 1 : 0;\n'
+        "    }\n"
+        "    return on != 0;\n"
+        "}",
+        text,
+        count=1,
+    )
+    if n1 == 0 or n2 == 0:
+        raise RuntimeError(
+            f"Failed to patch nvmtl_surfin_import / nvmtl_surfout_import in ArcMTLObjects.m (n1={n1}, n2={n2})"
+        )
+    return text
+
+
 def transform_vk_c(text: str) -> str:
     # 1. Hard-lock nvmtl_vk_set_accelerator and nvmtl_vk_vendor to Intel 0x8086.
     # CRITICAL on Dual-GPU systems: upstream nvmtl_vk_vendor() probes IOServiceMatching("NVAccel")
@@ -252,6 +293,8 @@ def adapt_plugin_tree(src_dir: Path, dst_dir: Path) -> None:
 
             if out_name == "ArcMTLDevice.m":
                 out = transform_device_m(out)
+            elif out_name == "ArcMTLObjects.m":
+                out = transform_objects_m(out)
             elif out_name == "ArcMTLLibraryLoad.m":
                 out = transform_library_load_m(out)
             elif out_name == "ArcMTLVendorCompiler.m":
@@ -323,6 +366,23 @@ def run_self_test() -> None:
     assert "if (nvmtl_vk_vendor() == 0x8086) { int rb = nvmtl_rebind_import" in out_vk
     assert "nvmtl_vk_vendor() != 0x8086" in out_vk
     assert 'CFSTR("ArcAccelHeadless")' in out_vk
+
+    sample_obj = (
+        'static bool nvmtl_surfin_import(void) {\n'
+        '    static int on = -1;\n'
+        '    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }\n'
+        '    return on;\n'
+        '}\n'
+        'static bool nvmtl_surfout_import(void) {\n'
+        '    static int on = -1;\n'
+        '    if (on < 0) { const char *u = getenv("NVMTL_SURFOUT_READBACK"); on = !(u && !strcmp(u, "cpu")); }\n'
+        '    return on;\n'
+        '}\n'
+    )
+    out_obj = transform_objects_m(transform_common(sample_obj))
+    assert 'getenv("ARCMTL_SURFIN_UPLOAD")' in out_obj
+    assert 'getenv("ARCMTL_SURFOUT_READBACK")' in out_obj
+    assert '!strcmp(u, "gpu")' in out_obj
     print("[adapt_arc_plugin] Self-test PASSED.")
 
 
