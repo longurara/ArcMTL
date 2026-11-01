@@ -349,8 +349,8 @@ bool ArcXeService::start(IOService *provider)
         if (curMem) {
             const unsigned int cnt = curMem->getCount();
             for (unsigned int i = 0; i < cnt; i++) {
-                if (auto *m = OSDynamicCast(IODeviceMemory, curMem->getObject(i))) {
-                    if (m->getPhysicalAddress() == (IOPhysicalAddress)fStolenPhys) {
+                if (auto *m = OSDynamicCast(IOMemoryDescriptor, curMem->getObject(i))) {
+                    if (m->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) == (addr64_t)fStolenPhys) {
                         hasDsm = true;
                         break;
                     }

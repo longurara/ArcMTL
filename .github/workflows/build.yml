@@ -232,6 +232,19 @@ jobs:
           ARC_TAHOE=0 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/15"
           ARC_TAHOE=1 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/26"
           ditto "$PWD/out/kexts/26/ArcAccel.kext" "$PWD/out/kexts/ArcAccel.kext"
+          STAGE="$(mktemp -d /var/tmp/arcmtl_fast_kc.XXXXXX)"
+          mkdir -p "$STAGE/Extensions"
+          sudo ditto "out/kexts/ArcXe.kext" "$STAGE/Extensions/ArcXe.kext"
+          sudo ditto "out/kexts/ArcFB.kext" "$STAGE/Extensions/ArcFB.kext"
+          sudo ditto "out/kexts/26/ArcAccel.kext" "$STAGE/Extensions/ArcAccel.kext"
+          sudo chown -R root:wheel "$STAGE/Extensions"
+          sudo chmod -R 755 "$STAGE/Extensions"
+          KS="/System/Library/KernelCollections/SystemKernelExtensions.kc"
+          [ -f "$KS" ] || KS="/Library/Apple/System/Library/KernelCollections/SystemKernelExtensions.kc"
+          KM_ARGS=(--allow-missing-kdk)
+          [ -f "/System/Library/Kernels/kernel" ] && KM_ARGS+=(--kernel "/System/Library/Kernels/kernel")
+          sudo kmutil create -n aux --volume-root / "${KM_ARGS[@]}" -B "$KB" -S "$KS" --repository "$STAGE/Extensions" -A "$STAGE/test_aux.kc" -z
+          sudo rm -rf "$STAGE"
           tar -czf ArcKexts-macos26-15-x86_64.tar.gz -C out kexts
 
       - name: Upload Fast Kexts Artifact

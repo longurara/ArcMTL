@@ -55,7 +55,7 @@
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOAcceleratorFamily2</key>
-		<string>1.0.0</string>
+		<string>2.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>2.1</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
