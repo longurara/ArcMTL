@@ -537,6 +537,27 @@ static void record_vm_bind_locked(int fd, uint32_t vm_id, uint32_t gem_handle, u
  * 5. Main DRM / Xe Ioctl Translator (`intel_ioctl` -> `arc_xnu_ioctl`)
  * ============================================================================ */
 
+struct ArcSyncProvider {
+    struct util_sync_provider base;
+    int                       fd;
+};
+
+static int arc_sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle);
+static int arc_sync_destroy(struct util_sync_provider *p, uint32_t handle);
+static int arc_sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_handles,
+                         int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled);
+static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
+                                  unsigned num_handles, int64_t timeout_nsec, unsigned flags,
+                                  uint32_t *first_signaled);
+static int arc_sync_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t count);
+static int arc_sync_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t count);
+static int arc_sync_timeline_signal(struct util_sync_provider *p, const uint32_t *handles,
+                                    uint64_t *points, uint32_t count);
+static int arc_sync_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
+                          uint32_t count, uint32_t flags);
+static int arc_sync_transfer(struct util_sync_provider *p, uint32_t dst_handle, uint64_t dst_point,
+                             uint32_t src_handle, uint64_t src_point, uint32_t flags);
+
 int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
 {
     pthread_mutex_lock(&g_arc_lock);
@@ -849,6 +870,121 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
         return 0;
     }
 
+    case DRM_IOCTL_SYNCOBJ_CREATE: {
+        struct drm_syncobj_create *sc = (struct drm_syncobj_create *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        int err = arc_sync_create(&sp.base, sc->flags, &sc->handle);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_DESTROY: {
+        struct drm_syncobj_destroy *sd = (struct drm_syncobj_destroy *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        int err = arc_sync_destroy(&sp.base, sd->handle);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_WAIT: {
+        struct drm_syncobj_wait *sw = (struct drm_syncobj_wait *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        uint32_t *handles = (uint32_t *)(uintptr_t)sw->handles;
+        uint32_t first = 0;
+        int err = arc_sync_wait(&sp.base, handles, sw->count_handles,
+                                sw->timeout_nsec, sw->flags, &first);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        sw->first_signaled = first;
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: {
+        struct drm_syncobj_timeline_wait *tw = (struct drm_syncobj_timeline_wait *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        uint32_t *handles = (uint32_t *)(uintptr_t)tw->handles;
+        uint64_t *points  = (uint64_t *)(uintptr_t)tw->points;
+        uint32_t first = 0;
+        int err = arc_sync_timeline_wait(&sp.base, handles, points, tw->count_handles,
+                                         tw->timeout_nsec, tw->flags, &first);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        tw->first_signaled = first;
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_RESET: {
+        struct drm_syncobj_array *sa = (struct drm_syncobj_array *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        const uint32_t *handles = (const uint32_t *)(uintptr_t)sa->handles;
+        int err = arc_sync_reset(&sp.base, handles, sa->count_handles);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_SIGNAL: {
+        struct drm_syncobj_array *sa = (struct drm_syncobj_array *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        const uint32_t *handles = (const uint32_t *)(uintptr_t)sa->handles;
+        int err = arc_sync_signal(&sp.base, handles, sa->count_handles);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL: {
+        struct drm_syncobj_timeline_array *ta = (struct drm_syncobj_timeline_array *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        const uint32_t *handles = (const uint32_t *)(uintptr_t)ta->handles;
+        uint64_t *points        = (uint64_t *)(uintptr_t)ta->points;
+        int err = arc_sync_timeline_signal(&sp.base, handles, points, ta->count_handles);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_QUERY: {
+        struct drm_syncobj_timeline_array *ta = (struct drm_syncobj_timeline_array *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        uint32_t *handles = (uint32_t *)(uintptr_t)ta->handles;
+        uint64_t *points  = (uint64_t *)(uintptr_t)ta->points;
+        int err = arc_sync_query(&sp.base, handles, points, ta->count_handles, ta->flags);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
+    case DRM_IOCTL_SYNCOBJ_TRANSFER: {
+        struct drm_syncobj_transfer *st = (struct drm_syncobj_transfer *)arg;
+        struct ArcSyncProvider sp = { .fd = fd };
+        int err = arc_sync_transfer(&sp.base, st->dst_handle, st->dst_point,
+                                    st->src_handle, st->src_point, st->flags);
+        if (err < 0) {
+            errno = -err;
+            return -1;
+        }
+        return 0;
+    }
+
     default:
         errno = ENOTTY;
         return -1;
@@ -858,11 +994,6 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
 /* ============================================================================
  * 6. Mesa `util_sync_provider` Implementation (Zero libdrm Dependency)
  * ============================================================================ */
-
-struct ArcSyncProvider {
-    struct util_sync_provider base;
-    int                       fd;
-};
 
 static int arc_sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
 {

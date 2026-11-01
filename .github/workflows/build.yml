@@ -81,7 +81,7 @@ jobs:
           python3 -m pip install --user --break-system-packages mako pyyaml packaging || \
             pip3 install --user mako pyyaml packaging
 
-      - name: Fetch & Patch Third-Party Sources (Vulkan-Headers, Mesa 25.0.7, NullMoth)
+      - name: Fetch & Patch Third-Party Sources (Vulkan-Headers, Mesa 26.2.6, NullMoth)
         run: |
           bash scripts/fetch_deps.sh
 

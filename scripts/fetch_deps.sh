@@ -9,7 +9,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TP="$ROOT/third_party"
-MESA_TAG="${MESA_TAG:-mesa-25.0.7}"
+MESA_TAG="${MESA_TAG:-mesa-26.2.6}"
 FORCE="${1:-}"
 
 mkdir -p "$TP" "$ROOT/build"

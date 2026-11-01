@@ -714,20 +714,23 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 
             IOLockLock(fClientLock);
             for (uint32_t i = 0; i < count; i++) {
-                const uint32_t h = in->handles[i];
+                const uint32_t h  = in->handles[i];
+                const uint64_t pt = in->points[i];
                 bool ready = false;
                 if (h == 0 || h >= kArcMaxSyncobjs || !fSyncobjs[h].inUse) {
                     ready = true;
-                } else if (fSyncobjs[h].signaled) {
-                    ready = true;
-                } else if (fSyncobjs[h].boundQueue) {
-                    if (*fSyncobjs[h].boundQueue->seqnoCpu >= fSyncobjs[h].waitSeqno) {
-                        fSyncobjs[h].signaled   = true;
-                        fSyncobjs[h].boundQueue = nullptr;
+                } else {
+                    if (!fSyncobjs[h].signaled && fSyncobjs[h].boundQueue) {
+                        if (*fSyncobjs[h].boundQueue->seqnoCpu >= fSyncobjs[h].waitSeqno) {
+                            fSyncobjs[h].signaled   = true;
+                            fSyncobjs[h].boundQueue = nullptr;
+                        } else if (!pendingQ) {
+                            pendingQ   = fSyncobjs[h].boundQueue;
+                            pendingSeq = fSyncobjs[h].waitSeqno;
+                        }
+                    }
+                    if (fSyncobjs[h].signaled && (pt == 0 || fSyncobjs[h].timelineValue >= pt)) {
                         ready = true;
-                    } else if (!pendingQ) {
-                        pendingQ   = fSyncobjs[h].boundQueue;
-                        pendingSeq = fSyncobjs[h].waitSeqno;
                     }
                 }
 
