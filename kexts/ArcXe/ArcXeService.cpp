@@ -188,8 +188,9 @@ void ArcXeService::programMtlPatTable()
         wr32(ARC_REG_PAT_INDEX(i), kXelpgPat[i]);
         gt1Wr32(ARC_REG_PAT_INDEX(i), kXelpgPat[i]);
     }
-    /* Page table walk attribute: L4 WB */
-    wr32(ARC_REG_PAT_PTA, ARC_XELPG_PAT_L4_WB | ARC_XELPG_PAT_COH_NONE);
+    /* Coherent page-table walk attribute (L4 WB + 1-Way Coherent, matching PAT[3]) */
+    wr32(ARC_REG_PAT_PTA, ARC_XELPG_PAT_L4_WB | ARC_XELPG_PAT_COH_1WAY);
+    gt1Wr32(ARC_REG_PAT_PTA, ARC_XELPG_PAT_L4_WB | ARC_XELPG_PAT_COH_1WAY);
     (void)rd32(ARC_REG_PAT_INDEX(3));
 
     AXELOG("Programmed Xe-LPG PAT[0..4] = {0x%02x, 0x%02x, 0x%02x, 0x%02x, 0x%02x}",
@@ -226,9 +227,10 @@ void ArcXeService::programMtlMocsTable()
         { ARC_MOCS_IG_PAT,                      ARC_L3_GLBGO | ARC_L3_1_UC },              /* 15: CCS Non-Displayable */
     };
 
-    /* Ensure GT0 MCR steering is in multicast broadcast mode across all DSS/L3 banks */
-    const uint32_t prevMcr = rd32(ARC_REG_MTL_MCR_SELECTOR);
-    wr32(ARC_REG_MTL_MCR_SELECTOR, prevMcr | ARC_MCR_MULTICAST);
+    /* Steer GT0 MCR selectors to group 0 / instance 0 with multicast write broadcast enabled */
+    wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
 
     for (uint32_t i = 0; i < ARC_MTL_NUM_MOCS_ENTRIES; i++) {
@@ -241,6 +243,31 @@ void ArcXeService::programMtlMocsTable()
     }
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
     AXELOG("Programmed Xe-LPG GLOBAL_MOCS[0..15] (IG_PAT=1) & LNCFCMOCS[0..7]");
+}
+
+void ArcXeService::applyXeLpgWorkarounds()
+{
+    /*
+     * Meteor Lake Xe-LPG (Graphics IP 12.70..12.74) GT, Engine & LRC Hardware Workarounds
+     * (Linux drivers/gpu/drm/xe/xe_wa.c: gt_was / engine_was / lrc_was).
+     * Must be applied with forcewake held and re-applied after any GRDOM_RENDER reset.
+     */
+    wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+
+    /* GT MCR workarounds (non-masked RMW on group 0/instance 0 -> multicast broadcast) */
+    wr32(ARC_REG_COMP_MOD_CTRL, rd32(ARC_REG_COMP_MOD_CTRL) | ARC_FORCE_MISS_FTLB);       /* Wa_14018575942 */
+    wr32(ARC_REG_SQCNT1,        rd32(ARC_REG_SQCNT1)        | ARC_SQCNT1_ENFORCE_RAR);    /* Wa_22016670082 */
+
+    /* Engine & LRC masked MCR chicken workarounds for RCS0/CCS0 */
+    wr32(ARC_REG_ROW_CHICKEN3,      ARC_MASKED_ENABLE(ARC_DIS_FIX_EOT1_FLUSH));           /* Wa_14017856879 */
+    wr32(ARC_REG_XEHP_HDC_CHICKEN0, ARC_MASKED_ENABLE(ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES));/* Wa_14015150844 */
+    wr32(ARC_REG_ROW_CHICKEN2,      ARC_MASKED_ENABLE(ARC_DISABLE_TDL_SVHS_GATING));      /* Wa_14020495402 */
+    wr32(ARC_REG_XEHP_PSS_CHICKEN,  ARC_MASKED_ENABLE(ARC_FD_END_COLLECT));               /* Wa_14019877138 */
+    wr32(ARC_REG_CACHE_MODE_1,      ARC_MASKED_ENABLE(ARC_MSAA_OPTIMIZATION_REDUC_DIS));  /* Wa_18019271663 */
+    (void)rd32(ARC_REG_ROW_CHICKEN3);
 }
 
 void ArcXeService::invalidateGlobalTlb()
@@ -357,6 +384,7 @@ bool ArcXeService::start(IOService *provider)
     readTopologyAndClocks();
     programMtlPatTable();
     programMtlMocsTable();
+    applyXeLpgWorkarounds();
 
     if (!initGgtt()) {
         forceWakePut();

@@ -499,9 +499,9 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
         size_t out_sz = sizeof(live);
         IOConnectCallStructMethod(s->connect, kArcXeMethodQueryDevice, NULL, 0, &live, &out_sz);
 
-        static mach_timebase_info_data_t tb = {0, 0};
-        if (tb.denom == 0) mach_timebase_info(&tb);
-        const uint64_t cpu_ns = (mach_absolute_time() * tb.numer) / tb.denom;
+        struct timespec now_ts = {0, 0};
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        const uint64_t cpu_ns = (uint64_t)now_ts.tv_sec * 1000000000ULL + (uint64_t)now_ts.tv_nsec;
 
         struct drm_xe_query_engine_cycles *ec = (struct drm_xe_query_engine_cycles *)(uintptr_t)q->data;
         ec->engine_cycles = live.gpu_timestamp_ticks;
@@ -1084,10 +1084,10 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
     pthread_mutex_unlock(&g_arc_lock);
     if (conn == IO_OBJECT_NULL) return -EBADF;
 
-    /* Convert Mesa's absolute CLOCK_MONOTONIC deadline to relative wait duration */
-    static mach_timebase_info_data_t tb = {0, 0};
-    if (tb.denom == 0) mach_timebase_info(&tb);
-    const int64_t now_ns = (int64_t)((mach_absolute_time() * tb.numer) / tb.denom);
+    /* Convert Mesa's absolute CLOCK_MONOTONIC deadline (os_time_get_nano) to relative wait duration */
+    struct timespec now_ts = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    const int64_t now_ns = (int64_t)now_ts.tv_sec * 1000000000LL + (int64_t)now_ts.tv_nsec;
     int64_t rel_ns = 0;
     if (timeout_nsec == INT64_MAX)
         rel_ns = 5000000000LL;

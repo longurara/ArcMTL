@@ -250,6 +250,18 @@ struct ArcXeWaitQueueOut {
     uint64_t completed_seqno;
     uint32_t timed_out;
     uint32_t engine_status;
+    uint32_t engine_status_hi;
+    uint32_t current_lrca;
+    uint32_t ring_head;
+    uint32_t ring_tail;
+    uint32_t ring_start;
+    uint32_t ring_ctl;
+    uint32_t acthd_lo;
+    uint32_t acthd_hi;
+    uint32_t ipehr;
+    uint32_t esr;
+    uint32_t instdone;
+    uint32_t mi_mode;
 };
 
 /* 13..16. Syncobj Operations (for Mesa vk_drm_syncobj compatibility) */

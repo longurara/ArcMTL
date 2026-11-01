@@ -620,15 +620,10 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
 
         uint64_t completed = 0;
         bool timedOut = false;
-        fOwner->waitQueueSeqno(q, in->target_seqno, in->timeout_ns, &completed, &timedOut);
-
         bzero(out, sizeof(*out));
+        fOwner->waitQueueSeqno(q, in->target_seqno, in->timeout_ns, &completed, &timedOut, out);
         out->completed_seqno = completed;
         out->timed_out       = timedOut ? 1u : 0u;
-        if (fOwner->forceWakeGet()) {
-            out->engine_status = fOwner->rd32(ARC_RING_EXECLIST_STATUS_LO(q->mmioBase));
-            fOwner->forceWakePut();
-        }
         args->structureOutputSize = sizeof(*out);
         return kIOReturnSuccess;
     }

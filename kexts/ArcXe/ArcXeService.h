@@ -183,6 +183,7 @@ public:
     void readTopologyAndClocks();
     void programMtlPatTable();
     void programMtlMocsTable();
+    void applyXeLpgWorkarounds();
     void invalidateGlobalTlb();
 
     /* Memory & Page Table Subsystem (ArcXeMemory.cpp) */
@@ -207,12 +208,15 @@ public:
     /* Execution & GuC Subsystem (ArcXeExec.cpp) */
     bool initEngines();
     void teardownEngines();
+    void armEngineHw(uint32_t base, ArcBo *hwsp);
+    bool resetEngineHw(uint32_t base, ArcBo *hwsp);
     uint32_t engineMmioBase(uint16_t engineClass, uint16_t engineInstance, ArcBo **outHwsp) const;
     ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance, uint32_t ringSize);
     void          destroyExecQueue(ArcExecQueue *q);
     IOReturn      submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno);
     IOReturn      waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
-                                 uint64_t *outCompleted, bool *outTimedOut);
+                                 uint64_t *outCompleted, bool *outTimedOut,
+                                 ArcXeWaitQueueOut *outDiag = nullptr);
     bool          tryLoadGucFirmwareFromDisk(const char *fwPath);
     static void   gucLoaderThreadEntry(void *arg, wait_result_t);
 

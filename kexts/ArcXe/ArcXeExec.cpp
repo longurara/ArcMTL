@@ -41,6 +41,81 @@ uint32_t ArcXeService::engineMmioBase(uint16_t engineClass, uint16_t engineInsta
     }
 }
 
+void ArcXeService::armEngineHw(uint32_t base, ArcBo *hwsp)
+{
+    if (!base || !hwsp) return;
+
+    wr32(ARC_RING_HWS_PGA(base), hwsp->ggttOffset);
+    (void)rd32(ARC_RING_HWS_PGA(base));
+    wr32(ARC_RING_HWSTAM(base), 0xFFFFFFFFu);
+    wr32(ARC_RING_IMR(base), 0xFFFFFFFFu); /* Mask ring IRQs (polling/seqno completion used) */
+    wr32(ARC_RING_EIR(base), 0xFFFFFFFFu);
+    wr32(ARC_RING_ESR(base), 0u);
+    /* Default CS MOCS for commands without explicit MOCS (BSpec 72161: MTL uc_index = 9) */
+    wr32(ARC_RING_CMD_CCTL(base),
+         ((0x3F00u | 0x007Eu) << 16) | (ARC_MTL_MOCS_UC_INDEX << 8) | (ARC_MTL_MOCS_UC_INDEX << 1));
+    /* Masked write: enable Execlist mode (disable legacy ringbuffer mode) */
+    wr32(ARC_RING_GFX_MODE(base), ARC_MASKED_ENABLE(ARC_GFX_DISABLE_LEGACY_MODE));
+    /* Ensure ring streamer is not halted in MI_MODE (STOP_RING is BIT(8); BIT(9) is read-only MODE_IDLE) */
+    wr32(ARC_RING_MI_MODE(base), ARC_MASKED_DISABLE(ARC_MI_STOP_RING));
+    (void)rd32(ARC_RING_MI_MODE(base));
+}
+
+bool ArcXeService::resetEngineHw(uint32_t base, ArcBo *hwsp)
+{
+    /*
+     * Hardware Engine Domain Reset (Linux i915/gt/intel_reset.c: gen8_engine_reset_prepare +
+     * gen6_hw_domain_reset + gen8_engine_reset_cancel). Caller MUST hold forceWakeGet().
+     * Only resets GT Render/Blitter domain — Display Engine & DSM GOP scanout are untouched.
+     */
+    const uint32_t domainMask = (base == ARC_BLT_RING_BASE) ? ARC_GRDOM_BLT : ARC_GRDOM_RENDER;
+
+    wr32(ARC_RING_MI_MODE(base), ARC_MASKED_ENABLE(ARC_MI_STOP_RING));
+    for (uint32_t us = 0; us < 2000; us += 10) {
+        if (rd32(ARC_RING_MI_MODE(base)) & ARC_MI_MODE_IDLE)
+            break;
+        IODelay(10);
+    }
+
+    const uint32_t ack = rd32(ARC_RING_RESET_CTL(base));
+    if (ack & ARC_RESET_CTL_CAT_ERROR) {
+        wr32(ARC_RING_RESET_CTL(base), ARC_MASKED_ENABLE(ARC_RESET_CTL_CAT_ERROR));
+        for (uint32_t us = 0; us < 10000; us += 10) {
+            if ((rd32(ARC_RING_RESET_CTL(base)) & ARC_RESET_CTL_CAT_ERROR) == 0)
+                break;
+            IODelay(10);
+        }
+    } else if ((ack & ARC_RESET_CTL_READY_TO_RESET) == 0) {
+        wr32(ARC_RING_RESET_CTL(base), ARC_MASKED_ENABLE(ARC_RESET_CTL_REQUEST_RESET));
+        for (uint32_t us = 0; us < 10000; us += 10) {
+            if (rd32(ARC_RING_RESET_CTL(base)) & ARC_RESET_CTL_READY_TO_RESET)
+                break;
+            IODelay(10);
+        }
+    }
+
+    wr32(ARC_REG_GDRST, domainMask);
+    bool resetOk = false;
+    for (uint32_t us = 0; us < 50000; us += 10) {
+        if ((rd32(ARC_REG_GDRST) & domainMask) == 0) {
+            resetOk = true;
+            break;
+        }
+        IODelay(10);
+    }
+    IODelay(50);
+
+    wr32(ARC_RING_RESET_CTL(base), ARC_MASKED_DISABLE(ARC_RESET_CTL_REQUEST_RESET));
+
+    /* Re-apply MOCS and Xe-LPG MCR workarounds after render domain reset */
+    if (domainMask == ARC_GRDOM_RENDER) {
+        programMtlMocsTable();
+        applyXeLpgWorkarounds();
+    }
+    armEngineHw(base, hwsp);
+    return resetOk;
+}
+
 bool ArcXeService::initEngines()
 {
     fEngineLock = IOLockAlloc();
@@ -72,18 +147,9 @@ bool ArcXeService::initEngines()
             }
             continue;
         }
-        wr32(ARC_RING_HWS_PGA(e.base), e.hwsp->ggttOffset);
-        (void)rd32(ARC_RING_HWS_PGA(e.base));
-        wr32(ARC_RING_HWSTAM(e.base), 0xFFFFFFFFu);
-        wr32(ARC_RING_IMR(e.base), 0xFFFFFFFFu); /* Mask ring IRQs (polling/seqno completion used) */
-        /* Default CS MOCS for commands without explicit MOCS (BSpec 72161: MTL uc_index = 9) */
-        wr32(ARC_RING_CMD_CCTL(e.base),
-             ((0x3F00u | 0x007Eu) << 16) | (ARC_MTL_MOCS_UC_INDEX << 8) | (ARC_MTL_MOCS_UC_INDEX << 1));
-        /* Masked write: enable Execlist mode (disable legacy ringbuffer mode) */
-        wr32(ARC_RING_GFX_MODE(e.base), ARC_MASKED_ENABLE(ARC_GFX_DISABLE_LEGACY_MODE));
-        /* Ensure ring streamer is not halted in MI_MODE */
-        wr32(ARC_RING_MI_MODE(e.base), ARC_MASKED_DISABLE((1u << 9) | (1u << 11)));
-        AXELOG("engine %s armed: base=0x%05x HWSP_GGTT=0x%08x", e.name, e.base, e.hwsp->ggttOffset);
+        const bool rstOk = resetEngineHw(e.base, e.hwsp);
+        AXELOG("engine %s armed (reset=%d): base=0x%05x HWSP_GGTT=0x%08x MI_MODE=0x%08x",
+               e.name, rstOk ? 1 : 0, e.base, e.hwsp->ggttOffset, rd32(ARC_RING_MI_MODE(e.base)));
     }
 
     forceWakePut();
@@ -235,10 +301,11 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     reg[0x2D] = 0u;
     reg[0x2E] = base + 0x278u; /* PDP1_LDW */
     reg[0x2F] = 0u;
+    const uint64_t pdp0Desc = arcEncodePpgttPde(q->pml4Phys);
     reg[0x30] = base + 0x274u; /* PDP0_UDW */
-    reg[0x31] = (uint32_t)(q->pml4Phys >> 32);
+    reg[0x31] = (uint32_t)(pdp0Desc >> 32);
     reg[0x32] = base + 0x270u; /* PDP0_LDW */
-    reg[0x33] = (uint32_t)(q->pml4Phys & 0xFFFFFFFFULL);
+    reg[0x33] = (uint32_t)(pdp0Desc & 0xFFFFFFFFULL);
 
     if (isRcs) {
         reg[0x34] = ARC_MI_NOOP;
@@ -258,10 +325,19 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         reg[0x34] = ARC_MI_BATCH_BUFFER_END_CTX; /* 0x05000001: End Context Restore! */
     }
 
-    /* Enable arbitration at start of ring */
-    q->ringCpu[0] = ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE;
-    q->ringCpu[1] = ARC_MI_NOOP;
-    q->ringTail   = 8u;
+    /* Enable arbitration + Wa_14019789679 (zero 3DSTATE_MESH_CONTROL on Xe-LPG RCS0) at start of ring */
+    uint32_t initDw = 0;
+    q->ringCpu[initDw++] = ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE;
+    if (isRcs) {
+        q->ringCpu[initDw++] = ARC_CMD_3DSTATE_MESH_CONTROL;
+        q->ringCpu[initDw++] = 0u;
+        q->ringCpu[initDw++] = 0u;
+    } else {
+        q->ringCpu[initDw++] = ARC_MI_NOOP;
+    }
+    if (initDw & 1u)
+        q->ringCpu[initDw++] = ARC_MI_NOOP;
+    q->ringTail = initDw * 4u;
     reg[ARC_CTX_RING_HEAD_VAL] = 0u;
     reg[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
     __asm__ __volatile__("mfence" ::: "memory");
@@ -310,13 +386,14 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     const uint32_t invalScratchGgtt = q->pphwspGgttAddr + 0x60u;
 
     /* Never allow a multi-dword CS instruction packet to straddle the end of the ring buffer */
-    if ((q->ringSize - q->ringTail) < 160u) {
+    if ((q->ringSize - q->ringTail) < 224u) {
         while (q->ringTail != 0u) {
             ringEmitDword(q, ARC_MI_NOOP);
         }
     }
 
-    /* 1. Pre-batch Cache & TLB Invalidate (Linux xe_ring_ops.c: emit_pipe_invalidate) */
+    /* 1. Pre-batch CS Preparser Disable + Cache & TLB Invalidate (Linux xe_ring_ops.c:469-481) */
+    ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(true));
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
         uint32_t pcFlags0 = ARC_PC0_L3_RO_CACHE_INVALIDATE;
         uint32_t pcFlags1 = ARC_PC_CS_STALL | ARC_PC_TLB_INVALIDATE |
@@ -337,15 +414,25 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
     }
+    ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(false));
 
     /* 2. Jump to Userspace 48-bit PPGTT Batch Buffer */
     ringEmitDword(q, ARC_MI_BATCH_BUFFER_START_PPGTT);
     ringEmitDword(q, (uint32_t)(batchGpuVa & 0xFFFFFFFFULL));
     ringEmitDword(q, (uint32_t)(batchGpuVa >> 32));
 
-    /* 3. Post-batch Render/Compute Cache Flush + Fence Seqno Write to GGTT PPHWSP (xe_ring_ops.c:491-500) */
+    /* 3. Post-batch Non-Preemptible Cache Flush + Fence Seqno Write to GGTT PPHWSP (xe_ring_ops.c:489-500) */
+    ringEmitDword(q, ARC_MI_ARB_ON_OFF | ARC_MI_ARB_DISABLE);
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
-        /* 3a. Quiesce & flush 3D/Compute caches (HDC + Tile + RT + Depth + DC) */
+        /* 3a. Wa_14016712196 (Xe-LPG 12.70..12.74): dummy depth-cache flush PIPE_CONTROL before main flush */
+        ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
+        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH);
+        ringEmitDword(q, invalScratchGgtt);
+        ringEmitDword(q, 0u);
+        ringEmitDword(q, 0u);
+        ringEmitDword(q, 0u);
+
+        /* 3b. Quiesce & flush 3D/Compute caches (HDC + Tile + RT + Depth + DC) */
         const uint32_t flush1 = ARC_PC_CS_STALL | ARC_PC_FLUSH_ENABLE | ARC_PC_DC_FLUSH_ENABLE |
                                 ARC_PC_TILE_CACHE_FLUSH | ARC_PC_RT_CACHE_FLUSH |
                                 ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL;
@@ -356,7 +443,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
-        /* 3b. Post-sync 64-bit seqno write into GGTT PPHWSP (PIPE_CONTROL_GLOBAL_GTT_IVB in dw1!) */
+        /* 3c. Post-sync 64-bit seqno write into GGTT PPHWSP (PIPE_CONTROL_GLOBAL_GTT_IVB in dw1!) */
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
         ringEmitDword(q, ARC_PC_GLOBAL_GTT | ARC_PC_QW_WRITE | ARC_PC_FLUSH_ENABLE | ARC_PC_CS_STALL);
         ringEmitDword(q, q->seqnoGgttAddr);
@@ -364,16 +451,16 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, (uint32_t)(seqno & 0xFFFFFFFFULL));
         ringEmitDword(q, (uint32_t)(seqno >> 32));
 
-        /* 3c. Serialized CS GGTT QWORD store of seqno */
+        /* 3d. Serialized CS GGTT QWORD store of seqno */
         ringEmitDword(q, ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_USE_GGTT | ARC_MI_SDI_QWORD_LEN);
         ringEmitDword(q, q->seqnoGgttAddr);
         ringEmitDword(q, 0u);
         ringEmitDword(q, (uint32_t)(seqno & 0xFFFFFFFFULL));
         ringEmitDword(q, (uint32_t)(seqno >> 32));
     } else {
-        /* Blitter engine: 4-dword MI_FLUSH_DW + 64-bit GGTT seqno store */
-        ringEmitDword(q, ARC_MI_FLUSH_DW | ARC_MI_FLUSH_DW_IMM_LEN);
-        ringEmitDword(q, 0u);
+        /* Blitter engine: 4-dword MI_FLUSH_DW write-cache flush + 64-bit GGTT seqno store */
+        ringEmitDword(q, ARC_MI_FLUSH_DW | ARC_MI_FLUSH_DW_OP_STOREDW | ARC_MI_FLUSH_DW_IMM_LEN);
+        ringEmitDword(q, invalScratchGgtt | ARC_MI_FLUSH_DW_USE_GGTT);
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
@@ -391,10 +478,11 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, ARC_MI_NOOP); /* Keep ring tail 8-byte aligned */
     }
 
-    /* Update LRC context image tail and root PML4 before kicking ELSP (Linux xe_execlist.c: __start_lrc) */
+    /* Update LRC context image tail and coherent root PML4 descriptor before kicking ELSP */
+    const uint64_t pdp0Desc = arcEncodePpgttPde(q->pml4Phys);
     q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
-    q->ctxRegsCpu[ARC_CTX_PDP0_UDW_VAL]  = (uint32_t)(q->pml4Phys >> 32);
-    q->ctxRegsCpu[ARC_CTX_PDP0_LDW_VAL]  = (uint32_t)(q->pml4Phys & 0xFFFFFFFFULL);
+    q->ctxRegsCpu[ARC_CTX_PDP0_UDW_VAL]  = (uint32_t)(pdp0Desc >> 32);
+    q->ctxRegsCpu[ARC_CTX_PDP0_LDW_VAL]  = (uint32_t)(pdp0Desc & 0xFFFFFFFFULL);
     __asm__ __volatile__("mfence" ::: "memory");
 
     /* Build 64-bit Xe-LPG LRC Descriptor (LRCA points to PPHWSP at [31:12]) */
@@ -424,15 +512,44 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     return kIOReturnSuccess;
 }
 
+static inline void readEngineDiagMmio(const ArcXeService *svc, uint32_t b, ArcXeWaitQueueOut *d)
+{
+    if (!d) return;
+    d->engine_status    = svc->rd32(ARC_RING_EXECLIST_STATUS_LO(b));
+    d->engine_status_hi = svc->rd32(ARC_RING_EXECLIST_STATUS_HI(b));
+    d->current_lrca     = svc->rd32(ARC_RING_CURRENT_LRCA(b));
+    d->ring_head        = svc->rd32(ARC_RING_HEAD(b));
+    d->ring_tail        = svc->rd32(ARC_RING_TAIL(b));
+    d->ring_start       = svc->rd32(ARC_RING_START(b));
+    d->ring_ctl         = svc->rd32(ARC_RING_CTL(b));
+    d->acthd_lo         = svc->rd32(ARC_RING_ACTHD(b));
+    d->acthd_hi         = svc->rd32(ARC_RING_ACTHD_UDW(b));
+    d->ipehr            = svc->rd32(ARC_RING_IPEHR(b));
+    d->esr              = svc->rd32(ARC_RING_ESR(b));
+    d->instdone         = svc->rd32(ARC_RING_INSTDONE(b));
+    d->mi_mode          = svc->rd32(ARC_RING_MI_MODE(b));
+}
+
 IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
-                                      uint64_t *outCompleted, bool *outTimedOut)
+                                      uint64_t *outCompleted, bool *outTimedOut,
+                                      ArcXeWaitQueueOut *outDiag)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
     if (targetSeqno == 0) targetSeqno = q->lastSubmittedSeqno;
 
     if (*q->seqnoCpu >= targetSeqno) {
-        if (outCompleted) *outCompleted = *q->seqnoCpu;
+        const uint64_t cur = *q->seqnoCpu;
+        if (outCompleted) *outCompleted = cur;
         if (outTimedOut)  *outTimedOut  = false;
+        if (outDiag) {
+            bzero(outDiag, sizeof(*outDiag));
+            outDiag->completed_seqno = cur;
+            outDiag->timed_out       = 0u;
+            if (forceWakeGet()) {
+                readEngineDiagMmio(this, q->mmioBase, outDiag);
+                forceWakePut();
+            }
+        }
         return kIOReturnSuccess;
     }
 
@@ -444,26 +561,50 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
         if (cur >= targetSeqno) {
             if (outCompleted) *outCompleted = cur;
             if (outTimedOut)  *outTimedOut  = false;
+            if (outDiag) {
+                bzero(outDiag, sizeof(*outDiag));
+                outDiag->completed_seqno = cur;
+                outDiag->timed_out       = 0u;
+                if (forceWakeGet()) {
+                    readEngineDiagMmio(this, q->mmioBase, outDiag);
+                    forceWakePut();
+                }
+            }
             return kIOReturnSuccess;
         }
 
         uint64_t elapsedNs = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - startAbs, &elapsedNs);
         if (elapsedNs >= timeoutNs) {
+            ArcXeWaitQueueOut snap = {};
+            snap.completed_seqno = cur;
+            snap.timed_out       = 1u;
+
+            IOLockLock(fEngineLock);
             if (forceWakeGet()) {
                 const uint32_t b = q->mmioBase;
+                readEngineDiagMmio(this, b, &snap);
                 AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
                        "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
-                       "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x",
+                       "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
                        q->queueId, (unsigned long long)targetSeqno, (unsigned long long)cur,
-                       rd32(ARC_RING_EXECLIST_STATUS_HI(b)), rd32(ARC_RING_EXECLIST_STATUS_LO(b)),
-                       rd32(ARC_RING_CURRENT_LRCA(b)),
-                       rd32(ARC_RING_HEAD(b)), rd32(ARC_RING_TAIL(b)),
-                       rd32(ARC_RING_START(b)), rd32(ARC_RING_CTL(b)),
-                       rd32(ARC_RING_ACTHD_UDW(b)), rd32(ARC_RING_ACTHD(b)),
-                       rd32(ARC_RING_IPEHR(b)), rd32(ARC_RING_ESR(b)));
+                       snap.engine_status_hi, snap.engine_status,
+                       snap.current_lrca,
+                       snap.ring_head, snap.ring_tail,
+                       snap.ring_start, snap.ring_ctl,
+                       snap.acthd_hi, snap.acthd_lo,
+                       snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
+
+                ArcBo *hwsp = nullptr;
+                (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
+                if (hwsp) {
+                    (void)resetEngineHw(b, hwsp);
+                }
                 forceWakePut();
             }
+            IOLockUnlock(fEngineLock);
+
+            if (outDiag)      *outDiag      = snap;
             if (outCompleted) *outCompleted = cur;
             if (outTimedOut)  *outTimedOut  = true;
             return kIOReturnSuccess;

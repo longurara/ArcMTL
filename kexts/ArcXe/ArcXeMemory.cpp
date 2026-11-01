@@ -297,6 +297,21 @@ void ArcXeService::releaseBo(ArcBo *bo)
  * 3. 48-bit 4-Level PPGTT Virtual Memory Manager (PML4 -> PDP -> PD -> PT)
  * ============================================================================ */
 
+static inline void arcClflushEntry(const volatile void *addr)
+{
+    __asm__ __volatile__("clflush (%0)" :: "r"(addr) : "memory");
+}
+
+static inline void arcClflushRange(const volatile void *addr, size_t bytes)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(63u);
+    const uintptr_t end   = (reinterpret_cast<uintptr_t>(addr) + bytes + 63u) & ~static_cast<uintptr_t>(63u);
+    for (uintptr_t p = start; p < end; p += 64u) {
+        __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
+    }
+    __asm__ __volatile__("mfence" ::: "memory");
+}
+
 ArcPtPage *ArcXeService::allocPtPage()
 {
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -331,6 +346,7 @@ ArcPtPage *ArcXeService::allocPtPage()
     }
     pt->entries = reinterpret_cast<volatile uint64_t *>(kva);
     bzero(kva, 4096);
+    arcClflushRange(kva, 4096);
     return pt;
 }
 
@@ -432,6 +448,7 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
                 ArcPtPage *pt  = pd  ? pd->children[idx1]  : nullptr;
                 if (pt) {
                     pt->entries[idx0] = 0ULL;
+                    arcClflushEntry(&pt->entries[idx0]);
                 }
                 continue;
             }
@@ -441,6 +458,7 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
                 if (!pdp) { IOLockUnlock(vm->lock); return false; }
                 vm->pml4->children[idx3] = pdp;
                 vm->pml4->entries[idx3]  = arcEncodePpgttPde(pdp->physAddr);
+                arcClflushEntry(&vm->pml4->entries[idx3]);
             }
             ArcPtPage *pdp = vm->pml4->children[idx3];
 
@@ -449,6 +467,7 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
                 if (!pd) { IOLockUnlock(vm->lock); return false; }
                 pdp->children[idx2] = pd;
                 pdp->entries[idx2]  = arcEncodePpgttPde(pd->physAddr);
+                arcClflushEntry(&pdp->entries[idx2]);
             }
             ArcPtPage *pd = pdp->children[idx2];
 
@@ -457,11 +476,13 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
                 if (!pt) { IOLockUnlock(vm->lock); return false; }
                 pd->children[idx1] = pt;
                 pd->entries[idx1]  = arcEncodePpgttPde(pt->physAddr);
+                arcClflushEntry(&pd->entries[idx1]);
             }
             ArcPtPage *pt = pd->children[idx1];
 
             const uint64_t targetPhys = isNull ? 0ULL : (physPage + sub);
             pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, /*readWrite=*/true, isNull);
+            arcClflushEntry(&pt->entries[idx0]);
         }
 
         done += chunkBytes;

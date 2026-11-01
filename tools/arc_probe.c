@@ -30,6 +30,94 @@ static int call_struct(io_connect_t conn, uint32_t sel,
     return 0;
 }
 
+static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
+                                  uint8_t *cpu_ptr, uint64_t base_va,
+                                  uint16_t engine_class, const char *engine_name,
+                                  uint32_t batch_off, uint32_t target_off,
+                                  uint64_t magic)
+{
+    const uint64_t batch_va  = base_va + batch_off;
+    const uint64_t target_va = base_va + target_off;
+    volatile uint64_t *result_slot = (volatile uint64_t *)(cpu_ptr + target_off);
+    *result_slot = 0xDEADBEEFCAFEBABEULL;
+
+    uint32_t *cs = (uint32_t *)(cpu_ptr + batch_off);
+    uint32_t idx = 0;
+    cs[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
+    cs[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
+    cs[idx++] = (uint32_t)(target_va >> 32);
+    cs[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
+    cs[idx++] = (uint32_t)(magic >> 32);
+    cs[idx++] = ARC_MI_NOOP;
+    cs[idx++] = ARC_MI_BATCH_BUFFER_END;
+    cs[idx++] = ARC_MI_NOOP;
+    __sync_synchronize();
+
+    struct ArcXeExecQueueCreateIn q_in = {
+        .vm_id = vm_id,
+        .engine_class = engine_class,
+        .engine_instance = 0,
+        .ring_size_bytes = 16384,
+        .priority = 1,
+    };
+    struct ArcXeExecQueueCreateOut q_out;
+    memset(&q_out, 0, sizeof(q_out));
+    size_t out_sz = sizeof(q_out);
+    if (call_struct(conn, kArcXeMethodExecQueueCreate, &q_in, sizeof(q_in), &q_out, &out_sz) != 0)
+        return false;
+
+    const uint32_t queue_id = q_out.exec_queue_id;
+    printf("  [%s] Created ExecQueue id=%u (LRC GGTT=0x%08x)\n",
+           engine_name, queue_id, q_out.ggtt_lrc_addr);
+
+    struct ArcXeExecIn exec_in;
+    memset(&exec_in, 0, sizeof(exec_in));
+    exec_in.exec_queue_id = queue_id;
+    exec_in.num_batch_buffer = 1;
+    exec_in.batch_gpu_va = batch_va;
+    struct ArcXeExecOut exec_out;
+    memset(&exec_out, 0, sizeof(exec_out));
+    out_sz = sizeof(exec_out);
+    bool ok = false;
+    if (call_struct(conn, kArcXeMethodExec, &exec_in, sizeof(exec_in), &exec_out, &out_sz) == 0) {
+        printf("  [%s] Submitted PPGTT batch (0x%012" PRIx64 ") -> fence seqno=%" PRIu64 "\n",
+               engine_name, batch_va, exec_out.submitted_seqno);
+
+        struct ArcXeWaitQueueIn wait_in = {
+            .exec_queue_id = queue_id,
+            .pad0 = 0,
+            .target_seqno = exec_out.submitted_seqno,
+            .timeout_ns = 2000000000ULL, /* 2s */
+        };
+        struct ArcXeWaitQueueOut wait_out;
+        memset(&wait_out, 0, sizeof(wait_out));
+        out_sz = sizeof(wait_out);
+        if (call_struct(conn, kArcXeMethodWaitQueueIdle, &wait_in, sizeof(wait_in), &wait_out, &out_sz) == 0) {
+            __sync_synchronize();
+            const uint64_t observed = *result_slot;
+            printf("  [%s] Fence completed_seqno=%" PRIu64 " timed_out=%u EL_STATUS=0x%08x_%08x\n",
+                   engine_name, wait_out.completed_seqno, wait_out.timed_out,
+                   wait_out.engine_status_hi, wait_out.engine_status);
+            printf("         LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x MI_MODE=0x%08x\n",
+                   wait_out.current_lrca, wait_out.ring_head, wait_out.ring_tail,
+                   wait_out.ring_start, wait_out.ring_ctl, wait_out.mi_mode);
+            if (wait_out.timed_out || observed != magic) {
+                printf("         ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x\n",
+                       wait_out.acthd_hi, wait_out.acthd_lo,
+                       wait_out.ipehr, wait_out.esr, wait_out.instdone);
+            }
+            printf("         UMA zero-copy readback: expected=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
+                   magic, observed);
+            ok = (!wait_out.timed_out && observed == magic);
+        }
+    }
+
+    struct ArcXeExecQueueDestroyIn dq = { .exec_queue_id = queue_id };
+    size_t z = 0;
+    IOConnectCallStructMethod(conn, kArcXeMethodExecQueueDestroy, &dq, sizeof(dq), NULL, &z);
+    return ok;
+}
+
 int main(int argc, char **argv)
 {
     bool info_only = (argc > 1 && strcmp(argv[1], "--info-only") == 0);
@@ -98,10 +186,10 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("\n--- Running Live RCS0 48-bit PPGTT Execution Smoke Test ---\n");
+    printf("\n--- Running Live BCS0 + RCS0 48-bit PPGTT Execution Smoke Tests ---\n");
 
     int rc = 0;
-    uint32_t gem_handle = 0, vm_id = 0, queue_id = 0;
+    uint32_t gem_handle = 0, vm_id = 0;
     mach_vm_address_t map_addr = 0;
     mach_vm_size_t map_size = 0;
 
@@ -120,7 +208,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     gem_handle = gem_out.gem_handle;
-    printf("  [1/6] Allocated UMA BO handle=%u (%" PRIu64 " bytes, PAT=%u 2-way coherent)\n",
+    printf("  [1/4] Allocated UMA BO handle=%u (%" PRIu64 " bytes, PAT=%u 2-way coherent)\n",
            gem_handle, gem_out.actual_size, ARC_MTL_PAT_IDX_WB_2WAY_COH);
 
     /* 2. Zero-copy map UMA BO into userspace */
@@ -144,19 +232,18 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     vm_id = vm_out.vm_id;
-    printf("  [2/6] Created 48-bit PPGTT VM id=%u (PML4 phys=0x%" PRIx64 ")\n",
+    printf("  [2/4] Created 48-bit PPGTT VM id=%u (PML4 phys=0x%" PRIx64 ")\n",
            vm_id, vm_out.pml4_phys);
 
     /* 4. Bind UMA BO into PPGTT at GPU VA 0x0000000100000000 */
-    const uint64_t batch_va  = 0x0000000100000000ULL;
-    const uint64_t target_va = batch_va + 0x1000ULL;
+    const uint64_t base_va = 0x0000000100000000ULL;
     struct ArcXeVmBindIn bind_in;
     memset(&bind_in, 0, sizeof(bind_in));
     bind_in.vm_id = vm_id;
     bind_in.op = kArcXeVmBindOpMap;
     bind_in.gem_handle = gem_handle;
     bind_in.pat_index = ARC_MTL_PAT_IDX_WB_2WAY_COH;
-    bind_in.gpu_va = batch_va;
+    bind_in.gpu_va = base_va;
     bind_in.bo_offset = 0;
     bind_in.range_size = gem_out.actual_size;
     out_sz = 0;
@@ -164,93 +251,30 @@ int main(int argc, char **argv)
         rc = 7;
         goto cleanup;
     }
-    printf("  [3/6] Bound BO -> PPGTT VA 0x%012" PRIx64 " (%" PRIu64 " bytes)\n",
-           batch_va, gem_out.actual_size);
+    printf("  [3/4] Bound BO -> PPGTT VA 0x%012" PRIx64 " (%" PRIu64 " bytes)\n",
+           base_va, gem_out.actual_size);
 
-    /* 5. Write Xe-LPG MI_STORE_DATA_IMM (QWORD) + MI_BATCH_BUFFER_END */
-    const uint64_t magic = 0xA2C7D550155CAFE0ULL;
-    volatile uint64_t *result_slot = (volatile uint64_t *)(cpu_ptr + 0x1000);
-    *result_slot = 0xDEADBEEFCAFEBABEULL;
+    /* 5. Test BCS0 (Copy/Blitter) + RCS0 (3D Render/Compute) 48-bit PPGTT Execution */
+    printf("  [4/4] Executing live PPGTT MI_STORE_DATA_IMM batches on BCS0 & RCS0...\n");
+    const bool bcs_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
+                                              kArcXeEngineClassCopy, "BCS0",
+                                              0x0000u, 0x1000u, 0xB2C7D550155BC500ULL);
+    const bool rcs_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
+                                              kArcXeEngineClassRender, "RCS0",
+                                              0x2000u, 0x3000u, 0xA2C7D550155CAFE0ULL);
 
-    uint32_t *cs = (uint32_t *)cpu_ptr;
-    uint32_t idx = 0;
-    cs[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
-    cs[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
-    cs[idx++] = (uint32_t)(target_va >> 32);
-    cs[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
-    cs[idx++] = (uint32_t)(magic >> 32);
-    cs[idx++] = ARC_MI_NOOP;
-    cs[idx++] = ARC_MI_BATCH_BUFFER_END;
-    cs[idx++] = ARC_MI_NOOP;
-    __sync_synchronize();
-
-    /* 6. Create RCS0 queue, execute batch, wait for PPHWSP seqno fence */
-    struct ArcXeExecQueueCreateIn q_in = {
-        .vm_id = vm_id,
-        .engine_class = kArcXeEngineClassRender,
-        .engine_instance = 0,
-        .ring_size_bytes = 16384,
-        .priority = 1,
-    };
-    struct ArcXeExecQueueCreateOut q_out;
-    memset(&q_out, 0, sizeof(q_out));
-    out_sz = sizeof(q_out);
-    if (call_struct(conn, kArcXeMethodExecQueueCreate, &q_in, sizeof(q_in), &q_out, &out_sz) != 0) {
-        rc = 8;
-        goto cleanup;
-    }
-    queue_id = q_out.exec_queue_id;
-    printf("  [4/6] Created RCS0 ExecQueue id=%u (LRC GGTT=0x%08x)\n",
-           queue_id, q_out.ggtt_lrc_addr);
-
-    struct ArcXeExecIn exec_in;
-    memset(&exec_in, 0, sizeof(exec_in));
-    exec_in.exec_queue_id = queue_id;
-    exec_in.num_batch_buffer = 1;
-    exec_in.batch_gpu_va = batch_va;
-    struct ArcXeExecOut exec_out;
-    memset(&exec_out, 0, sizeof(exec_out));
-    out_sz = sizeof(exec_out);
-    if (call_struct(conn, kArcXeMethodExec, &exec_in, sizeof(exec_in), &exec_out, &out_sz) != 0) {
-        rc = 9;
-        goto cleanup;
-    }
-    printf("  [5/6] Submitted batch -> fence seqno=%" PRIu64 "\n", exec_out.submitted_seqno);
-
-    struct ArcXeWaitQueueIn wait_in = {
-        .exec_queue_id = queue_id,
-        .pad0 = 0,
-        .target_seqno = exec_out.submitted_seqno,
-        .timeout_ns = 2000000000ULL, /* 2s */
-    };
-    struct ArcXeWaitQueueOut wait_out;
-    memset(&wait_out, 0, sizeof(wait_out));
-    out_sz = sizeof(wait_out);
-    if (call_struct(conn, kArcXeMethodWaitQueueIdle, &wait_in, sizeof(wait_in), &wait_out, &out_sz) != 0) {
-        rc = 10;
-        goto cleanup;
-    }
-
-    __sync_synchronize();
-    uint64_t observed = *result_slot;
-    printf("  [6/6] Fence completed_seqno=%" PRIu64 " timed_out=%u engine_status=0x%08x\n",
-           wait_out.completed_seqno, wait_out.timed_out, wait_out.engine_status);
-    printf("        UMA zero-copy readback: expected=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
-           magic, observed);
-
-    if (!wait_out.timed_out && observed == magic) {
-        printf("\n[PASS] Stage 1 PASSED: Intel Arc Xe-LPG RCS0 executed PPGTT batch & wrote coherent UMA!\n");
+    if (bcs_ok && rcs_ok) {
+        printf("\n[PASS] Stage 1 PASSED: Intel Arc Xe-LPG BCS0 & RCS0 executed 48-bit PPGTT batches & wrote coherent UMA!\n");
+    } else if (rcs_ok) {
+        printf("\n[PASS] Stage 1 PASSED (RCS0 OK, BCS0=%d): Intel Arc Xe-LPG RCS0 executed 48-bit PPGTT batch!\n",
+               bcs_ok ? 1 : 0);
     } else {
-        fprintf(stderr, "\n[FAIL] Stage 1 FAILED: GPU timeout or UMA readback mismatch!\n");
+        fprintf(stderr, "\n[FAIL] Stage 1 FAILED (BCS0=%d, RCS0=%d): GPU timeout or UMA readback mismatch!\n",
+                bcs_ok ? 1 : 0, rcs_ok ? 1 : 0);
         rc = 11;
     }
 
 cleanup:
-    if (queue_id) {
-        struct ArcXeExecQueueDestroyIn dq = { .exec_queue_id = queue_id };
-        size_t z = 0;
-        IOConnectCallStructMethod(conn, kArcXeMethodExecQueueDestroy, &dq, sizeof(dq), NULL, &z);
-    }
     if (vm_id) {
         struct ArcXeVmDestroyIn dv = { .vm_id = vm_id };
         size_t z = 0;

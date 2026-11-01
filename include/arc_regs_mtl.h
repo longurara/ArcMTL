@@ -137,6 +137,8 @@ static inline bool arcIsSupportedXeLpgDevice(uint16_t vendor, uint16_t device)
  * 3. Page Attribute Table (PAT), MOCS & GGTT / 48-bit PPGTT PTE Encodings (Xe-LPG)
  * ============================================================================ */
 #define ARC_REG_MTL_MCR_SELECTOR            0x000FD4u
+#define ARC_REG_SF_MCR_SELECTOR             0x000FD8u
+#define ARC_REG_GAM_MCR_SELECTOR            0x000FE0u
 #define   ARC_MCR_MULTICAST                 (1u << 31)
 
 #define ARC_REG_GLOBAL_MOCS(i)              (0x004000u + (uint32_t)(i) * 4u)
@@ -211,9 +213,20 @@ static inline uint64_t arcEncodePpgttPte(uint64_t physAddr, uint16_t patIndex, b
     return pte;
 }
 
+/*
+ * Encode non-leaf 48-bit PPGTT directory descriptor (CTX_PDP0 -> PML4 -> PDP -> PD -> PT).
+ * Per Linux drivers/gpu/drm/xe/xe_vm.c (xelp_pde_encode_bo / xe_vm_pdp4_descriptor), non-leaf
+ * PDEs have 2 PAT bits (PAT0=bit 3, PAT1=bit 4) and MUST select PAT[3] (ARC_MTL_PAT_IDX_WB_1WAY_COH,
+ * 1-way coherent L4 WB) on Meteor Lake UMA so the GPU hardware page-table walker snoops CPU caches
+ * instead of defaulting to PAT[0] (0x00 = COH_NONE).
+ */
 static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 {
-    return (nextTablePhysAddr & ARC_PTE_ADDR_MASK) | ARC_PTE_PRESENT | ARC_PTE_RW;
+    return (nextTablePhysAddr & ARC_PTE_ADDR_MASK)
+         | ARC_PTE_PRESENT
+         | ARC_PTE_RW
+         | ARC_PPGTT_PTE_PAT0
+         | ARC_PPGTT_PTE_PAT1;
 }
 
 /* GGTT Layout Boundaries */
@@ -242,9 +255,17 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define ARC_RING_HWS_PGA(base)              ((base) + 0x080u)
 #define ARC_RING_HWSTAM(base)               ((base) + 0x098u)
 #define ARC_RING_MI_MODE(base)              ((base) + 0x09Cu)
+#define   ARC_MI_STOP_RING                  (1u << 8)
+#define   ARC_MI_MODE_IDLE                  (1u << 9)
 #define ARC_RING_IMR(base)                  ((base) + 0x0A8u)
+#define ARC_RING_EIR(base)                  ((base) + 0x0B0u)
+#define ARC_RING_EMR(base)                  ((base) + 0x0B4u)
 #define ARC_RING_ESR(base)                  ((base) + 0x0B8u)
 #define ARC_RING_CMD_CCTL(base)             ((base) + 0x0C4u)
+#define ARC_RING_RESET_CTL(base)            ((base) + 0x0D0u)
+#define   ARC_RESET_CTL_CAT_ERROR           (1u << 2)
+#define   ARC_RESET_CTL_READY_TO_RESET      (1u << 1)
+#define   ARC_RESET_CTL_REQUEST_RESET       (1u << 0)
 #define ARC_RING_EXECLIST_STATUS_LO(base)   ((base) + 0x234u)
 #define ARC_RING_EXECLIST_STATUS_HI(base)   ((base) + 0x238u)
 #define ARC_RING_CURRENT_LRCA(base)         ((base) + 0x240u)
@@ -290,8 +311,11 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define ARC_MI_NOOP                         0x00000000u
 #define ARC_MI_USER_INTERRUPT               (0x02u << 23)
 #define ARC_MI_ARB_CHECK                    (0x05u << 23)
+#define   ARC_MI_PREPARSER_DISABLE(dis)     (ARC_MI_ARB_CHECK | (1u << 8) | ((dis) ? 1u : 0u))
 #define ARC_MI_ARB_ON_OFF                   (0x08u << 23)
+#define   ARC_MI_ARB_DISABLE                0u
 #define   ARC_MI_ARB_ENABLE                 (1u << 0)
+#define ARC_CMD_3DSTATE_MESH_CONTROL        ((0x3u << 29) | (0x3u << 27) | (0x77u << 16) | 1u) /* 3 dwords (Wa_14019789679) */
 #define ARC_MI_BATCH_BUFFER_END             (0x0Au << 23)
 #define ARC_MI_BATCH_BUFFER_END_CTX         ((0x0Au << 23) | 1u) /* BIT(0) = End Context Restore */
 #define ARC_MI_LOAD_REGISTER_IMM(n)         ((0x22u << 23) | (2u * (uint32_t)(n) - 1u))
@@ -336,11 +360,30 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_PC_STALL_AT_SCOREBOARD        (1u << 1)
 #define   ARC_PC_DEPTH_CACHE_FLUSH          (1u << 0)
 
+/* Xe-LPG 12.70..12.74 Hardware Workaround Registers (Linux drivers/gpu/drm/xe/xe_wa.c) */
+#define ARC_REG_CACHE_MODE_1                0x007004u /* Masked MCR */
+#define   ARC_MSAA_OPTIMIZATION_REDUC_DIS   (1u << 11)/* Wa_18019271663 */
+#define ARC_REG_XEHP_PSS_CHICKEN            0x007044u /* Masked MCR */
+#define   ARC_FD_END_COLLECT                (1u << 5) /* Wa_14019877138 */
+#define ARC_REG_SQCNT1                      0x008718u /* Non-masked MCR */
+#define   ARC_SQCNT1_ENFORCE_RAR            (1u << 23)/* Wa_22016670082 */
+#define ARC_REG_COMP_MOD_CTRL               0x00CF30u /* Non-masked GAM MCR */
+#define   ARC_FORCE_MISS_FTLB               (1u << 3) /* Wa_14018575942 */
+#define ARC_REG_ROW_CHICKEN3                0x00E49Cu /* Masked MCR */
+#define   ARC_DIS_FIX_EOT1_FLUSH            (1u << 9) /* Wa_14017856879 */
+#define ARC_REG_ROW_CHICKEN2                0x00E4F4u /* Masked MCR */
+#define   ARC_DISABLE_TDL_SVHS_GATING       (1u << 1) /* Wa_14020495402 */
+#define ARC_REG_XEHP_HDC_CHICKEN0           0x00E5F0u /* Masked MCR */
+#define   ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES (1u << 3) /* Wa_14015150844 */
+
 /* ============================================================================
- * 6. GuC v70 Firmware Loader & CTB Registers (mtl_guc_70.bin)
+ * 6. GuC v70 Firmware Loader, Engine Domain Reset & CTB Registers (mtl_guc_70.bin)
  * ============================================================================ */
 #define ARC_REG_GEN11_SOFT_RESET            0x190090u
 #define ARC_REG_GDRST                       0x00941Cu
+#define   ARC_GRDOM_FULL                    (1u << 0)
+#define   ARC_GRDOM_RENDER                  (1u << 1)
+#define   ARC_GRDOM_BLT                     (1u << 2)
 #define   ARC_GRDOM_GUC                     (1u << 3)
 
 #define ARC_REG_GUC_STATUS                  0x00C000u

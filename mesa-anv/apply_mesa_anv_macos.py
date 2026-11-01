@@ -64,6 +64,22 @@ def main() -> None:
         "ARCXE_DARWIN_MESON",
     )
 
+    # 2b. src/util/build_id.h: Mach-O LC_UUID on Apple platforms is 16 bytes (128-bit UUID),
+    #     whereas ELF GNU build-id SHA-1 is 20 bytes. copy_build_id_to_sha1() already supports
+    #     16-byte LC_UUID, so set BUILD_ID_EXPECTED_HASH_LENGTH = 16 on DETECT_OS_APPLE so
+    #     anv_physical_device_init_uuids() succeeds during vkEnumeratePhysicalDevices().
+    replace_once(
+        mesa / "src" / "util" / "build_id.h",
+        "#define BUILD_ID_EXPECTED_HASH_LENGTH 20 /* sha1 */",
+        "/* ARCXE_DARWIN_BUILD_ID_LEN */\n"
+        "#if DETECT_OS_APPLE\n"
+        "#define BUILD_ID_EXPECTED_HASH_LENGTH 16 /* Mach-O LC_UUID */\n"
+        "#else\n"
+        "#define BUILD_ID_EXPECTED_HASH_LENGTH 20 /* sha1 */\n"
+        "#endif",
+        "ARCXE_DARWIN_BUILD_ID_LEN",
+    )
+
     # 3. Route src/util/libdrm.h and src/util/os_drm.h through our include/xf86drm.h shim on Darwin
     #    so vk_instance.c (drmGetDevices2) and intel_kmd.c (drmGetVersion) reach anv_xnu_drm_shim.c.
     replace_once(
