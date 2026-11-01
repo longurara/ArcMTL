@@ -165,7 +165,7 @@ def transform_objects_m(text: str) -> str:
     # requested. XNU IOSurface mappings use Write-Combining CPU PTEs and unwire across IOSurfaceUnlock,
     # which can otherwise mismatch GPU L4 WB (PAT[4]) userptr imports without failing VkResult.
     text, n1 = re.subn(
-        r"static\s+bool\s+nvmtl_surfin_import\s*\(\s*void\s*\)\s*\{[^}]*\}",
+        r"static\s+bool\s+nvmtl_surfin_import\s*\(\s*void\s*\)\s*\{.*?return\s+on\s*;\s*\}",
         "static bool nvmtl_surfin_import(void) {\n"
         "    static int on = -1;\n"
         "    if (on < 0) {\n"
@@ -177,9 +177,10 @@ def transform_objects_m(text: str) -> str:
         "}",
         text,
         count=1,
+        flags=re.DOTALL,
     )
     text, n2 = re.subn(
-        r"static\s+bool\s+nvmtl_surfout_import\s*\(\s*void\s*\)\s*\{[^}]*\}",
+        r"static\s+bool\s+nvmtl_surfout_import\s*\(\s*void\s*\)\s*\{.*?return\s+on\s*;\s*\}",
         "static bool nvmtl_surfout_import(void) {\n"
         "    static int on = -1;\n"
         "    if (on < 0) {\n"
@@ -191,6 +192,7 @@ def transform_objects_m(text: str) -> str:
         "}",
         text,
         count=1,
+        flags=re.DOTALL,
     )
     if n1 == 0 or n2 == 0:
         raise RuntimeError(
