@@ -19,14 +19,22 @@ uint32_t ArcXeService::engineMmioBase(uint16_t engineClass, uint16_t engineInsta
     (void)engineInstance;
     switch (engineClass) {
     case kArcXeEngineClassRender:
+    case kArcXeEngineClassCompute:
+        /*
+         * On Meteor Lake Xe-LPG (12.70/12.71), standalone CCS0 (0x1A000) is clock/power-gated
+         * off at reset unless RCU_MODE_CCS_ENABLE / CCS_MODE slice partitioning is enabled,
+         * while RCS0 (0x02000) natively executes both 3D and GPGPU COMPUTE_WALKER pipelines
+         * with full undivided access to all 8 Xe-cores (128 Vector Engines).
+         */
         if (outHwsp) *outHwsp = fRcsHwspBo;
         return ARC_RENDER_RING_BASE;
-    case kArcXeEngineClassCompute:
-        if (outHwsp) *outHwsp = fCcsHwspBo;
-        return ARC_COMPUTE0_RING_BASE;
     case kArcXeEngineClassCopy:
-        if (outHwsp) *outHwsp = fBcsHwspBo;
-        return ARC_BLT_RING_BASE;
+        if (fBcsHwspBo) {
+            if (outHwsp) *outHwsp = fBcsHwspBo;
+            return ARC_BLT_RING_BASE;
+        }
+        if (outHwsp) *outHwsp = fRcsHwspBo;
+        return ARC_RENDER_RING_BASE;
     default:
         if (outHwsp) *outHwsp = nullptr;
         return 0;
@@ -38,14 +46,12 @@ bool ArcXeService::initEngines()
     fEngineLock = IOLockAlloc();
     if (!fEngineLock) return false;
 
-    /* Allocate 4KB Global HWSP in GGTT for each primary GT0 engine */
+    /* Allocate 4KB Global HWSP in GGTT for RCS0 (Render+Compute) and BCS0 (Copy/Blitter) */
     fRcsHwspBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
-                                ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
-    fCcsHwspBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
                                 ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
     fBcsHwspBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
                                 ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
-    if (!fRcsHwspBo || !fCcsHwspBo || !fBcsHwspBo) {
+    if (!fRcsHwspBo || !fBcsHwspBo) {
         AXELOG("initEngines: failed to allocate engine HWSPs");
         return false;
     }
@@ -54,11 +60,18 @@ bool ArcXeService::initEngines()
 
     const struct { uint32_t base; ArcBo *hwsp; const char *name; } engines[] = {
         { ARC_RENDER_RING_BASE,   fRcsHwspBo, "RCS0" },
-        { ARC_COMPUTE0_RING_BASE, fCcsHwspBo, "CCS0" },
         { ARC_BLT_RING_BASE,      fBcsHwspBo, "BCS0" },
     };
 
     for (const auto &e : engines) {
+        if (rd32(ARC_RING_MI_MODE(e.base)) == 0xFFFFFFFFu) {
+            AXELOG("engine %s at 0x%05x unpowered/fused off; skipping", e.name, e.base);
+            if (e.base == ARC_BLT_RING_BASE) {
+                releaseBo(fBcsHwspBo);
+                fBcsHwspBo = nullptr;
+            }
+            continue;
+        }
         wr32(ARC_RING_HWS_PGA(e.base), e.hwsp->ggttOffset);
         (void)rd32(ARC_RING_HWS_PGA(e.base));
         wr32(ARC_RING_HWSTAM(e.base), 0xFFFFFFFFu);
@@ -497,6 +510,9 @@ void ArcXeService::gucLoaderThreadEntry(void *arg, wait_result_t)
         "/Library/ArcDriver/fw/mtl_guc_70.bin",
         "/usr/local/share/arcfw/mtl_guc_70.bin",
     };
+
+    /* Wait until rootfs VFS is mounted (OpenCore injects Safe Boot kexts during early PCI init!) */
+    IOSleep(8000);
 
     /* Poll gently for up to 30 s while root volume finishes mounting at boot */
     for (uint32_t attempt = 0; attempt < 30 && !self->fStopping; attempt++) {

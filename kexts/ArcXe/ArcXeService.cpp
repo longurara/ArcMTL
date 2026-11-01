@@ -337,13 +337,15 @@ bool ArcXeService::start(IOService *provider)
     /* Re-trigger matching on parent IOPCIDevice so ArcAccel can attach cleanly */
     fPCI->registerService();
 
-    /* Spawn background thread to load /Library/ArcDriver/fw/mtl_guc_70.bin once rootfs is mounted */
-    this->retain();
-    thread_t fwThread = THREAD_NULL;
-    if (kernel_thread_start(&ArcXeService::gucLoaderThreadEntry, this, &fwThread) == KERN_SUCCESS) {
-        thread_deallocate(fwThread);
-    } else {
-        this->release();
+    /* Only spawn background GuC firmware loader when arc_guc=1 is explicitly requested */
+    if (fUseGuc) {
+        this->retain();
+        thread_t fwThread = THREAD_NULL;
+        if (kernel_thread_start(&ArcXeService::gucLoaderThreadEntry, this, &fwThread) == KERN_SUCCESS) {
+            thread_deallocate(fwThread);
+        } else {
+            this->release();
+        }
     }
 
     AXELOG("ArcXeService READY (backend=%s)", fUseGuc ? "GuC-v70" : "Direct-Execlist");

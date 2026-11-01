@@ -415,7 +415,7 @@ bool ArcFB::start(IOService *provider)
     if (!fPCI) return false;
     fPCI->setMemoryEnable(true);
 
-    fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
     if (!fMMIO || fMMIO->getLength() < ARC_BAR0_TOTAL_SIZE) {
         AFBLOG("BAR0 map failed or smaller than 16 MiB");
         OSSafeReleaseNULL(fMMIO);
