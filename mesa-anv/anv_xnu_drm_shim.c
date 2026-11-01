@@ -16,7 +16,9 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <os/os_sync_wait_on_address.h>
 #include <pthread.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -265,6 +267,39 @@ int arc_xnu_gem_munmap(void *addr, size_t length)
         return 0;
     }
     return munmap(addr, length);
+}
+
+int arc_xnu_futex_wake(uint32_t *addr, int32_t count)
+{
+    if (!addr || count <= 0)
+        return 0;
+    if (count == 1)
+        return os_sync_wake_by_address_any(addr, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    return os_sync_wake_by_address_all(addr, sizeof(uint32_t), OS_SYNC_WAKE_BY_ADDRESS_NONE);
+}
+
+int arc_xnu_futex_wait(uint32_t *addr, int32_t value, const struct timespec *timeout)
+{
+    if (!addr)
+        return -1;
+    if (!timeout) {
+        return os_sync_wait_on_address(addr, (uint64_t)(uint32_t)value, sizeof(uint32_t),
+                                       OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t sec  = (int64_t)timeout->tv_sec - (int64_t)now.tv_sec;
+    int64_t nsec = (int64_t)timeout->tv_nsec - (int64_t)now.tv_nsec;
+    int64_t total_ns = sec * 1000000000LL + nsec;
+    if (total_ns <= 0) {
+        errno = ETIMEDOUT;
+        return ETIMEDOUT;
+    }
+    int r = os_sync_wait_on_address_with_timeout(addr, (uint64_t)(uint32_t)value, sizeof(uint32_t),
+                                                 OS_SYNC_WAIT_ON_ADDRESS_NONE,
+                                                 OS_CLOCK_MACH_ABSOLUTE_TIME,
+                                                 (uint64_t)total_ns);
+    return (r < 0 && errno == ETIMEDOUT) ? ETIMEDOUT : r;
 }
 
 /* ============================================================================
