@@ -365,10 +365,13 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_PC_DEPTH_CACHE_FLUSH          (1u << 0)
 
 /* Xe-LPG 12.70..12.74 Hardware Workaround & Render Tuning Registers (Linux xe_wa.c / xe_tuning.c / xe_hw_engine.c) */
+#define ARC_GFXPIPE_3D_CMD(op, sub)         ((0x3u << 29) | (0x3u << 27) | ((uint32_t)(op) << 24) | ((uint32_t)(sub) << 16))
 #define ARC_REG_CACHE_MODE_1                0x007004u /* Masked MCR */
 #define   ARC_MSAA_OPTIMIZATION_REDUC_DIS   (1u << 11)/* Wa_18019271663 */
 #define ARC_REG_XEHP_PSS_CHICKEN            0x007044u /* Masked MCR */
 #define   ARC_FD_END_COLLECT                (1u << 5) /* Wa_14019877138 */
+#define ARC_REG_COMMON_SLICE_CHICKEN3       0x007304u /* Masked MCR (xe_lrc.c / anv_queue.c) */
+#define   ARC_DISABLE_STATE_CACHE_PERF_FIX  (1u << 13)
 #define ARC_REG_SQCNT1                      0x008718u /* Non-masked MCR */
 #define   ARC_SQCNT1_ENFORCE_RAR            (1u << 23)/* Wa_22016670082 */
 #define ARC_REG_MISCCPCTL                   0x009424u /* Non-masked GT */

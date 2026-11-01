@@ -221,9 +221,7 @@ public:
     void armEngineHw(uint32_t base, ArcBo *hwsp);
     bool resetEngineHw(uint32_t base, ArcBo *hwsp);
     uint32_t engineMmioBase(uint16_t engineClass, uint16_t engineInstance, ArcBo **outHwsp) const;
-    void     switchToIdleContextLocked(uint32_t base);
-    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance,
-                                  uint32_t ringSize, bool isIdleQueue = false);
+    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance, uint32_t ringSize);
     void          destroyExecQueue(ArcExecQueue *q);
     bool          parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *prevQueue);
     IOReturn      submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno);

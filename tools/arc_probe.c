@@ -36,21 +36,36 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
                                   uint32_t batch_off, uint32_t target_off,
                                   uint64_t magic)
 {
-    const uint64_t batch_va  = base_va + batch_off;
+    const uint64_t batch1_va = base_va + batch_off;
+    const uint64_t batch2_va = base_va + batch_off + 0x100u;
     const uint64_t target_va = base_va + target_off;
+    const uint64_t magic1    = magic ^ 0x1111111111111111ULL;
     volatile uint64_t *result_slot = (volatile uint64_t *)(cpu_ptr + target_off);
     *result_slot = 0xDEADBEEFCAFEBABEULL;
 
-    uint32_t *cs = (uint32_t *)(cpu_ptr + batch_off);
+    /* Batch #1 at +0x000: write magic1 */
+    uint32_t *cs1 = (uint32_t *)(cpu_ptr + batch_off);
     uint32_t idx = 0;
-    cs[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
-    cs[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
-    cs[idx++] = (uint32_t)(target_va >> 32);
-    cs[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
-    cs[idx++] = (uint32_t)(magic >> 32);
-    cs[idx++] = ARC_MI_NOOP;
-    cs[idx++] = ARC_MI_BATCH_BUFFER_END;
-    cs[idx++] = ARC_MI_NOOP;
+    cs1[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
+    cs1[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
+    cs1[idx++] = (uint32_t)(target_va >> 32);
+    cs1[idx++] = (uint32_t)(magic1 & 0xFFFFFFFFULL);
+    cs1[idx++] = (uint32_t)(magic1 >> 32);
+    cs1[idx++] = ARC_MI_NOOP;
+    cs1[idx++] = ARC_MI_BATCH_BUFFER_END;
+    cs1[idx++] = ARC_MI_NOOP;
+
+    /* Batch #2 at +0x100: write final magic on the SAME ExecQueue (verifies LRC Save/Restore) */
+    uint32_t *cs2 = (uint32_t *)(cpu_ptr + batch_off + 0x100u);
+    idx = 0;
+    cs2[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
+    cs2[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
+    cs2[idx++] = (uint32_t)(target_va >> 32);
+    cs2[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
+    cs2[idx++] = (uint32_t)(magic >> 32);
+    cs2[idx++] = ARC_MI_NOOP;
+    cs2[idx++] = ARC_MI_BATCH_BUFFER_END;
+    cs2[idx++] = ARC_MI_NOOP;
     __sync_synchronize();
 
     struct ArcXeExecQueueCreateIn q_in = {
@@ -70,18 +85,23 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
     printf("  [%s] Created ExecQueue id=%u (LRC GGTT=0x%08x)\n",
            engine_name, queue_id, q_out.ggtt_lrc_addr);
 
-    struct ArcXeExecIn exec_in;
-    memset(&exec_in, 0, sizeof(exec_in));
-    exec_in.exec_queue_id = queue_id;
-    exec_in.num_batch_buffer = 1;
-    exec_in.batch_gpu_va = batch_va;
-    struct ArcXeExecOut exec_out;
-    memset(&exec_out, 0, sizeof(exec_out));
-    out_sz = sizeof(exec_out);
-    bool ok = false;
-    if (call_struct(conn, kArcXeMethodExec, &exec_in, sizeof(exec_in), &exec_out, &out_sz) == 0) {
-        printf("  [%s] Submitted PPGTT batch (0x%012" PRIx64 ") -> fence seqno=%" PRIu64 "\n",
-               engine_name, batch_va, exec_out.submitted_seqno);
+    const uint64_t batches[2]  = { batch1_va, batch2_va };
+    const uint64_t expected[2] = { magic1,    magic     };
+    bool ok = true;
+
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        struct ArcXeExecIn exec_in;
+        memset(&exec_in, 0, sizeof(exec_in));
+        exec_in.exec_queue_id = queue_id;
+        exec_in.num_batch_buffer = 1;
+        exec_in.batch_gpu_va = batches[pass];
+        struct ArcXeExecOut exec_out;
+        memset(&exec_out, 0, sizeof(exec_out));
+        out_sz = sizeof(exec_out);
+        if (call_struct(conn, kArcXeMethodExec, &exec_in, sizeof(exec_in), &exec_out, &out_sz) != 0) {
+            ok = false;
+            break;
+        }
 
         struct ArcXeWaitQueueIn wait_in = {
             .exec_queue_id = queue_id,
@@ -92,23 +112,31 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
         struct ArcXeWaitQueueOut wait_out;
         memset(&wait_out, 0, sizeof(wait_out));
         out_sz = sizeof(wait_out);
-        if (call_struct(conn, kArcXeMethodWaitQueueIdle, &wait_in, sizeof(wait_in), &wait_out, &out_sz) == 0) {
-            __sync_synchronize();
-            const uint64_t observed = *result_slot;
-            printf("  [%s] Fence completed_seqno=%" PRIu64 " timed_out=%u EL_STATUS=0x%08x_%08x\n",
-                   engine_name, wait_out.completed_seqno, wait_out.timed_out,
-                   wait_out.engine_status_hi, wait_out.engine_status);
+        if (call_struct(conn, kArcXeMethodWaitQueueIdle, &wait_in, sizeof(wait_in), &wait_out, &out_sz) != 0) {
+            ok = false;
+            break;
+        }
+        __sync_synchronize();
+        const uint64_t observed = *result_slot;
+        if (pass == 1 || wait_out.timed_out || observed != expected[pass]) {
+            printf("  [%s] Pass %u/2 seqno=%" PRIu64 " completed=%" PRIu64 " timed_out=%u EL_STATUS=0x%08x_%08x\n",
+                   engine_name, pass + 1u, exec_out.submitted_seqno, wait_out.completed_seqno,
+                   wait_out.timed_out, wait_out.engine_status_hi, wait_out.engine_status);
             printf("         LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x MI_MODE=0x%08x\n",
                    wait_out.current_lrca, wait_out.ring_head, wait_out.ring_tail,
                    wait_out.ring_start, wait_out.ring_ctl, wait_out.mi_mode);
-            if (wait_out.timed_out || observed != magic) {
+            if (wait_out.timed_out || observed != expected[pass]) {
                 printf("         ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x\n",
                        wait_out.acthd_hi, wait_out.acthd_lo,
                        wait_out.ipehr, wait_out.esr, wait_out.instdone);
             }
             printf("         UMA zero-copy readback: expected=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
-                   magic, observed);
-            ok = (!wait_out.timed_out && observed == magic);
+                   expected[pass], observed);
+        }
+        if (wait_out.timed_out || observed != expected[pass] ||
+            wait_out.completed_seqno != exec_out.submitted_seqno) {
+            ok = false;
+            break;
         }
     }
 

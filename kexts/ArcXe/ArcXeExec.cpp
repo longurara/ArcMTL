@@ -194,12 +194,20 @@ bool ArcXeService::initEngines()
     }
     fRcsIdleQueue->swCtxId         = 0u;
     fRcsIdleQueue->isIdleKernelCtx = true;
+    if (fRcsIdleQueue->holdsForceWake) {
+        forceWakePut();
+        fRcsIdleQueue->holdsForceWake = false;
+    }
 
     if (fBcsHwspBo) {
         fBcsIdleQueue = createExecQueue(fKernelIdleVm, kArcXeEngineClassCopy, 0, 16384);
         if (fBcsIdleQueue) {
             fBcsIdleQueue->swCtxId         = 0u;
             fBcsIdleQueue->isIdleKernelCtx = true;
+            if (fBcsIdleQueue->holdsForceWake) {
+                forceWakePut();
+                fBcsIdleQueue->holdsForceWake = false;
+            }
         }
     }
     return true;
@@ -301,7 +309,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     q->engineClass        = engineClass;
     q->engineInstance     = engineInstance;
     q->mmioBase           = base;
-    q->swCtxId            = (uint32_t)(OSIncrementAtomic((SInt32 *)&fNextSwCtxId) & 0x7FFFu);
+    q->swCtxId            = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
     if (q->swCtxId == 0) q->swCtxId = 1;
     q->lrcBo              = lrcBo;
     q->fenceBo            = fenceBo;
@@ -403,13 +411,83 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         reg[0x34] = ARC_MI_BATCH_BUFFER_END_CTX; /* 0x05000001: End Context Restore! */
     }
 
-    /* Enable arbitration + Wa_14019789679 (zero 3DSTATE_MESH_CONTROL on Xe-LPG RCS0) at start of ring */
+    /*
+     * Initial Ring Setup for Xe-LPG RCS0 (Linux drivers/gpu/drm/xe/xe_lrc.c):
+     *   1. MI_ARB_ON_OFF(ENABLE)
+     *   2. LRI(COMMON_SLICE_CHICKEN3, DISABLE_STATE_CACHE_PERF_FIX) — requested by Mesa ANV on Xe
+     *   3. LRI_CS_MMIO(CS_DEBUG_MODE2, INSTRUCTION_STATE_CACHE_INV) — Wa_18022495364
+     *   4. Full 50-entry xe_hpg_svg_state[] zeroed 3DSTATE_* headers — Wa_14019789679
+     */
+    static const struct { uint32_t instr; uint16_t numDw; } kXeHpgSvgState[] = {
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x15), 11 }, /* 3DSTATE_CONSTANT_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x19), 11 }, /* 3DSTATE_CONSTANT_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1A), 11 }, /* 3DSTATE_CONSTANT_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x16), 11 }, /* 3DSTATE_CONSTANT_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x09), 69 }, /* 3DSTATE_VERTEX_ELEMENTS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x55),  5 }, /* 3DSTATE_VF_COMPONENT_PACKING */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x4A),  2 }, /* 3DSTATE_VF_SGVS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x56),  3 }, /* 3DSTATE_VF_SGVS_2 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x10),  9 }, /* 3DSTATE_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x26),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2B),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x58),  3 }, /* 3DSTATE_URB_ALLOC_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1E),  5 }, /* 3DSTATE_STREAMOUT */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x60),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_0 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x61),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_1 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x62),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_2 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x63),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_3 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x12),  4 }, /* 3DSTATE_CLIP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x6C),  6 }, /* 3DSTATE_PRIMITIVE_REPLICATION */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x81),  2 }, /* 3DSTATE_CLIP_MESH */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x13),  4 }, /* 3DSTATE_SF */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x0F),  2 }, /* 3DSTATE_SCISSOR_STATE_POINTERS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x21),  2 }, /* 3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x50),  5 }, /* 3DSTATE_RASTER */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x6E),  4 }, /* 3DSTATE_TBIMR_TILE_PASS_INFO */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x52),  6 }, /* 3DSTATE_WM_HZ_OP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x0D),  2 }, /* 3DSTATE_MULTISAMPLE */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1B),  9 }, /* 3DSTATE_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x27),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2C),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x59),  3 }, /* 3DSTATE_URB_ALLOC_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7C),  3 }, /* 3DSTATE_TASK_CONTROL */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7D),  7 }, /* 3DSTATE_TASK_SHADER */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7E), 10 }, /* 3DSTATE_TASK_SHADER_DATA */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x80),  3 }, /* 3DSTATE_URB_ALLOC_TASK */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1C),  5 }, /* 3DSTATE_TE */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x79),  2 }, /* 3DSTATE_TASK_REDISTRIB */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1D), 11 }, /* 3DSTATE_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x28),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2D),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x5A),  3 }, /* 3DSTATE_URB_ALLOC_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x11), 10 }, /* 3DSTATE_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x29),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2E),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x5B),  3 }, /* 3DSTATE_URB_ALLOC_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x77),  3 }, /* 3DSTATE_MESH_CONTROL */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7B), 10 }, /* 3DSTATE_MESH_SHADER_DATA */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7F),  3 }, /* 3DSTATE_URB_ALLOC_MESH */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7A),  8 }, /* 3DSTATE_MESH_SHADER */
+        { ARC_GFXPIPE_3D_CMD(0x1, 0x00),  4 }, /* 3DSTATE_DRAWING_RECTANGLE */
+    };
+
     uint32_t initDw = 0;
     q->ringCpu[initDw++] = ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE;
     if (isRcs) {
-        q->ringCpu[initDw++] = ARC_CMD_3DSTATE_MESH_CONTROL;
-        q->ringCpu[initDw++] = 0u;
-        q->ringCpu[initDw++] = 0u;
+        q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u);
+        q->ringCpu[initDw++] = ARC_REG_COMMON_SLICE_CHICKEN3;
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_DISABLE_STATE_CACHE_PERF_FIX);
+
+        q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
+        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(0) */
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_INSTRUCTION_STATE_CACHE_INV);
+
+        for (const auto &st : kXeHpgSvgState) {
+            q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
+            for (uint16_t z = 1; z < st.numDw; z++) {
+                q->ringCpu[initDw++] = 0u;
+            }
+        }
     } else {
         q->ringCpu[initDw++] = ARC_MI_NOOP;
     }
@@ -419,7 +497,8 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     reg[ARC_CTX_RING_HEAD_VAL] = 0u;
     reg[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
     clflushRange(q->ctxRegsCpu, 0x140);
-    clflushRange(q->ringCpu, 0x40);
+    clflushRange(q->ringCpu, q->ringTail + 64u);
+    q->holdsForceWake = forceWakeGet();
 
     return q;
 }
@@ -446,6 +525,10 @@ void ArcXeService::destroyExecQueue(ArcExecQueue *q)
             if (fLastBcsQueue == q) fLastBcsQueue = nullptr;
         }
         IOLockUnlock(fEngineLock);
+    }
+    if (q->holdsForceWake) {
+        forceWakePut();
+        q->holdsForceWake = false;
     }
     if (q->fenceBo) {
         releaseBo(q->fenceBo);
@@ -478,6 +561,13 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         return false;
     }
 
+    /* Ensure the previous context's trailing ring dwords retired to HEAD == TAIL before switching out */
+    for (uint32_t us = 0; us < 10000u; us += 5u) {
+        if (rd32(ARC_RING_HEAD(base)) == rd32(ARC_RING_TAIL(base)))
+            break;
+        IODelay(5);
+    }
+
     /* Evict any CPU cachelines of prevQueue's context header before hardware Context-Saves prevQueue */
     if (prevQueue && prevQueue->ctxRegsCpu) {
         clflushRange(prevQueue->ctxRegsCpu, 0x140);
@@ -506,6 +596,7 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
             ARC_MASKED_DISABLE(ARC_CTX_CTRL_RESTORE_INHIBIT);
     }
     idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
+    clflushRange(idleQ->ringCpu, idleQ->ringSize);
     clflushRange(idleQ->ctxRegsCpu, 0x140);
 
     /* Kernel idle context always uses SW_CTX_ID = 0 (Linux xe_execlist.c: port->lrc) */
@@ -514,6 +605,11 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
                             | ARC_LRC_DESC_LEGACY_64B_PPGTT
                             | ARC_LRC_DESC_PRIVILEGE_PPGTT;
 
+    ArcBo *hwsp = (base == ARC_BLT_RING_BASE) ? fBcsHwspBo : fRcsHwspBo;
+    if (hwsp) {
+        wr32(ARC_RING_HWS_PGA(base), hwsp->ggttOffset);
+        (void)rd32(ARC_RING_HWS_PGA(base));
+    }
     wr32(ARC_RING_EXECLIST_SQ_LO(base), (uint32_t)(idleDesc & 0xFFFFFFFFULL));
     wr32(ARC_RING_EXECLIST_SQ_HI(base), (uint32_t)(idleDesc >> 32));
     wr32(ARC_RING_EXECLIST_CONTROL(base), ARC_EL_CTRL_LOAD);
@@ -527,9 +623,19 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         }
         IODelay(5);
     }
+    for (uint32_t us = 0; us < 10000u; us += 5u) {
+        if ((rd32(ARC_RING_CURRENT_LRCA(base)) & ~0xFFFu) == (idleQ->pphwspGgttAddr & ~0xFFFu) &&
+            rd32(ARC_RING_HEAD(base)) == rd32(ARC_RING_TAIL(base))) {
+            break;
+        }
+        IODelay(5);
+    }
 
     if (parkedOk) {
         if (prevQueue) {
+            if (prevQueue->ctxRegsCpu) {
+                clflushRange(prevQueue->ctxRegsCpu, 0x140);
+            }
             prevQueue->isLoadedOnHw    = false;
             prevQueue->hasSavedHwState = true;
         }
@@ -677,12 +783,13 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
     q->ctxRegsCpu[ARC_CTX_PDP0_UDW_VAL]  = (uint32_t)(pdp0Desc >> 32);
     q->ctxRegsCpu[ARC_CTX_PDP0_LDW_VAL]  = (uint32_t)(pdp0Desc & 0xFFFFFFFFULL);
+    clflushRange(q->ringCpu, q->ringSize);
     clflushRange(q->ctxRegsCpu, 0x140);
 
     /* Allocate fresh non-zero SW_CTX_ID (1..0x7FFF) for this Execlist run (Linux xe_execlist.c:99-111) */
-    uint32_t nextCtxId = (uint32_t)(OSIncrementAtomic((SInt32 *)&fNextSwCtxId) & 0x7FFFu);
+    uint32_t nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
     if (nextCtxId == 0u) {
-        nextCtxId = (uint32_t)(OSIncrementAtomic((SInt32 *)&fNextSwCtxId) & 0x7FFFu);
+        nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
         if (nextCtxId == 0u) nextCtxId = 1u;
     }
     q->swCtxId = nextCtxId;
@@ -693,6 +800,13 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
                            | ARC_LRC_DESC_LEGACY_64B_PPGTT
                            | ARC_LRC_DESC_PRIVILEGE_PPGTT
                            | ((uint64_t)q->swCtxId << ARC_LRC_DESC_XEHP_SW_CTX_SHIFT);
+
+    ArcBo *hwsp = nullptr;
+    (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
+    if (hwsp) {
+        wr32(ARC_RING_HWS_PGA(q->mmioBase), hwsp->ggttOffset);
+        (void)rd32(ARC_RING_HWS_PGA(q->mmioBase));
+    }
 
     wr32(ARC_RING_EXECLIST_SQ_LO(q->mmioBase), (uint32_t)(lrcDesc & 0xFFFFFFFFULL));
     wr32(ARC_RING_EXECLIST_SQ_HI(q->mmioBase), (uint32_t)(lrcDesc >> 32));
