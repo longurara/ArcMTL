@@ -36,12 +36,21 @@ fi
 
 mkdir -p "$OUT/kexts" "$OUT/fw" "$OUT/arcmtl" "$OUT/GPUBundles" "$OUT/tools"
 
-# 1. Kernel Extensions
+# 1. Kernel Extensions (ArcXe, ArcFB + ArcAccel for BOTH macOS 15 Sequoia & macOS 26 Tahoe)
 echo ""
-echo "[Step 1/5] Building Kernel Extensions (ArcXe, ArcFB, ArcAccel)..."
+echo "[Step 1/5] Building Kernel Extensions (ArcXe, ArcFB, ArcAccel [macOS 15 & macOS 26])..."
 bash "$ROOT/kexts/ArcXe/build.sh" "$OUT/kexts"
 bash "$ROOT/kexts/ArcFB/build.sh" "$OUT/kexts"
-bash "$ROOT/kexts/ArcAccel/build.sh" "$OUT/kexts"
+ARC_TAHOE=0 bash "$ROOT/kexts/ArcAccel/build.sh" "$OUT/kexts/15"
+ARC_TAHOE=1 bash "$ROOT/kexts/ArcAccel/build.sh" "$OUT/kexts/26"
+
+HOST_VER="$(sw_vers -productVersion)"
+HOST_MAJ="${HOST_VER%%.*}"
+if [ "$HOST_MAJ" = "26" ]; then
+    ditto "$OUT/kexts/26/ArcAccel.kext" "$OUT/kexts/ArcAccel.kext"
+else
+    ditto "$OUT/kexts/15/ArcAccel.kext" "$OUT/kexts/ArcAccel.kext"
+fi
 
 # 2. GuC v70 Firmware
 echo ""

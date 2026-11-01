@@ -39,9 +39,10 @@ if [ "${RELEASE:-1}" = "1" ]; then
 fi
 
 echo "[build_plugin] Compiling ArcMTLDriver.bundle (x86_64 Mach-O bundle, ARC enabled)..."
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 (
     cd "$PLUGIN_BUILD_SRC"
-    xcrun clang -arch x86_64 -bundle -fobjc-arc -O2 $RDEF \
+    xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O2 $RDEF \
         -Wno-protocol -Wno-incomplete-implementation -Wno-deprecated-declarations \
         -I"$VULKAN_INC" -I"$PLUGIN_BUILD_SRC" \
         -o "$BUNDLE_MACOS/ArcMTLDriver" \

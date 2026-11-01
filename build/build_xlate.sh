@@ -11,6 +11,7 @@ OUT_DIR="$ROOT/out/arcmtl"
 
 BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /usr/local)"
 export PATH="$HOME/.cargo/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 if [ ! -f "$XLATE_SRC/wrapper/Cargo.toml" ]; then
     echo "[ERROR] Translator source not found at $XLATE_SRC/wrapper/Cargo.toml"

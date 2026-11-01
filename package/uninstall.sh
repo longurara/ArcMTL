@@ -66,11 +66,15 @@ if [ "${#REMAINING_KARG[@]}" -eq 0 ]; then
     rm -f "$AUX_KC" "$AUX_KC.elides"
     echo "      No third-party kexts remain in $LE; removed $AUX_KC."
 else
+    KM_BASE_ARGS=(--allow-missing-kdk)
+    if [ -f "/System/Library/Kernels/kernel" ]; then
+        KM_BASE_ARGS+=(--kernel "/System/Library/Kernels/kernel")
+    fi
     TMP_DIR="$(mktemp -d /var/tmp/arc_uninstall.XXXXXX)"
     trap 'rm -rf "$TMP_DIR"' EXIT
     kmutil create -n aux \
         --volume-root / \
-        "${REMAINING_KARG[@]}" \
+        "${KM_BASE_ARGS[@]}" \
         -B "$KB" -S "$KS" \
         --repository "$LE" \
         -A "$TMP_DIR/aux.kc" -z

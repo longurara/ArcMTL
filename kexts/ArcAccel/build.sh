@@ -14,7 +14,11 @@ KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 
 TAHOE_FLAG=()
 DARWIN_MAJOR=$(uname -r | cut -d. -f1)
-if [ "${DARWIN_MAJOR:-24}" -ge 25 ]; then
+if [ "${ARC_TAHOE:-auto}" = "1" ]; then
+  TAHOE_FLAG=(-DARC_TAHOE=1)
+elif [ "${ARC_TAHOE:-auto}" = "0" ]; then
+  TAHOE_FLAG=()
+elif [ "${DARWIN_MAJOR:-24}" -ge 25 ]; then
   TAHOE_FLAG=(-DARC_TAHOE=1)
 fi
 

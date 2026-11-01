@@ -13,6 +13,7 @@ BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /usr/local)"
 LLVM_PREFIX="$(brew --prefix llvm 2>/dev/null || echo "$BREW_PREFIX/opt/llvm")"
 export PATH="$LLVM_PREFIX/bin:$BREW_PREFIX/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PKG_CONFIG_PATH="$LLVM_PREFIX/lib/pkgconfig:$BREW_PREFIX/lib/pkgconfig:$BREW_PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
 if [ ! -f "$MESA_SRC/meson.build" ]; then
     echo "[ERROR] Mesa source tree not found at $MESA_SRC"

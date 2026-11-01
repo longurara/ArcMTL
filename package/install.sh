@@ -1,14 +1,15 @@
 #!/bin/bash
-# package/install.sh — Safe Co-existing Installer for Intel Arc (Xe-LPG 8086:7D55) on macOS 15+
+# package/install.sh — Safe Co-existing Installer for Intel Arc (Xe-LPG 8086:7D55) on macOS 15 & macOS 26
 #
 # CRITICAL SAFETY GUARANTEES FOR DUAL-GPU (NullMoth RTX 4070 + Intel Arc 155H):
-#   1. Scans and preserves EVERY existing kext in /Library/Extensions (NVRM.kext, NVAccel.kext,
+#   1. Supports BOTH macOS 15 Sequoia (out/kexts/15/ArcAccel.kext) AND macOS 26 Tahoe (out/kexts/26/ArcAccel.kext).
+#   2. Scans and preserves EVERY existing kext in /Library/Extensions (NVRM.kext, NVAccel.kext,
 #      NVRMFB.kext, NVRMAGDC.kext, NVPrimarySelector.kext, etc.).
-#   2. Never touches /Library/GPUBundles/{NVMTLDriver.bundle, NVIDIAShared.bundle, nvmtl, nvmtl-allow.txt}.
-#   3. Pre-flights `kmutil create -n aux` into /var/tmp and verifies BOTH com.arc.* AND any existing
-#      com.nullmoth.* bundle IDs are present in the test AuxKC BEFORE modifying /Library/Extensions
-#      or /Library/KernelCollections/AuxiliaryKernelExtensions.kc.
-#   4. Creates a timestamped backup under /Library/ArcDriver/backups/<timestamp>.
+#   3. Never touches /Library/GPUBundles/{NVMTLDriver.bundle, NVIDIAShared.bundle, nvmtl, nvmtl-allow.txt}.
+#   4. Pre-flights `kmutil create -n aux --allow-missing-kdk` into /var/tmp and verifies BOTH com.arc.*
+#      AND any existing com.nullmoth.* bundle IDs are present in the test AuxKC BEFORE modifying
+#      /Library/Extensions or /Library/KernelCollections/AuxiliaryKernelExtensions.kc.
+#   5. Creates a timestamped backup under /Library/ArcDriver/backups/<timestamp>.
 #
 # Usage:
 #   sudo bash package/install.sh --stage1   # Install ArcXe.kext + firmware + userspace only (Stages 1 & 2)
@@ -28,23 +29,63 @@ die() {
 }
 
 if [ "$(uname -s)" != "Darwin" ]; then
-    die "install.sh must be run on macOS 15 Sequoia (or 26 Tahoe)."
+    die "install.sh must be run on macOS 15 Sequoia or macOS 26 Tahoe."
 fi
 if [ "$(id -u)" -ne 0 ]; then
     die "install.sh must be run as root (use: sudo bash package/install.sh)."
 fi
 
+OS_VER="$(sw_vers -productVersion)"
+OS_MAJ="${OS_VER%%.*}"
+case "$OS_MAJ" in
+    15|26) ;;
+    *) die "Unsupported macOS version '$OS_VER' (expected macOS 15 Sequoia or macOS 26 Tahoe)." ;;
+esac
+
+kpath() {
+    local k="$1"
+    if [ "$k" = "ArcAccel" ] && [ -d "$OUT/kexts/$OS_MAJ/ArcAccel.kext" ]; then
+        echo "$OUT/kexts/$OS_MAJ/ArcAccel.kext"
+    else
+        echo "$OUT/kexts/$k.kext"
+    fi
+}
+
+stamp_host_deps() {
+    local kext_dir="$1"
+    local plist="$kext_dir/Contents/Info.plist"
+    local pairs=(
+        "com.apple.iokit.IOPCIFamily:/System/Library/Extensions/IOPCIFamily.kext/Contents/Info.plist"
+        "com.apple.iokit.IOGraphicsFamily:/System/Library/Extensions/IOGraphicsFamily.kext/Contents/Info.plist"
+        "com.apple.iokit.IOAcceleratorFamily2:/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/Info.plist"
+        "com.apple.iokit.IOSurface:/System/Library/Extensions/IOSurface.kext/Contents/Info.plist"
+    )
+    for item in "${pairs[@]}"; do
+        local bid="${item%%:*}"
+        local sle="${item#*:}"
+        if /usr/libexec/PlistBuddy -c "Print :OSBundleLibraries:$bid" "$plist" >/dev/null 2>&1 && [ -f "$sle" ]; then
+            local ver
+            ver="$(/usr/libexec/PlistBuddy -c 'Print :OSBundleCompatibleVersion' "$sle" 2>/dev/null || \
+                   /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$sle" 2>/dev/null || true)"
+            if [ -n "$ver" ]; then
+                /usr/libexec/PlistBuddy -c "Set :OSBundleLibraries:$bid $ver" "$plist"
+            fi
+        fi
+    done
+    codesign --force --sign - "$kext_dir"
+}
+
 if [ "$MODE" = "--stage1" ]; then
     ARC_KEXTS=("ArcXe")
     echo "=================================================================="
-    echo " Installing Intel Arc Driver — STAGE 1/2 MODE (ArcXe.kext + ANV)"
-    echo " (ArcFB & ArcAccel omitted; RTX 4070 desktop completely untouched)"
+    echo " Installing Intel Arc Driver on macOS $OS_VER — STAGE 1/2 MODE"
+    echo " (ArcXe.kext + ANV only; RTX 4070 desktop completely untouched)"
     echo "=================================================================="
 elif [ "$MODE" = "--full" ]; then
     ARC_KEXTS=("ArcXe" "ArcFB" "ArcAccel")
     echo "=================================================================="
-    echo " Installing Intel Arc Driver — FULL STACK (Dual-GPU & Standalone)"
-    echo " (Kexts: ArcXe, ArcFB, ArcAccel + Mesa ANV + ArcMTLDriver.bundle)"
+    echo " Installing Intel Arc Driver on macOS $OS_VER — FULL STACK"
+    echo " (ArcXe + ArcFB + ArcAccel [macOS $OS_MAJ] + ANV + ArcMTLDriver)"
     echo "=================================================================="
 else
     die "Unknown option '$MODE'. Expected '--stage1' or '--full' (default)."
@@ -52,8 +93,9 @@ fi
 
 # 1. Verify all built artifacts exist in out/
 for k in "${ARC_KEXTS[@]}"; do
-    [ -f "$OUT/kexts/$k.kext/Contents/MacOS/$k" ] || die "Missing built kext $OUT/kexts/$k.kext (run 'bash build/build_all.sh' first)"
-    [ -f "$OUT/kexts/$k.kext/Contents/Info.plist" ] || die "Missing Info.plist in $OUT/kexts/$k.kext"
+    kp="$(kpath "$k")"
+    [ -f "$kp/Contents/MacOS/$k" ] || die "Missing built kext $kp (run 'bash build/build_all.sh' first)"
+    [ -f "$kp/Contents/Info.plist" ] || die "Missing Info.plist in $kp"
 done
 [ -f "$OUT/fw/mtl_guc_70.bin" ] || die "Missing $OUT/fw/mtl_guc_70.bin"
 [ -f "$OUT/arcmtl/libvulkan_intel.dylib" ] || die "Missing $OUT/arcmtl/libvulkan_intel.dylib"
@@ -62,7 +104,7 @@ done
 [ -f "$OUT/GPUBundles/ArcMTLDriver.bundle/Contents/MacOS/ArcMTLDriver" ] || die "Missing $OUT/GPUBundles/ArcMTLDriver.bundle"
 [ -f "$OUT/GPUBundles/arcmtl-allow.txt" ] || die "Missing $OUT/GPUBundles/arcmtl-allow.txt"
 
-# 2. Locate Boot & System Kernel Collections for kmutil
+# 2. Locate Boot/System Kernel Collections & Kernel binary for kmutil (--allow-missing-kdk)
 KB=""
 for p in /System/Library/KernelCollections/BootKernelExtensions.kc \
          /Library/Apple/System/Library/KernelCollections/BootKernelExtensions.kc; do
@@ -74,6 +116,11 @@ for p in /System/Library/KernelCollections/SystemKernelExtensions.kc \
     [ -f "$p" ] && { KS="$p"; break; }
 done
 [ -n "$KB" ] && [ -n "$KS" ] || die "Could not locate BootKernelExtensions.kc / SystemKernelExtensions.kc"
+
+KM_BASE_ARGS=(--allow-missing-kdk)
+if [ -f "/System/Library/Kernels/kernel" ]; then
+    KM_BASE_ARGS+=(--kernel "/System/Library/Kernels/kernel")
+fi
 
 LE="/Library/Extensions"
 GB="/Library/GPUBundles"
@@ -103,7 +150,7 @@ if [ -d "$LE" ]; then
             echo "      Preserving: $bname ($bid)"
             ditto "$existing" "$STAGE_EXT/$bname"
             chown -R root:wheel "$STAGE_EXT/$bname"
-            chmod -R 755 "$STAGE_EXT/$bname"
+            chmod -R go-w "$STAGE_EXT/$bname"
             if [ -n "$bid" ]; then
                 case "$bid" in
                     com.nullmoth.*)
@@ -115,26 +162,20 @@ if [ -d "$LE" ]; then
     done
 fi
 
-# Copy selected Arc*.kext bundles into staging repository
+# Copy selected Arc*.kext bundles into staging repository & stamp host OSBundleCompatibleVersion
 for k in "${ARC_KEXTS[@]}"; do
-    ditto "$OUT/kexts/$k.kext" "$STAGE_EXT/$k.kext"
+    ditto "$(kpath "$k")" "$STAGE_EXT/$k.kext"
+    stamp_host_deps "$STAGE_EXT/$k.kext"
     chown -R root:wheel "$STAGE_EXT/$k.kext"
     chmod -R 755 "$STAGE_EXT/$k.kext"
 done
 
-# Build explicit --bundle-path arguments for every kext in $STAGE_EXT
-KARG=()
-for staged in "$STAGE_EXT"/*.kext; do
-    [ -d "$staged" ] || continue
-    KARG+=(--bundle-path "$staged")
-done
-
 # 4. Pre-flight kmutil create -n aux in /var/tmp BEFORE touching /Library/Extensions or AuxKC
 echo ""
-echo "[2/5] Running pre-flight kmutil AuxiliaryKernelExtensions validation..."
+echo "[2/5] Running pre-flight kmutil AuxiliaryKernelExtensions validation (macOS $OS_MAJ)..."
 if ! kmutil create -n aux \
         --volume-root / \
-        ${KARG[@]+"${KARG[@]}"} \
+        "${KM_BASE_ARGS[@]}" \
         -B "$KB" -S "$KS" \
         --repository "$STAGE_EXT" \
         -A "$STAGE_DIR/test_aux.kc" -z >"$STAGE_DIR/kmutil_pre.log" 2>&1; then
@@ -205,10 +246,10 @@ if id _windowserver >/dev/null 2>&1; then
         || die "_windowserver cannot read $GB/arcmtl/libvulkan_intel.dylib!"
 fi
 
-# Remove old Arc*.kext first (ensures --stage1 removes ArcFB/ArcAccel if previously installed)
+# Install stamped kexts from $STAGE_EXT into /Library/Extensions
 rm -rf "$LE/ArcXe.kext" "$LE/ArcFB.kext" "$LE/ArcAccel.kext"
 for k in "${ARC_KEXTS[@]}"; do
-    ditto "$OUT/kexts/$k.kext" "$LE/$k.kext"
+    ditto "$STAGE_EXT/$k.kext" "$LE/$k.kext"
     chown -R root:wheel "$LE/$k.kext"
     chmod -R 755 "$LE/$k.kext"
 done
@@ -216,16 +257,10 @@ done
 # 7. Rebuild Live AuxiliaryKernelExtensions.kc atomically
 echo ""
 echo "[5/5] Rebuilding live $AUX_KC..."
-LIVE_KARG=()
-for livek in "$LE"/*.kext; do
-    [ -d "$livek" ] || continue
-    LIVE_KARG+=(--bundle-path "$livek")
-done
-
 NEW_KC="$STAGE_DIR/live_aux.kc"
 if ! kmutil create -n aux \
         --volume-root / \
-        ${LIVE_KARG[@]+"${LIVE_KARG[@]}"} \
+        "${KM_BASE_ARGS[@]}" \
         -B "$KB" -S "$KS" \
         --repository "$LE" \
         -A "$NEW_KC" -z >"$STAGE_DIR/kmutil_live.log" 2>&1; then
@@ -245,7 +280,7 @@ fi
 
 echo ""
 echo "=================================================================="
-echo " [INSTALLED] Intel Arc macOS Driver Stack Ready!"
+echo " [INSTALLED] Intel Arc Driver Ready for macOS $OS_VER!"
 echo " Backup saved at: $BK"
 echo "=================================================================="
 echo "  1. First install: If macOS prompts in System Settings -> Privacy & Security,"

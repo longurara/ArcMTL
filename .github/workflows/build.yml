@@ -1,4 +1,4 @@
-name: Build ArcMTL macOS 15 Driver Stack
+name: Build ArcMTL (macOS 26 Tahoe & macOS 15 Sequoia)
 
 on:
   push:
@@ -12,46 +12,48 @@ permissions:
   contents: write
 
 jobs:
-  build-macos15-x86_64:
-    name: Build & Verify on macOS 15 Sequoia (x86_64)
-    runs-on: macos-15-intel
+  build-macos26-x86_64:
+    name: Build Full Stack on macOS 26 Tahoe (x86_64, supports 26 & 15)
+    runs-on: macos-26-intel
 
     steps:
       - name: Checkout ArcMTL repository
         uses: actions/checkout@v4
 
-      - name: Inspect macOS 15 Sequoia & Xcode environment
+      - name: Inspect macOS 26 Tahoe & Xcode environment
         run: |
           sw_vers
           uname -a
           xcodebuild -version
           xcrun --show-sdk-path
 
-      - name: Build Kernel Extensions (ArcXe.kext, ArcFB.kext, ArcAccel.kext)
+      - name: Build Kernel Extensions (ArcXe, ArcFB + ArcAccel for macOS 26 & macOS 15)
         run: |
           chmod +x kexts/*/build.sh build/*.sh scripts/*.sh package/*.sh
           bash kexts/ArcXe/build.sh "$PWD/out/kexts"
           bash kexts/ArcFB/build.sh "$PWD/out/kexts"
-          bash kexts/ArcAccel/build.sh "$PWD/out/kexts"
+          ARC_TAHOE=0 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/15"
+          ARC_TAHOE=1 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/26"
+          ditto "$PWD/out/kexts/26/ArcAccel.kext" "$PWD/out/kexts/ArcAccel.kext"
 
-      - name: Verify Kernel Linking with Apple kmutil (AuxKC Pre-flight)
+      - name: Verify macOS 26 Tahoe Kernel Linking with Apple kmutil (AuxKC Pre-flight)
         run: |
-          STAGE="$(mktemp -d /var/tmp/arcmtl_ci_kc.XXXXXX)"
+          STAGE="$(mktemp -d /var/tmp/arcmtl_ci26_kc.XXXXXX)"
           mkdir -p "$STAGE/Extensions"
-          for k in ArcXe ArcFB ArcAccel; do
-            sudo ditto "out/kexts/$k.kext" "$STAGE/Extensions/$k.kext"
-            sudo chown -R root:wheel "$STAGE/Extensions/$k.kext"
-            sudo chmod -R 755 "$STAGE/Extensions/$k.kext"
-          done
+          sudo ditto "out/kexts/ArcXe.kext" "$STAGE/Extensions/ArcXe.kext"
+          sudo ditto "out/kexts/ArcFB.kext" "$STAGE/Extensions/ArcFB.kext"
+          sudo ditto "out/kexts/26/ArcAccel.kext" "$STAGE/Extensions/ArcAccel.kext"
+          sudo chown -R root:wheel "$STAGE/Extensions"
+          sudo chmod -R 755 "$STAGE/Extensions"
           KB="/System/Library/KernelCollections/BootKernelExtensions.kc"
           [ -f "$KB" ] || KB="/Library/Apple/System/Library/KernelCollections/BootKernelExtensions.kc"
           KS="/System/Library/KernelCollections/SystemKernelExtensions.kc"
           [ -f "$KS" ] || KS="/Library/Apple/System/Library/KernelCollections/SystemKernelExtensions.kc"
+          KM_ARGS=(--allow-missing-kdk)
+          [ -f "/System/Library/Kernels/kernel" ] && KM_ARGS+=(--kernel "/System/Library/Kernels/kernel")
           sudo kmutil create -n aux \
             --volume-root / \
-            --bundle-path "$STAGE/Extensions/ArcXe.kext" \
-            --bundle-path "$STAGE/Extensions/ArcFB.kext" \
-            --bundle-path "$STAGE/Extensions/ArcAccel.kext" \
+            "${KM_ARGS[@]}" \
             -B "$KB" -S "$KS" \
             --repository "$STAGE/Extensions" \
             -A "$STAGE/test_aux.kc" -z
@@ -84,36 +86,42 @@ jobs:
           bash scripts/fetch_deps.sh
 
       - name: Build Rust AIR -> SPIR-V Translator (libarcmtl_translate.dylib)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
           bash build/build_xlate.sh
 
       - name: Build Mesa Intel ANV Vulkan 1.3 ICD (libvulkan_intel.dylib)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
           bash build/build_anv.sh
 
       - name: Build ArcMTLDriver.bundle & Staged CLI Verification Tools
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: |
           bash build/build_plugin.sh
           mkdir -p out/fw out/tools
           cp -f firmware/mtl_guc_70.bin out/fw/mtl_guc_70.bin
 
           VULKAN_INC="$PWD/third_party/Vulkan-Headers/include"
-          xcrun clang -arch x86_64 -O2 -Wall -I"$PWD/include" \
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -I"$PWD/include" \
             tools/arc_probe.c -o out/tools/arc_probe \
             -framework IOKit -framework CoreFoundation
 
-          xcrun clang -arch x86_64 -O2 -Wall -I"$VULKAN_INC" \
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -I"$VULKAN_INC" \
             tools/vk_offscreen_test.c -o out/tools/vk_offscreen_test
 
-          xcrun clang -arch x86_64 -fobjc-arc -O2 -Wall \
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -fobjc-arc -O2 -Wall \
             tools/mtl_offscreen_test.m -o out/tools/mtl_offscreen_test \
             -framework Foundation -framework Metal -framework IOSurface
 
           codesign -f -s - out/tools/arc_probe out/tools/vk_offscreen_test out/tools/mtl_offscreen_test
 
-      - name: Package Ready-to-Install Distribution Archive
+      - name: Package Ready-to-Install Universal Distribution (macOS 26 Tahoe & 15 Sequoia)
         run: |
-          DIST="ArcMTL-macos15-x86_64"
+          DIST="ArcMTL-macos26-15-x86_64"
           rm -rf "$DIST" "$DIST.tar.gz"
           mkdir -p "$DIST/package"
           cp -R out "$DIST/out"
@@ -124,10 +132,47 @@ jobs:
           shasum -a 256 "$DIST.tar.gz"
           ls -lh "$DIST.tar.gz"
 
-      - name: Upload Compiled Driver Artifact
+      - name: Upload Compiled Driver Artifact (macOS 26 & 15)
         uses: actions/upload-artifact@v4
         with:
-          name: ArcMTL-macos15-x86_64
-          path: ArcMTL-macos15-x86_64.tar.gz
+          name: ArcMTL-macos26-15-x86_64
+          path: ArcMTL-macos26-15-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 90
+
+  verify-kexts-macos15:
+    name: Verify Kernel Linking on macOS 15 Sequoia (x86_64)
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout ArcMTL repository
+        uses: actions/checkout@v4
+
+      - name: Build & Link-Verify Kexts on macOS 15 Sequoia
+        run: |
+          chmod +x kexts/*/build.sh
+          bash kexts/ArcXe/build.sh "$PWD/out/kexts"
+          bash kexts/ArcFB/build.sh "$PWD/out/kexts"
+          ARC_TAHOE=0 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/15"
+
+          STAGE="$(mktemp -d /var/tmp/arcmtl_ci15_kc.XXXXXX)"
+          mkdir -p "$STAGE/Extensions"
+          sudo ditto "out/kexts/ArcXe.kext" "$STAGE/Extensions/ArcXe.kext"
+          sudo ditto "out/kexts/ArcFB.kext" "$STAGE/Extensions/ArcFB.kext"
+          sudo ditto "out/kexts/15/ArcAccel.kext" "$STAGE/Extensions/ArcAccel.kext"
+          sudo chown -R root:wheel "$STAGE/Extensions"
+          sudo chmod -R 755 "$STAGE/Extensions"
+          KB="/System/Library/KernelCollections/BootKernelExtensions.kc"
+          [ -f "$KB" ] || KB="/Library/Apple/System/Library/KernelCollections/BootKernelExtensions.kc"
+          KS="/System/Library/KernelCollections/SystemKernelExtensions.kc"
+          [ -f "$KS" ] || KS="/Library/Apple/System/Library/KernelCollections/SystemKernelExtensions.kc"
+          KM_ARGS=(--allow-missing-kdk)
+          [ -f "/System/Library/Kernels/kernel" ] && KM_ARGS+=(--kernel "/System/Library/Kernels/kernel")
+          sudo kmutil create -n aux \
+            --volume-root / \
+            "${KM_ARGS[@]}" \
+            -B "$KB" -S "$KS" \
+            --repository "$STAGE/Extensions" \
+            -A "$STAGE/test_aux.kc" -z
+          kmutil inspect -a x86_64 -A "$STAGE/test_aux.kc" | grep -E "com\.arc\.(ArcXe|ArcFB|ArcAccel)"
+          sudo rm -rf "$STAGE"
