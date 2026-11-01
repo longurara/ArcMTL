@@ -404,9 +404,21 @@ def main() -> None:
         anv_meson,
         "  link_args : [vulkan_icd_link_args, ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],",
         "  # ARCXE_DARWIN_LINK\n"
-        "  link_args : [vulkan_icd_link_args, '-Wl,-framework,IOKit', '-Wl,-framework,CoreFoundation', ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],",
+        "  link_args : [vulkan_icd_link_args, '-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOKit', '-Wl,-framework,CoreFoundation', ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections],",
         "ARCXE_DARWIN_LINK",
     )
+    # Upgrade older ARCXE_DARWIN_LINK trees if re-applied locally
+    meson_txt = anv_meson.read_text(encoding="utf-8")
+    if "ARCXE_DARWIN_LINK" in meson_txt and "'-Wl,-undefined,dynamic_lookup'" not in meson_txt:
+        anv_meson.write_text(
+            meson_txt.replace(
+                "'-Wl,-framework,IOKit'",
+                "'-Wl,-undefined,dynamic_lookup', '-Wl,-framework,IOKit'",
+                1,
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
 
     print("Mesa 26.2 ANV Darwin/XNU patch applied successfully.")
 

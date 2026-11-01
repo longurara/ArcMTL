@@ -81,8 +81,9 @@ jobs:
           python3 -m pip install --user --break-system-packages mako pyyaml packaging || \
             pip3 install --user mako pyyaml packaging
 
-      - name: Cache Cargo & ccache Build Artifacts
-        uses: actions/cache@v4
+      - name: Restore Cargo & ccache Build Cache
+        id: build-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -90,7 +91,7 @@ jobs:
             ~/Library/Caches/ccache
             ~/.cache/ccache
             build/xlate-target
-          key: arcmtl-macos26-x86_64-mesa26.2.6-${{ hashFiles('scripts/fetch_deps.sh', 'build/*.sh') }}
+          key: arcmtl-macos26-x86_64-mesa26.2.6-${{ github.sha }}
           restore-keys: |
             arcmtl-macos26-x86_64-mesa26.2.6-
             arcmtl-macos26-x86_64-
@@ -145,6 +146,18 @@ jobs:
           tar -czf "$DIST.tar.gz" "$DIST"
           shasum -a 256 "$DIST.tar.gz"
           ls -lh "$DIST.tar.gz"
+
+      - name: Save Cargo & ccache Build Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/Library/Caches/ccache
+            ~/.cache/ccache
+            build/xlate-target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
 
       - name: Upload Compiled Driver Artifact (macOS 26 & 15)
         uses: actions/upload-artifact@v4
