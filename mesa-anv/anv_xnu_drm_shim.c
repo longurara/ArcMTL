@@ -10,7 +10,7 @@
 #ifdef __APPLE__
 
 #include "anv_xnu_drm_shim.h"
-#include "xf86drm_macos_stub.h"
+#include <xf86drm.h>
 
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -1239,6 +1239,8 @@ static drmDevicePtr alloc_single_arc_drm_device(const struct ArcXeQueryDeviceOut
     }
 
     dev->available_nodes         = (1 << DRM_NODE_RENDER);
+    dev->nodes[DRM_NODE_PRIMARY] = strdup("");
+    dev->nodes[DRM_NODE_CONTROL] = strdup("");
     dev->nodes[DRM_NODE_RENDER]  = strdup(ARC_XNU_FAKE_RENDER_NODE);
     dev->bustype                 = DRM_BUS_PCI;
     dev->businfo.pci->domain     = 0;

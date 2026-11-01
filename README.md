@@ -1,8 +1,8 @@
-# Intel Arc (Xe-LPG / Meteor Lake `8086:7D55`) Metal 3 & Display Driver cho macOS 15 Sequoia
+# Intel Arc (Xe-LPG / Meteor Lake `8086:7D55`) Metal 3 & Display Driver cho macOS 26 Tahoe & macOS 15 Sequoia
 
-Bộ driver đồ họa **Metal 3 + Vulkan 1.3 (Mesa ANV) + Display (`IOFramebuffer` / `IOGraphicsAccelerator2`)** dành cho iGPU **Intel Arc Graphics** trên vi xử lý **Intel Core Ultra 7 155H** (`PCI\VEN_8086&DEV_7D55`, kiến trúc **Xe-LPG IP 12.70**, Media **Xe-LPM+ IP 13.00**, Display **IP v14**, bộ nhớ hợp nhất UMA).
+Bộ driver đồ họa **Metal 3 + Vulkan 1.3/1.4 (Mesa ANV 26.2.6) + Display (`IOFramebuffer` / `IOGraphicsAccelerator2`)** dành cho iGPU **Intel Arc Graphics** trên vi xử lý **Intel Core Ultra 7 155H** (`PCI\VEN_8086&DEV_7D55`, kiến trúc **Xe-LPG IP 12.70**, Media **Xe-LPM+ IP 13.00**, Display **IP v14**, bộ nhớ hợp nhất UMA).
 
-Được thiết kế chuyên biệt để **chung sống an toàn 100%** với bộ driver **NullMoth NVIDIA (`RTX 4070`)** trên cùng hệ thống macOS 15 Sequoia (và macOS 26 Tahoe):
+Được thiết kế chuyên biệt để **chung sống an toàn 100%** với bộ driver **NullMoth NVIDIA (`RTX 4070`)** trên cả **macOS 26 Tahoe** và **macOS 15 Sequoia**:
 - **Chế độ Dual-GPU (`arc_headless=1`)**: `WindowServer` tiếp tục chạy siêu mượt trên `RTX 4070`, trong khi mọi ứng dụng Metal 3 / Compute (`MTLCopyAllDevices()`) nhìn thấy và sử dụng đồng thời **cả 2 GPU** (`RTX 4070` + `Intel Arc Graphics`).
 - **Chế độ Laptop Độc lập / Tiết kiệm Pin (`arcfb=1 arcaccel=1 -nvoff`)**: Tắt hoàn toàn dGPU NVIDIA, xuất hình và tăng tốc toàn bộ giao diện macOS `WindowServer` Metal 3 trực tiếp trên iGPU Intel Arc với cơ chế **Zero-Copy UMA `IOSurface` -> GGTT `PLANE_SURF` Flip**.
 
@@ -21,9 +21,9 @@ Bộ driver đồ họa **Metal 3 + Vulkan 1.3 (Mesa ANV) + Display (`IOFramebuf
 │  • Gọi libarcmtl_translate.dylib dịch Apple AIR / Metallib -> SPIR-V       │
 │  • Zero-copy UMA buffer/IOSurface qua VK_EXT_external_memory_host          │
 └──────────────────┬───────────────────────────────────────┬─────────────────┘
-                   │ Vulkan 1.3 C API                      │ IOSurface Flip
+                   │ Vulkan 1.3/1.4 C API                  │ IOSurface Flip
 ┌──────────────────▼──────────────────────┐   ┌────────────▼─────────────────┐
-│  libvulkan_intel.dylib (Mesa ANV 25.0)  │   │  ArcAccel.kext & ArcFB.kext  │
+│  libvulkan_intel.dylib (Mesa ANV 26.2)  │   │  ArcAccel.kext & ArcFB.kext  │
 │  • Compiler Intel BRW chuẩn cho Xe-LPG  │   │  • IOGraphicsAccelerator2    │
 │  • anv_xnu_drm_shim.c dịch DRM_IOCTL_XE │   │  • Display IP 14 Scanout     │
 │    sang IOConnectCallMethod / MapMemory │   │  • Zero-copy GGTT PLANE_SURF │
@@ -61,29 +61,34 @@ Bộ driver đồ họa **Metal 3 + Vulkan 1.3 (Mesa ANV) + Display (`IOFramebuf
 
 ---
 
-## 3. Hướng dẫn Biên dịch (Chạy trực tiếp trên macOS 15 Sequoia)
+## 3. Tải gói Build sẵn từ GitHub Actions hoặc Tự Biên dịch (macOS 26 Tahoe / macOS 15 Sequoia)
 
-Khởi động vào macOS 15 Sequoia (đang chạy mượt bằng RTX 4070 của bạn), mở Terminal tại thư mục dự án này:
+### Cách A — Tải trực tiếp gói `ArcMTL-macos26-15-x86_64.tar.gz` từ GitHub Actions (Khuyên dùng)
+GitHub Actions tự động biên dịch trọn bộ trên **macOS 26 Tahoe (`macos-26-intel`)** và kiểm tra liên kết kernel bằng `kmutil` trên cả **macOS 26 Tahoe** lẫn **macOS 15 Sequoia (`macos-15-intel`)**.
+1. Vào tab **Actions** trên repo [`longurara/ArcMTL`](https://github.com/longurara/ArcMTL/actions), tải artifact **`ArcMTL-macos26-15-x86_64`**.
+2. Giải nén trên máy Mac của bạn — bộ cài `package/install.sh` sẽ tự nhận diện `kern.osrelease` (Darwin 25.x = macOS 26 Tahoe, Darwin 24.x = macOS 15 Sequoia) để nạp đúng biến thể `ArcAccel.kext`.
 
-### Bước 3.1 — Cài đặt các gói công cụ build qua Homebrew
+### Cách B — Tự biên dịch trực tiếp trên máy Mac
+
+#### Bước 3.1 — Cài đặt các gói công cụ build qua Homebrew
 ```bash
 xcode-select --install 2>/dev/null || true
-brew install rust meson ninja pkgconf bison flex glslang llvm spirv-llvm-translator spirv-tools libclc
+brew install ccache rust meson ninja pkgconf bison flex glslang llvm spirv-llvm-translator spirv-tools libclc
 python3 -m pip install --user --break-system-packages mako pyyaml packaging
 ```
 
-### Bước 3.2 — Tải mã nguồn phụ thuộc & tự động patch
+#### Bước 3.2 — Tải mã nguồn phụ thuộc & tự động patch
 ```bash
 bash scripts/fetch_deps.sh
 ```
-Lệnh này tải `Vulkan-Headers`, `Mesa 25.0.7`, và sparse-checkout `translator/` + `plugin/` của NullMoth vào `third_party/`, sau đó tự động gắn `anv_xnu_drm_shim.c` vào Mesa và sinh mã nguồn `ArcMTLDriver` (đã đổi tên toàn bộ class sang `ArcMTL*`).
+Lệnh này tải `Vulkan-Headers`, `Mesa 26.2.6`, và sparse-checkout `translator/` + `plugin/` của NullMoth vào `third_party/`, sau đó tự động gắn `anv_xnu_drm_shim.c` vào Mesa và sinh mã nguồn `ArcMTLDriver` (đã đổi tên toàn bộ class sang `ArcMTL*`).
 
-### Bước 3.3 — Biên dịch toàn bộ Kexts + Vulkan ANV + Metal Bundle + Tools
+#### Bước 3.3 — Biên dịch toàn bộ Kexts + Vulkan ANV + Metal Bundle + Tools
 ```bash
 bash build/build_all.sh
 ```
 Toàn bộ sản phẩm sau khi build sẽ nằm gọn trong thư mục `out/`:
-- `out/kexts/{ArcXe.kext, ArcFB.kext, ArcAccel.kext}`
+- `out/kexts/{ArcXe.kext, ArcFB.kext, ArcAccel.kext}` (kèm `out/kexts/26/ArcAccel.kext` & `out/kexts/15/ArcAccel.kext`)
 - `out/fw/mtl_guc_70.bin`
 - `out/arcmtl/{libvulkan_intel.dylib, libarcmtl_translate.dylib, intel_icd.json}`
 - `out/GPUBundles/{ArcMTLDriver.bundle, arcmtl-allow.txt}`

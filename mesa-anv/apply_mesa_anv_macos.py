@@ -101,6 +101,57 @@ def main() -> None:
         "ARCXE_DARWIN_VK_SYNCOBJ",
     )
 
+    # 4b. Enable vk_image::drm_format_mod and vk_common_GetImageDrmFormatModifierPropertiesEXT on Darwin
+    #     (Mesa ANV uses image->vk.drm_format_mod unconditionally across anv_private.h / anv_image.c).
+    replace_once(
+        mesa / "src" / "vulkan" / "runtime" / "vk_image.h",
+        "#if DETECT_OS_LINUX || DETECT_OS_BSD\n"
+        "   /* VK_EXT_drm_format_modifier",
+        "/* ARCXE_DARWIN_VK_IMAGE_H */\n"
+        "#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE\n"
+        "   /* VK_EXT_drm_format_modifier",
+        "ARCXE_DARWIN_VK_IMAGE_H",
+    )
+    replace_all(
+        mesa / "src" / "vulkan" / "runtime" / "vk_image.c",
+        "#if DETECT_OS_LINUX || DETECT_OS_BSD",
+        "/* ARCXE_DARWIN_VK_IMAGE_C */\n#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE",
+        "ARCXE_DARWIN_VK_IMAGE_C",
+        expected_min=3,
+    )
+
+    # 4c. Prefer per-user / App Sandbox $TMPDIR in src/util/anon_file.c on Darwin before /tmp fallback
+    replace_once(
+        mesa / "src" / "util" / "anon_file.c",
+        '    env = os_get_option("XDG_RUNTIME_DIR");\n'
+        "    if (env && env[0] != '\\0') {\n"
+        '        n = asprintf(&buf, "%s", env);\n'
+        "        if (n < 0)\n"
+        "           return NULL;\n"
+        "        return buf;\n"
+        "    }",
+        '    env = os_get_option("XDG_RUNTIME_DIR");\n'
+        "    if (env && env[0] != '\\0') {\n"
+        '        n = asprintf(&buf, "%s", env);\n'
+        "        if (n < 0)\n"
+        "           return NULL;\n"
+        "        return buf;\n"
+        "    }\n"
+        "#ifdef __APPLE__\n"
+        "    /* ARCXE_DARWIN_TMPDIR */\n"
+        '    env = os_get_option("TMPDIR");\n'
+        "    if (env && env[0] != '\\0' && stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {\n"
+        '        n = asprintf(&buf, "%s", env);\n'
+        "        if (n < 0)\n"
+        "           return NULL;\n"
+        "        while (n > 1 && buf[n - 1] == '/')\n"
+        "           buf[--n] = '\\0';\n"
+        "        return buf;\n"
+        "    }\n"
+        "#endif",
+        "ARCXE_DARWIN_TMPDIR",
+    )
+
     # 5. Hook intel_ioctl() in src/intel/common/intel_gem.h to route through arc_xnu_ioctl on __APPLE__
     replace_once(
         mesa / "src" / "intel" / "common" / "intel_gem.h",

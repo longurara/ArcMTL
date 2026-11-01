@@ -67,7 +67,7 @@ jobs:
           HOMEBREW_NO_ENV_HINTS: "1"
         run: |
           pkgs=()
-          for f in meson ninja pkgconf bison flex glslang llvm spirv-llvm-translator spirv-tools libclc; do
+          for f in ccache meson ninja pkgconf bison flex glslang llvm spirv-llvm-translator spirv-tools libclc; do
             brew list --versions "$f" >/dev/null 2>&1 || pkgs+=("$f")
           done
           if [ "${#pkgs[@]}" -gt 0 ]; then
@@ -80,6 +80,20 @@ jobs:
           fi
           python3 -m pip install --user --break-system-packages mako pyyaml packaging || \
             pip3 install --user mako pyyaml packaging
+
+      - name: Cache Cargo & ccache Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/Library/Caches/ccache
+            ~/.cache/ccache
+            build/xlate-target
+          key: arcmtl-macos26-x86_64-mesa26.2.6-${{ hashFiles('scripts/fetch_deps.sh', 'build/*.sh') }}
+          restore-keys: |
+            arcmtl-macos26-x86_64-mesa26.2.6-
+            arcmtl-macos26-x86_64-
 
       - name: Fetch & Patch Third-Party Sources (Vulkan-Headers, Mesa 26.2.6, NullMoth)
         run: |
