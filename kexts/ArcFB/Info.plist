@@ -17,20 +17,19 @@
       <key>CFBundleIdentifier</key><string>com.arc.ArcFB</string>
       <key>IOClass</key><string>ArcFB</string>
       <key>IOProviderClass</key><string>IOPCIDevice</string>
-      <key>IOPCIMatch</key><string>0x00008086&amp;0x0000ffff</string>
-      <key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+      <key>IOPCIMatch</key><string>0x7d558086 0x7d408086 0x7d418086 0x7d458086 0x7d518086 0x7d608086 0x7d678086 0x7dd18086 0x7dd58086</string>
       <key>IOProbeScore</key><integer>65000</integer>
       <key>IOMatchCategory</key><string>IOFramebuffer</string>
     </dict>
   </dict>
   <key>OSBundleLibraries</key>
   <dict>
-    <key>com.apple.kpi.bsd</key><string>8.0</string>
-    <key>com.apple.kpi.iokit</key><string>8.0</string>
-    <key>com.apple.kpi.libkern</key><string>8.0</string>
-    <key>com.apple.kpi.mach</key><string>8.0</string>
-    <key>com.apple.iokit.IOPCIFamily</key><string>1.0.0</string>
-    <key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
+    <key>com.apple.kpi.bsd</key><string>16.0</string>
+    <key>com.apple.kpi.iokit</key><string>16.0</string>
+    <key>com.apple.kpi.libkern</key><string>16.0</string>
+    <key>com.apple.kpi.mach</key><string>16.0</string>
+    <key>com.apple.iokit.IOPCIFamily</key><string>2.9</string>
+    <key>com.apple.iokit.IOGraphicsFamily</key><string>2.1</string>
   </dict>
   <key>OSBundleRequired</key><string>Safe Boot</string>
 </dict>

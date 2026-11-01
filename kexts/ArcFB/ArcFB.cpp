@@ -306,42 +306,74 @@ bool ArcFB::resolveScanoutPhysical(IOPhysicalAddress bar2Base, IOPhysicalLength 
     const uint64_t needed = (uint64_t)fRowBytes * (uint64_t)fHeight;
     fScanoutBytes = (IOPhysicalLength)((needed + 0xFFFULL) & ~0xFFFULL);
 
-    /* Path 1: Direct BAR2 GMADR Aperture window (fastest and always linear in CPU physical space) */
-    if (bar2Base && bar2Len && ((uint64_t)fBootSurfGgtt + fScanoutBytes <= (uint64_t)bar2Len)) {
-        fScanoutPhys = bar2Base + fBootSurfGgtt;
-        AFBLOG("scanout mapped via BAR2 GMADR: phys 0x%llx (%llu KiB)",
+    /*
+     * Path 1 (Primary on Xe-LPG / Display IP 13-20): Inspect GGTT PTEs in BAR0 + 8 MiB.
+     * Note: Meteor Lake Xe-LPG (Graphics IP 12.70/12.71, Display IP 14) has NO CPU-mappable
+     * GGTT aperture on BAR2 (0x90000000); UEFI GOP allocates the linear scanout surface in
+     * contiguous Data Stolen Memory (DSM, e.g. 0x78800000) and maps it via GGTT PTEs.
+     */
+    uint64_t pte0 = rdGgttPte(fBootSurfGgtt);
+    if ((pte0 != ~0ULL) && (pte0 & ARC_PTE_PRESENT)) {
+        uint64_t basePhys = pte0 & ARC_PTE_ADDR_MASK;
+        const uint32_t numPages = (uint32_t)(fScanoutBytes >> 12);
+        bool contiguous = (basePhys != 0);
+        for (uint32_t pg = 1; contiguous && pg < numPages; pg++) {
+            uint64_t pte = rdGgttPte(fBootSurfGgtt + (pg << 12));
+            if (!(pte & ARC_PTE_PRESENT) || ((pte & ARC_PTE_ADDR_MASK) != basePhys + ((uint64_t)pg << 12))) {
+                AFBLOG("GOP GGTT pages non-contiguous at page %u/%u", pg, numPages);
+                contiguous = false;
+            }
+        }
+        if (contiguous) {
+            fScanoutPhys = (IOPhysicalAddress)basePhys;
+            AFBLOG("scanout resolved from contiguous DSM GGTT PTEs: phys 0x%llx (%llu KiB)",
+                   (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
+            return true;
+        }
+    }
+
+    /* Path 2: XNU UEFI GOP boot console physical base (PE_state.video.v_baseAddr) */
+    if (PE_state.video.v_baseAddr != 0) {
+        fScanoutPhys = (IOPhysicalAddress)PE_state.video.v_baseAddr;
+        AFBLOG("scanout resolved from XNU PE_state.video.v_baseAddr: phys 0x%llx (%llu KiB)",
                (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
         return true;
     }
 
-    /* Path 2: Fallback for platforms/BIOSes placing GOP surface above 256 MiB BAR2 — inspect GGTT PTEs in BAR0+8MB */
-    uint64_t pte0 = rdGgttPte(fBootSurfGgtt);
-    if (!(pte0 & ARC_PTE_PRESENT)) {
-        AFBLOG("GGTT PTE for surface 0x%x is not present (0x%llx)", fBootSurfGgtt, (unsigned long long)pte0);
-        return false;
+    /* Path 3: Legacy Gen12 (Display IP <= 12) CPU-mappable BAR2 GMADR Aperture window */
+    if (fVer <= 12 && bar2Base && bar2Len && ((uint64_t)fBootSurfGgtt + fScanoutBytes <= (uint64_t)bar2Len)) {
+        fScanoutPhys = bar2Base + fBootSurfGgtt;
+        AFBLOG("scanout mapped via legacy BAR2 GMADR: phys 0x%llx (%llu KiB)",
+               (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
+        return true;
     }
-    uint64_t basePhys = pte0 & ARC_PTE_ADDR_MASK;
-    const uint32_t numPages = (uint32_t)(fScanoutBytes >> 12);
-    for (uint32_t pg = 1; pg < numPages; pg++) {
-        uint64_t pte = rdGgttPte(fBootSurfGgtt + (pg << 12));
-        if (!(pte & ARC_PTE_PRESENT) || ((pte & ARC_PTE_ADDR_MASK) != basePhys + ((uint64_t)pg << 12))) {
-            AFBLOG("GOP GGTT pages non-contiguous at page %u/%u; BAR2 required", pg, numPages);
-            return false;
-        }
-    }
-    fScanoutPhys = (IOPhysicalAddress)basePhys;
-    AFBLOG("scanout resolved directly from contiguous DSM GGTT PTEs: phys 0x%llx (%llu KiB)",
-           (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
-    return true;
+
+    AFBLOG("failed to resolve CPU physical scanout address for GGTT 0x%x", fBootSurfGgtt);
+    return false;
 }
 
 bool ArcFB::adoptFirmwareMode(IOPhysicalAddress bar2Base, IOPhysicalLength bar2Len)
 {
     for (int p = 0; p < 4; p++) {
-        const uint32_t conf = rd32(ARC_DISP_TRANSCONF(p));
-        const uint32_t ctl  = rd32(ARC_DISP_PLANE_CTL_1(p));
-        if (!(conf & ARC_DISP_TRANS_ENABLE) || !(ctl & ARC_PLANE_CTL_ENABLE))
+        const uint32_t ctl = rd32(ARC_DISP_PLANE_CTL_1(p));
+        if (ctl == ~0u || !(ctl & ARC_PLANE_CTL_ENABLE))
             continue;
+
+        int t = -1;
+        const uint32_t confSame = rd32(ARC_DISP_TRANSCONF(p));
+        if (confSame != ~0u && (confSame & ARC_DISP_TRANS_ENABLE)) {
+            t = p;
+        } else {
+            for (int cand = 0; cand < 4; cand++) {
+                const uint32_t confCand = rd32(ARC_DISP_TRANSCONF(cand));
+                if (confCand != ~0u && (confCand & ARC_DISP_TRANS_ENABLE)) {
+                    t = cand;
+                    break;
+                }
+            }
+            if (t < 0)
+                t = p;
+        }
 
         const uint32_t fmt  = planeFormatOf(ctl);
         const uint32_t tile = planeTileOf(ctl);
@@ -356,7 +388,7 @@ bool ArcFB::adoptFirmwareMode(IOPhysicalAddress bar2Base, IOPhysicalLength bar2L
         }
 
         const uint32_t sizeReg   = rd32(ARC_DISP_PLANE_SIZE_1(p));
-        const uint32_t strideReg = rd32(ARC_DISP_PLANE_STRIDE_1(p)) & 0x7FFu;
+        const uint32_t strideReg = rd32(ARC_DISP_PLANE_STRIDE_1(p)) & 0xFFFu;
         fWidth        = (sizeReg & 0xFFFFu) + 1u;
         fHeight       = ((sizeReg >> 16) & 0xFFFFu) + 1u;
         fRowBytes     = strideReg * 64u;
@@ -372,12 +404,12 @@ bool ArcFB::adoptFirmwareMode(IOPhysicalAddress bar2Base, IOPhysicalLength bar2L
         if (!resolveScanoutPhysical(bar2Base, bar2Len))
             return false;
 
-        fHT  = (rd32(ARC_DISP_HTOTAL(p)) >> 16) + 1u;
-        fVT  = (rd32(ARC_DISP_VTOTAL(p)) >> 16) + 1u;
-        fHSS = (rd32(ARC_DISP_HSYNC(p)) & 0xFFFFu) + 1u;
-        fHSE = (rd32(ARC_DISP_HSYNC(p)) >> 16) + 1u;
-        fVSS = (rd32(ARC_DISP_VSYNC(p)) & 0xFFFFu) + 1u;
-        fVSE = (rd32(ARC_DISP_VSYNC(p)) >> 16) + 1u;
+        fHT  = (rd32(ARC_DISP_HTOTAL(t)) >> 16) + 1u;
+        fVT  = (rd32(ARC_DISP_VTOTAL(t)) >> 16) + 1u;
+        fHSS = (rd32(ARC_DISP_HSYNC(t)) & 0xFFFFu) + 1u;
+        fHSE = (rd32(ARC_DISP_HSYNC(t)) >> 16) + 1u;
+        fVSS = (rd32(ARC_DISP_VSYNC(t)) & 0xFFFFu) + 1u;
+        fVSE = (rd32(ARC_DISP_VSYNC(t)) >> 16) + 1u;
 
         /* Measure true refresh rate from hardware frame counter over 200 ms */
         const uint32_t f0 = rd32(ARC_DISP_PIPE_FRMCOUNT(p));

@@ -33,7 +33,7 @@ bool ArcXeService::initGgtt()
             uint32_t surf   = rd32(ARC_DISP_PLANE_SURF_1(p)) & ~0xFFFu;
             uint32_t sizeR  = rd32(ARC_DISP_PLANE_SIZE_1(p));
             uint32_t height = ((sizeR >> 16) & 0xFFFFu) + 1u;
-            uint32_t stride = (rd32(ARC_DISP_PLANE_STRIDE_1(p)) & 0x7FFu) * 64u;
+            uint32_t stride = (rd32(ARC_DISP_PLANE_STRIDE_1(p)) & 0xFFFu) * 64u;
             uint64_t end    = ((uint64_t)surf + (uint64_t)height * stride + 0xFFFFFULL) & ~0xFFFFFULL;
             if (end > usableStart && end < 0x20000000ULL) {
                 AXELOG("initGgtt: reserving active GOP pipe %c range [0x%x .. 0x%llx)",
@@ -158,16 +158,19 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
     const uint64_t alignedSize = (size + 0xFFFULL) & ~0xFFFULL;
 
     /*
-     * IMPORTANT XNU RULE:
-     *   1. Do NOT pass kIOMemoryKernelUserShared to inTaskWithPhysicalMask(kernel_task, ...):
-     *      in XNU, kIOMemoryKernelUserShared sets kInternalFlagAsIfUnmapped, causing
-     *      buf->getBytesNoCopy() to return NULL! IOUserClient::clientMemoryForType maps
-     *      standard kernel_task IOBufferMemoryDescriptors into owningTask cleanly via map().
-     *   2. Do NOT pass kIOMapWriteCombineCache (0x400) in creation options, because 0x400 in
+     * IMPORTANT XNU RULES:
+     *   1. For user-mappable GEM BOs (!mapInKernel, mapped into owningTask via IOConnectMapMemory64),
+     *      include kIOMemoryKernelUserShared so XNU creates a shareable VM object outside kernel_map
+     *      (avoiding macOS 15/26 kernel_map protection failures on IOConnectMapMemory64). Note that
+     *      getBytesNoCopy() returns NULL when kIOMemoryKernelUserShared is set, so we zero via map().
+     *      For kernel-only BOs (mapInKernel == true), omit kIOMemoryKernelUserShared.
+     *   2. Never pass kIOMapWriteCombineCache (0x400) in creation options, because 0x400 in
      *      IOMemoryDescriptor creation IOOptionBits is kIOMemoryPageable, which conflicts
      *      with physicalMask! Pass cache flags ONLY to buf->map(mapOpts) / clientMemoryForType.
      */
     IOOptionBits allocOpts = kIODirectionInOut;
+    if (!mapInKernel)
+        allocOpts |= kIOMemoryKernelUserShared;
     if (alignedSize == 4096)
         allocOpts |= kIOMemoryPhysicallyContiguous;
 
