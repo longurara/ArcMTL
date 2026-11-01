@@ -6,6 +6,8 @@
  */
 
 #include "ArcXeService.h"
+#include <IOKit/IODeviceMemory.h>
+#include <libkern/c++/OSArray.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
@@ -333,8 +335,63 @@ bool ArcXeService::start(IOService *provider)
     fPCI->setProperty("arcxe-claimed", kOSBooleanTrue);
     fPCI->setProperty("model", "Intel(R) Arc(TM) Graphics");
 
+    /*
+     * Register Data Stolen Memory (DSM, e.g. 0x78800000..+128 MiB) in parent IOPCIDevice's
+     * IODeviceMemory array (tagged with PCI BDSM config offset 0xC0 so BAR0/BAR2 lookups are
+     * unaffected). On Meteor Lake Xe-LPG, UEFI GOP places PE_state.video.v_baseAddr in DSM
+     * outside BAR0/BAR2; exposing DSM in IODeviceMemory allows Apple's IOBootNDRV::fromRegistryEntry
+     * (IONDRVFramebuffer) to match v_baseAddr and launch WindowServer cleanly whenever ArcFB
+     * is not overriding head 0.
+     */
+    if (fStolenPhys && fStolenSize) {
+        OSArray *curMem = fPCI->getDeviceMemory();
+        bool hasDsm = false;
+        if (curMem) {
+            const unsigned int cnt = curMem->getCount();
+            for (unsigned int i = 0; i < cnt; i++) {
+                if (auto *m = OSDynamicCast(IODeviceMemory, curMem->getObject(i))) {
+                    if (m->getPhysicalAddress() == (IOPhysicalAddress)fStolenPhys) {
+                        hasDsm = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!hasDsm) {
+            OSArray *newMem = curMem ? OSArray::withArray(curMem) : OSArray::withCapacity(4);
+            if (newMem) {
+                if (IODeviceMemory *dsmMem = IODeviceMemory::withRange(
+                        (IOPhysicalAddress)fStolenPhys, (IOPhysicalLength)fStolenSize)) {
+                    dsmMem->setTag(ARC_PCI_BDSM_64_LO);
+                    newMem->setObject(dsmMem);
+                    dsmMem->release();
+                }
+                const uint64_t vBase = (uint64_t)PE_state.video.v_baseAddr;
+                const uint64_t vLen  = ((uint64_t)PE_state.video.v_rowBytes *
+                                        (uint64_t)PE_state.video.v_height + 0xFFFULL) & ~0xFFFULL;
+                if (vBase && vLen && (vBase < fStolenPhys || (vBase + vLen) > (fStolenPhys + fStolenSize))) {
+                    if (IODeviceMemory *gopMem = IODeviceMemory::withRange(
+                            (IOPhysicalAddress)(vBase & ~0xFFFULL), (IOPhysicalLength)vLen)) {
+                        gopMem->setTag(0xC8u);
+                        newMem->setObject(gopMem);
+                        gopMem->release();
+                    }
+                }
+                fPCI->setDeviceMemory(newMem);
+                newMem->release();
+                AXELOG("Registered DSM [0x%llx .. +0x%llx) in IOPCIDevice IODeviceMemory (v_baseAddr=0x%llx)",
+                       (unsigned long long)fStolenPhys, (unsigned long long)fStolenSize,
+                       (unsigned long long)PE_state.video.v_baseAddr);
+            }
+        }
+        const uint64_t vb = (uint64_t)PE_state.video.v_baseAddr;
+        if (vb >= fStolenPhys && vb < (fStolenPhys + fStolenSize)) {
+            fPCI->setProperty("AAPL,boot-display", kOSBooleanTrue);
+        }
+    }
+
     registerService();
-    /* Re-trigger matching on parent IOPCIDevice so ArcAccel can attach cleanly */
+    /* Re-trigger matching on parent IOPCIDevice so IONDRVFramebuffer / ArcFB / ArcAccel attach cleanly */
     fPCI->registerService();
 
     /* Only spawn background GuC firmware loader when arc_guc=1 is explicitly requested */

@@ -214,6 +214,18 @@ jobs:
 
       - name: Build & Package All 4 Kexts (macOS 26 Tahoe & macOS 15 Sequoia)
         run: |
+          KB="/System/Library/KernelCollections/BootKernelExtensions.kc"
+          [ -f "$KB" ] || KB="/Library/Apple/System/Library/KernelCollections/BootKernelExtensions.kc"
+          echo "=== Checking BootKC for IOGraphicsFamily / IONDRVSupport / IOAcceleratorFamily2 ==="
+          kmutil inspect -a x86_64 -B "$KB" | grep -E "IOGraphicsFamily|IONDRVSupport|IOAcceleratorFamily2|IOPCIFamily" || true
+          for f in IOPCIFamily IOGraphicsFamily IOAcceleratorFamily2 IOSurface; do
+            pl="/System/Library/Extensions/$f.kext/Contents/Info.plist"
+            if [ -f "$pl" ]; then
+              cv=$(/usr/libexec/PlistBuddy -c 'Print :OSBundleCompatibleVersion' "$pl" 2>/dev/null || echo "N/A")
+              bv=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$pl" 2>/dev/null || echo "N/A")
+              echo "SLE $f: CFBundleVersion=$bv OSBundleCompatibleVersion=$cv"
+            fi
+          done
           chmod +x kexts/*/build.sh
           bash kexts/ArcXe/build.sh "$PWD/out/kexts"
           bash kexts/ArcFB/build.sh "$PWD/out/kexts"
