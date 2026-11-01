@@ -50,6 +50,7 @@ struct ArcBo {
 /* 4-Level 48-bit PPGTT Page Table Node (512 entries x 8 bytes = 4 KiB) */
 struct ArcPtPage {
     IOBufferMemoryDescriptor   *buf;
+    IOMemoryMap                *kernMap;
     uint64_t                    physAddr;
     volatile uint64_t          *entries;
     ArcPtPage                  *children[512];  /* Null at leaf level 0 (PT) */

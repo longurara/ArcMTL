@@ -199,9 +199,12 @@ void ArcXeService::programMtlPatTable()
 void ArcXeService::invalidateGlobalTlb()
 {
     if (!forceWakeGet()) return;
-    wr32(ARC_REG_GTCR, ARC_GTCR_INVALIDATE);
-    for (uint32_t us = 0; us < 5000; us += 10) {
-        if ((rd32(ARC_REG_GTCR) & ARC_GTCR_INVALIDATE) == 0)
+    /* Gen12.50+ / Xe-LPG per-domain TLB invalidation registers (Linux i915 intel_tlb.c) + legacy GTCR */
+    static const uint32_t kTlbRegs[] = { 0x00CED8u, 0x00CF04u, 0x00CEECu, ARC_REG_GTCR };
+    for (uint32_t reg : kTlbRegs)
+        wr32(reg, ARC_GTCR_INVALIDATE);
+    for (uint32_t us = 0; us < 2000; us += 10) {
+        if ((rd32(0x00CED8u) & 1u) == 0 && (rd32(ARC_REG_GTCR) & ARC_GTCR_INVALIDATE) == 0)
             break;
         IODelay(10);
     }

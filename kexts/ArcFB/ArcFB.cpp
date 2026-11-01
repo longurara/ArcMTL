@@ -345,8 +345,9 @@ bool ArcFB::adoptFirmwareMode(IOPhysicalAddress bar2Base, IOPhysicalLength bar2L
 
         const uint32_t fmt  = planeFormatOf(ctl);
         const uint32_t tile = planeTileOf(ctl);
-        if (fmt != ARC_PLANE_CTL_FMT_XRGB8888 && fmt != ARC_PLANE_CTL_FMT_XBGR8888) {
-            AFBLOG("pipe %c: unsupported GOP format %u; declining safely", 'A' + p, fmt);
+        const uint32_t fmt4 = (ctl >> 24) & 0xFu;
+        if (fmt != ARC_PLANE_CTL_FMT_XRGB8888 && fmt != ARC_PLANE_CTL_FMT_XBGR8888 && fmt4 != 4u) {
+            AFBLOG("pipe %c: unsupported GOP format %u (ctl=0x%08x); declining safely", 'A' + p, fmt, ctl);
             return false;
         }
         if (tile != ARC_PLANE_CTL_TILE_LINEAR) {

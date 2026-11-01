@@ -140,8 +140,8 @@ jobs:
           rm -rf "$DIST" "$DIST.tar.gz"
           mkdir -p "$DIST/package"
           cp -R out "$DIST/out"
-          cp -f package/install.sh package/uninstall.sh "$DIST/package/"
-          chmod +x "$DIST/package/install.sh" "$DIST/package/uninstall.sh" "$DIST/out/tools/"*
+          cp -f package/install.sh package/uninstall.sh package/install_opencore_userspace.sh "$DIST/package/"
+          chmod +x "$DIST/package/install.sh" "$DIST/package/uninstall.sh" "$DIST/package/install_opencore_userspace.sh" "$DIST/out/tools/"*
           cp -f README.md LICENSE NOTICE "$DIST/"
           tar -czf "$DIST.tar.gz" "$DIST"
           shasum -a 256 "$DIST.tar.gz"
@@ -203,3 +203,29 @@ jobs:
             -A "$STAGE/test_aux.kc" -z
           kmutil inspect -a x86_64 -A "$STAGE/test_aux.kc" | grep -E "com\.arc\.(ArcXe|ArcFB|ArcAccel)"
           sudo rm -rf "$STAGE"
+
+  build-kexts-fast:
+    name: Fast Kext Build (macOS 26 & 15, ~25s)
+    runs-on: macos-26-intel
+
+    steps:
+      - name: Checkout ArcMTL repository
+        uses: actions/checkout@v4
+
+      - name: Build & Package All 4 Kexts (macOS 26 Tahoe & macOS 15 Sequoia)
+        run: |
+          chmod +x kexts/*/build.sh
+          bash kexts/ArcXe/build.sh "$PWD/out/kexts"
+          bash kexts/ArcFB/build.sh "$PWD/out/kexts"
+          ARC_TAHOE=0 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/15"
+          ARC_TAHOE=1 bash kexts/ArcAccel/build.sh "$PWD/out/kexts/26"
+          ditto "$PWD/out/kexts/26/ArcAccel.kext" "$PWD/out/kexts/ArcAccel.kext"
+          tar -czf ArcKexts-macos26-15-x86_64.tar.gz -C out kexts
+
+      - name: Upload Fast Kexts Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArcKexts-macos26-15-x86_64
+          path: ArcKexts-macos26-15-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 90

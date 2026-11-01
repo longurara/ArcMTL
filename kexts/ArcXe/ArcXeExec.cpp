@@ -62,7 +62,7 @@ bool ArcXeService::initEngines()
         wr32(ARC_RING_HWS_PGA(e.base), e.hwsp->ggttOffset);
         (void)rd32(ARC_RING_HWS_PGA(e.base));
         wr32(ARC_RING_HWSTAM(e.base), 0xFFFFFFFFu);
-        wr32(ARC_RING_IMR(e.base), 0u);
+        wr32(ARC_RING_IMR(e.base), 0xFFFFFFFFu); /* Mask ring IRQs (polling/seqno completion used) */
         /* Masked write: enable Execlist mode (disable legacy ringbuffer mode) */
         wr32(ARC_RING_GFX_MODE(e.base), ARC_MASKED_ENABLE(ARC_GFX_DISABLE_LEGACY_MODE));
         /* Ensure ring streamer is not halted in MI_MODE */

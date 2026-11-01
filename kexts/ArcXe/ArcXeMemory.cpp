@@ -157,14 +157,22 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
     if (!size) return nullptr;
     const uint64_t alignedSize = (size + 0xFFFULL) & ~0xFFFULL;
 
-    IOOptionBits opts = kIODirectionInOut | kIOMemoryKernelUserShared;
-    if (flags & ARCXE_GEM_FLAG_CPU_WC)
-        opts |= kIOMapWriteCombineCache;
-    else
-        opts |= kIOMapDefaultCache;
+    /*
+     * IMPORTANT XNU RULE:
+     *   1. Do NOT pass kIOMemoryKernelUserShared to inTaskWithPhysicalMask(kernel_task, ...):
+     *      in XNU, kIOMemoryKernelUserShared sets kInternalFlagAsIfUnmapped, causing
+     *      buf->getBytesNoCopy() to return NULL! IOUserClient::clientMemoryForType maps
+     *      standard kernel_task IOBufferMemoryDescriptors into owningTask cleanly via map().
+     *   2. Do NOT pass kIOMapWriteCombineCache (0x400) in creation options, because 0x400 in
+     *      IOMemoryDescriptor creation IOOptionBits is kIOMemoryPageable, which conflicts
+     *      with physicalMask! Pass cache flags ONLY to buf->map(mapOpts) / clientMemoryForType.
+     */
+    IOOptionBits allocOpts = kIODirectionInOut;
+    if (alignedSize == 4096)
+        allocOpts |= kIOMemoryPhysicallyContiguous;
 
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, opts, (mach_vm_size_t)alignedSize, ARC_DMA_PHYS_MASK_46BIT);
+        kernel_task, allocOpts, (mach_vm_size_t)alignedSize, ARC_DMA_PHYS_MASK_46BIT);
     if (!buf) {
         AXELOG("createKernelBo: allocation of %llu bytes failed", (unsigned long long)alignedSize);
         return nullptr;
@@ -173,7 +181,6 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
         buf->release();
         return nullptr;
     }
-    bzero(buf->getBytesNoCopy(), (size_t)alignedSize);
 
     ArcBo *bo = IONewZero(ArcBo, 1);
     if (!bo) {
@@ -189,9 +196,23 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
     bo->flags    = flags;
     bo->patIndex = (patIndex < ARC_MTL_PAT_NUM_ENTRIES) ? patIndex : ARC_MTL_PAT_IDX_WB_1WAY_COH;
 
+    const IOOptionBits mapOpts = (flags & ARCXE_GEM_FLAG_CPU_WC) ? kIOMapWriteCombineCache : kIOMapDefaultCache;
     if (mapInKernel) {
-        bo->kernMap = buf->map();
+        bo->kernMap = buf->map(mapOpts);
+        if (!bo->kernMap || !bo->kernMap->getVirtualAddress()) {
+            AXELOG("createKernelBo: kernel map failed for %llu bytes", (unsigned long long)alignedSize);
+            releaseBo(bo);
+            return nullptr;
+        }
+        bzero(reinterpret_cast<void *>(bo->kernMap->getVirtualAddress()), (size_t)alignedSize);
+    } else if (void *kva = buf->getBytesNoCopy()) {
+        bzero(kva, (size_t)alignedSize);
+    } else if (IOMemoryMap *tmpMap = buf->map(kIOMapDefaultCache)) {
+        if (tmpMap->getVirtualAddress())
+            bzero(reinterpret_cast<void *>(tmpMap->getVirtualAddress()), (size_t)alignedSize);
+        tmpMap->release();
     }
+
     if (flags & ARCXE_GEM_FLAG_SCANOUT) {
         uint16_t ggttPat = (bo->patIndex <= 3) ? bo->patIndex : ARC_MTL_PAT_IDX_WB_1WAY_COH;
         if (!allocGgttAndBind(bo->memDesc, bo->size, ggttPat, &bo->ggttOffset, &bo->ggttSize)) {
@@ -276,7 +297,7 @@ void ArcXeService::releaseBo(ArcBo *bo)
 ArcPtPage *ArcXeService::allocPtPage()
 {
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapDefaultCache,
+        kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
         4096, ARC_DMA_PHYS_MASK_46BIT);
     if (!buf) return nullptr;
     if (buf->prepare() != kIOReturnSuccess) {
@@ -292,8 +313,21 @@ ArcPtPage *ArcXeService::allocPtPage()
     }
     pt->buf      = buf;
     pt->physAddr = buf->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-    pt->entries  = reinterpret_cast<volatile uint64_t *>(buf->getBytesNoCopy());
-    bzero((void *)pt->entries, 4096);
+    void *kva    = buf->getBytesNoCopy();
+    if (!kva) {
+        pt->kernMap = buf->map(kIOMapDefaultCache);
+        if (pt->kernMap)
+            kva = reinterpret_cast<void *>(pt->kernMap->getVirtualAddress());
+    }
+    if (!kva || !pt->physAddr) {
+        OSSafeReleaseNULL(pt->kernMap);
+        buf->complete();
+        buf->release();
+        IODelete(pt, ArcPtPage, 1);
+        return nullptr;
+    }
+    pt->entries = reinterpret_cast<volatile uint64_t *>(kva);
+    bzero(kva, 4096);
     return pt;
 }
 
@@ -308,6 +342,7 @@ void ArcXeService::freePtTree(ArcPtPage *node, int level)
             }
         }
     }
+    OSSafeReleaseNULL(node->kernMap);
     if (node->buf) {
         node->buf->complete();
         node->buf->release();

@@ -227,7 +227,8 @@ public:
                 kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, 16384, 4096);
             if (fStamps) {
                 fStamps->prepare();
-                bzero(fStamps->getBytesNoCopy(), 16384);
+                if (void *sp = fStamps->getBytesNoCopy())
+                    bzero(sp, 16384);
             }
         }
         if (countOut) *countOut = fStamps ? 4096u : 0u;
