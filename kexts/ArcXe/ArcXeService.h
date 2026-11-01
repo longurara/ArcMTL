@@ -143,6 +143,8 @@ public:
     ArcBo                      *fRcsHwspBo          = nullptr;
     ArcBo                      *fCcsHwspBo          = nullptr;
     ArcBo                      *fBcsHwspBo          = nullptr;
+    ArcExecQueue               *fLastRcsQueue       = nullptr;
+    ArcExecQueue               *fLastBcsQueue       = nullptr;
     uint32_t                    fNextSwCtxId        = 1;
 
     /* GuC v70 State */

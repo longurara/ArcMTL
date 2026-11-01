@@ -203,9 +203,22 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         if (in->size == 0)
             return kIOReturnBadArgument;
 
-        uint16_t pat = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
-                     ? in->pat_index : ARC_MTL_PAT_IDX_WB_1WAY_COH;
-        ArcBo *bo = fOwner->createKernelBo(in->size, in->flags, pat, false);
+        uint32_t flags = in->flags;
+        uint16_t pat   = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
+                       ? in->pat_index : ARC_MTL_PAT_IDX_WB_2WAY_COH;
+        /*
+         * XNU UMA Coherency Rule:
+         * Non-scanout GEM BOs use kIOMemoryKernelUserShared and are mapped into owningTask via
+         * IOConnectMapMemory64(..., kIOMapAnywhere) with CPU Write-Back (WB) caching. On Meteor Lake
+         * Xe-LPG (has_llc = false), binding non-scanout BOs with PAT[0..2] (COH_NONE) causes GPU reads
+         * (batch buffers, state pools, shaders) and GPU writes (BLORP clears, render targets, UAVs)
+         * to bypass CPU IA WB caches. Promote all non-scanout user BOs to PAT[4] (2-Way Coherent WB).
+         */
+        if ((flags & ARCXE_GEM_FLAG_SCANOUT) == 0) {
+            flags = (flags & ~ARCXE_GEM_FLAG_CPU_WC) | ARCXE_GEM_FLAG_CPU_WB_COHERENT;
+            pat   = ARC_MTL_PAT_IDX_WB_2WAY_COH;
+        }
+        ArcBo *bo = fOwner->createKernelBo(in->size, flags, pat, false);
         if (!bo)
             return kIOReturnNoMemory;
 
@@ -249,9 +262,14 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         if (!in->user_addr || !in->size)
             return kIOReturnBadArgument;
 
-        uint16_t pat = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
-                     ? in->pat_index : ARC_MTL_PAT_IDX_WB_1WAY_COH;
-        ArcBo *bo = fOwner->importTaskMemoryBo(fTask, in->user_addr, in->size, pat, in->flags);
+        uint32_t flags = in->flags;
+        uint16_t pat   = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
+                       ? in->pat_index : ARC_MTL_PAT_IDX_WB_2WAY_COH;
+        if ((flags & ARCXE_GEM_FLAG_SCANOUT) == 0) {
+            flags = (flags & ~ARCXE_GEM_FLAG_CPU_WC) | ARCXE_GEM_FLAG_CPU_WB_COHERENT;
+            pat   = ARC_MTL_PAT_IDX_WB_2WAY_COH;
+        }
+        ArcBo *bo = fOwner->importTaskMemoryBo(fTask, in->user_addr, in->size, pat, flags);
         if (!bo)
             return kIOReturnVMError;
 
@@ -383,7 +401,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             return kIOReturnBadArgument;
 
         uint16_t pat = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
-                     ? in->pat_index : ARC_MTL_PAT_IDX_WB_1WAY_COH;
+                     ? in->pat_index : ARC_MTL_PAT_IDX_WB_2WAY_COH;
 
         IOLockLock(fClientLock);
         ArcVm *vm = lookupVmLocked(in->vm_id);
@@ -406,11 +424,17 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         IOLockUnlock(fClientLock);
 
         if (in->op == kArcXeVmBindOpMapUserPtr) {
+            pat = ARC_MTL_PAT_IDX_WB_2WAY_COH;
             tempUserBo = fOwner->importTaskMemoryBo(fTask, in->user_ptr, in->range_size, pat,
                                                     ARCXE_GEM_FLAG_CPU_WB_COHERENT);
             if (!tempUserBo)
                 return kIOReturnVMError;
             bo = tempUserBo;
+        }
+
+        /* Promote all non-scanout PPGTT binds to PAT[4] (2-Way Coherent WB) to match XNU CPU WB mappings */
+        if (!bo || (bo->flags & ARCXE_GEM_FLAG_SCANOUT) == 0) {
+            pat = ARC_MTL_PAT_IDX_WB_2WAY_COH;
         }
 
         const bool isUnmap = (in->op == kArcXeVmBindOpUnmap);

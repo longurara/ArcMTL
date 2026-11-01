@@ -5,11 +5,23 @@
 #   ProcessName    Allow ProcessName
 #   *              Allow all remaining user applications & CLI compute workloads
 
-# WindowServer is doubly gated:
-#  1. In Dual-GPU headless mode (boot-arg arc_headless=1 -> debug.arcaccel_headless=1),
-#     WindowServer is rejected before reading this file so RTX 4070 owns the desktop.
-#  2. Even when headless=0, '!WindowServer' requires debug.arcaccelfb=1 (arcaccel=1).
+# WindowServer and core macOS desktop shell processes are gated with '!':
+#  1. In Dual-GPU headless mode (boot-arg arc_headless=1 -> debug.arcaccelfb=0),
+#     desktop shell & Terminal stay on RTX 4070 so the GUI can never turn black,
+#     while mtl_offscreen_test, benchmarks, apps, and ARCMTL_ENABLE=1 see BOTH GPUs!
+#  2. In Standalone Arc Desktop mode (arcfb=1 arcaccel=1 -> debug.arcaccelfb=1),
+#     '!' evaluates to ALLOW so the entire macOS desktop composites on Intel Arc.
 !WindowServer
+!loginwindow
+!Dock
+!Finder
+!SystemUIServer
+!ControlCenter
+!NotificationCenter
+!WallpaperAgent
+!WallpaperVideoExtension
+!Spotlight
+!Terminal
 
 # Grant Metal 3 access on Intel Arc (Xe-LPG) to all applications & compute tools
 *

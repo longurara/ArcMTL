@@ -54,6 +54,12 @@ void ArcXeService::armEngineHw(uint32_t base, ArcBo *hwsp)
     /* Default CS MOCS for commands without explicit MOCS (BSpec 72161: MTL uc_index = 9) */
     wr32(ARC_RING_CMD_CCTL(base),
          ((0x3F00u | 0x007Eu) << 16) | (ARC_MTL_MOCS_UC_INDEX << 8) | (ARC_MTL_MOCS_UC_INDEX << 1));
+    if (base == ARC_BLT_RING_BASE) {
+        /* BLIT_CCTL (non-masked): [14:9] = dst MOCS, [6:1] = src MOCS (xe_hw_engine.c:340-360) */
+        const uint32_t curBlitCctl = rd32(ARC_RING_BLIT_CCTL(base));
+        wr32(ARC_RING_BLIT_CCTL(base),
+             (curBlitCctl & ~0x7E7Eu) | (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1));
+    }
     /* Masked write: enable Execlist mode (disable legacy ringbuffer mode) */
     wr32(ARC_RING_GFX_MODE(base), ARC_MASKED_ENABLE(ARC_GFX_DISABLE_LEGACY_MODE));
     /* Ensure ring streamer is not halted in MI_MODE (STOP_RING is BIT(8); BIT(9) is read-only MODE_IDLE) */
@@ -69,6 +75,10 @@ bool ArcXeService::resetEngineHw(uint32_t base, ArcBo *hwsp)
      * Only resets GT Render/Blitter domain — Display Engine & DSM GOP scanout are untouched.
      */
     const uint32_t domainMask = (base == ARC_BLT_RING_BASE) ? ARC_GRDOM_BLT : ARC_GRDOM_RENDER;
+    if (base == ARC_BLT_RING_BASE)
+        fLastBcsQueue = nullptr;
+    else
+        fLastRcsQueue = nullptr;
 
     wr32(ARC_RING_MI_MODE(base), ARC_MASKED_ENABLE(ARC_MI_STOP_RING));
     for (uint32_t us = 0; us < 2000; us += 10) {
@@ -238,15 +248,17 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
 
     /*
      * Populate Meteor Lake Xe-LPG (12.70/12.71) Engine Context Register State Image.
-     * Matches Linux drivers/gpu/drm/xe/xe_lrc.c: set_offsets() with mtl_rcs_offsets[] (RCS0)
-     * and gen12_xcs_offsets[] (BCS0), terminated by MI_BATCH_BUFFER_END | BIT(0) (END_CONTEXT).
+     * Matches Linux drivers/gpu/drm/i915/gt/intel_lrc.c: reg_offsets() for IP_VER >= (12, 55),
+     * where BOTH mtl_rcs_offsets[] (RCS0) and dg2_xcs_offsets[] (BCS0) begin with LRI(15, POSTED)
+     * including PRT_BB_STATE (0x120) and PRT_BB_STATE_UDW (0x124) at reg[0x1C..0x1F], followed
+     * by NOP(1) at 0x20 and LRI(9, POSTED) at 0x21, terminated by MI_BATCH_BUFFER_END | BIT(0).
      */
     const bool isRcs = (base == ARC_RENDER_RING_BASE || base == ARC_COMPUTE0_RING_BASE);
     volatile uint32_t *reg = q->ctxRegsCpu;
     const uint32_t lriPostedCs = ARC_MI_LRI_FORCE_POSTED | ARC_MI_LRI_CS_MMIO;
 
     reg[0x00] = ARC_MI_NOOP;
-    reg[0x01] = ARC_MI_LOAD_REGISTER_IMM(isRcs ? 15u : 13u) | lriPostedCs;
+    reg[0x01] = ARC_MI_LOAD_REGISTER_IMM(15u) | lriPostedCs;
 
     reg[0x02] = base + 0x244u; /* CTX_CONTEXT_CONTROL */
     reg[0x03] = ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
@@ -274,17 +286,11 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     reg[0x19] = 0u;
     reg[0x1A] = base + 0x2B4u; /* SEMAPHORE_TOKEN */
     reg[0x1B] = 0u;
-
-    if (isRcs) {
-        reg[0x1C] = base + 0x120u; /* PRT_BB_STATE */
-        reg[0x1D] = 0u;
-        reg[0x1E] = base + 0x124u; /* PRT_BB_STATE_UDW */
-        reg[0x1F] = 0u;
-        reg[0x20] = ARC_MI_NOOP;
-    } else {
-        for (uint32_t i = 0x1Cu; i <= 0x20u; i++)
-            reg[i] = ARC_MI_NOOP;
-    }
+    reg[0x1C] = base + 0x120u; /* PRT_BB_STATE (present on both RCS0 & BCS0 for IP >= 12.55) */
+    reg[0x1D] = 0u;
+    reg[0x1E] = base + 0x124u; /* PRT_BB_STATE_UDW */
+    reg[0x1F] = 0u;
+    reg[0x20] = ARC_MI_NOOP;
 
     reg[0x21] = ARC_MI_LOAD_REGISTER_IMM(9u) | lriPostedCs;
     reg[0x22] = base + 0x3A8u; /* CTX_TIMESTAMP */
@@ -352,6 +358,12 @@ void ArcXeService::destroyExecQueue(ArcExecQueue *q)
         uint64_t done = 0; bool to = false;
         (void)waitQueueSeqno(q, q->lastSubmittedSeqno, 250000000ULL, &done, &to);
     }
+    if (fEngineLock) {
+        IOLockLock(fEngineLock);
+        if (fLastRcsQueue == q) fLastRcsQueue = nullptr;
+        if (fLastBcsQueue == q) fLastBcsQueue = nullptr;
+        IOLockUnlock(fEngineLock);
+    }
     if (q->lrcBo) {
         releaseBo(q->lrcBo);
         q->lrcBo = nullptr;
@@ -380,6 +392,20 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         IOLockUnlock(fEngineLock);
         IOLockUnlock(q->submitLock);
         return kIOReturnDeviceError;
+    }
+
+    /*
+     * Direct Execlist Multi-Queue Serialization:
+     * If a different ArcExecQueue previously submitted to this physical engine (e.g. Render vs Compute
+     * on shared RCS0, or multiple processes), wait for its in-flight seqno to retire before loading
+     * the new LRCA into EXECLIST_SQ_LO/HI. Same-queue submissions proceed immediately via Lite Restore.
+     */
+    ArcExecQueue *&lastQ = (q->mmioBase == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
+    if (lastQ && lastQ != q && lastQ->seqnoCpu) {
+        const uint64_t prevTarget = lastQ->lastSubmittedSeqno;
+        for (uint32_t us = 0; us < 500000u && *lastQ->seqnoCpu < prevTarget; us += 10u) {
+            IODelay(10);
+        }
     }
 
     const uint64_t seqno = ++q->lastSubmittedSeqno;
@@ -503,6 +529,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     wr32(ARC_RING_EXECLIST_SQ_HI(q->mmioBase), (uint32_t)(lrcDesc >> 32));
     wr32(ARC_RING_EXECLIST_CONTROL(q->mmioBase), ARC_EL_CTRL_LOAD);
     (void)rd32(ARC_RING_EXECLIST_STATUS_LO(q->mmioBase));
+    lastQ = q;
 
     forceWakePut();
     IOLockUnlock(fEngineLock);

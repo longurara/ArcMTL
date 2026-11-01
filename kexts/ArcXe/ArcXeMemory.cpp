@@ -152,6 +152,21 @@ void ArcXeService::freeGgttRange(uint32_t ggttOffset, uint32_t ggttSize)
  * 2. UMA Buffer Objects (Kernel Allocated & Zero-Copy Task / IOSurface Imports)
  * ============================================================================ */
 
+static inline void arcClflushEntry(const volatile void *addr)
+{
+    __asm__ __volatile__("clflush (%0)" :: "r"(addr) : "memory");
+}
+
+static inline void arcClflushRange(const volatile void *addr, size_t bytes)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(63u);
+    const uintptr_t end   = (reinterpret_cast<uintptr_t>(addr) + bytes + 63u) & ~static_cast<uintptr_t>(63u);
+    for (uintptr_t p = start; p < end; p += 64u) {
+        __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
+    }
+    __asm__ __volatile__("mfence" ::: "memory");
+}
+
 ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patIndex, bool mapInKernel)
 {
     if (!size) return nullptr;
@@ -199,6 +214,8 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
     bo->flags    = flags;
     bo->patIndex = (patIndex < ARC_MTL_PAT_NUM_ENTRIES) ? patIndex : ARC_MTL_PAT_IDX_WB_1WAY_COH;
 
+    const bool flushNonCoh = ((flags & ARCXE_GEM_FLAG_CPU_WC) != 0) ||
+                             (bo->patIndex <= ARC_MTL_PAT_IDX_UC_NONCOH);
     const IOOptionBits mapOpts = (flags & ARCXE_GEM_FLAG_CPU_WC) ? kIOMapWriteCombineCache : kIOMapDefaultCache;
     if (mapInKernel) {
         bo->kernMap = buf->map(mapOpts);
@@ -207,12 +224,21 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
             releaseBo(bo);
             return nullptr;
         }
-        bzero(reinterpret_cast<void *>(bo->kernMap->getVirtualAddress()), (size_t)alignedSize);
+        void *kva = reinterpret_cast<void *>(bo->kernMap->getVirtualAddress());
+        bzero(kva, (size_t)alignedSize);
+        if (flushNonCoh)
+            arcClflushRange(kva, (size_t)alignedSize);
     } else if (void *kva = buf->getBytesNoCopy()) {
         bzero(kva, (size_t)alignedSize);
+        if (flushNonCoh)
+            arcClflushRange(kva, (size_t)alignedSize);
     } else if (IOMemoryMap *tmpMap = buf->map(kIOMapDefaultCache)) {
-        if (tmpMap->getVirtualAddress())
-            bzero(reinterpret_cast<void *>(tmpMap->getVirtualAddress()), (size_t)alignedSize);
+        if (tmpMap->getVirtualAddress()) {
+            void *tkva = reinterpret_cast<void *>(tmpMap->getVirtualAddress());
+            bzero(tkva, (size_t)alignedSize);
+            if (flushNonCoh)
+                arcClflushRange(tkva, (size_t)alignedSize);
+        }
         tmpMap->release();
     }
 
@@ -296,21 +322,6 @@ void ArcXeService::releaseBo(ArcBo *bo)
 /* ============================================================================
  * 3. 48-bit 4-Level PPGTT Virtual Memory Manager (PML4 -> PDP -> PD -> PT)
  * ============================================================================ */
-
-static inline void arcClflushEntry(const volatile void *addr)
-{
-    __asm__ __volatile__("clflush (%0)" :: "r"(addr) : "memory");
-}
-
-static inline void arcClflushRange(const volatile void *addr, size_t bytes)
-{
-    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(63u);
-    const uintptr_t end   = (reinterpret_cast<uintptr_t>(addr) + bytes + 63u) & ~static_cast<uintptr_t>(63u);
-    for (uintptr_t p = start; p < end; p += 64u) {
-        __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
-    }
-    __asm__ __volatile__("mfence" ::: "memory");
-}
 
 ArcPtPage *ArcXeService::allocPtPage()
 {

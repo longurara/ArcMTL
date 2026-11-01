@@ -266,6 +266,7 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_RESET_CTL_CAT_ERROR           (1u << 2)
 #define   ARC_RESET_CTL_READY_TO_RESET      (1u << 1)
 #define   ARC_RESET_CTL_REQUEST_RESET       (1u << 0)
+#define ARC_RING_BLIT_CCTL(base)            ((base) + 0x204u) /* Non-masked: [14:9]=dst MOCS, [6:1]=src MOCS */
 #define ARC_RING_EXECLIST_STATUS_LO(base)   ((base) + 0x234u)
 #define ARC_RING_EXECLIST_STATUS_HI(base)   ((base) + 0x238u)
 #define ARC_RING_CURRENT_LRCA(base)         ((base) + 0x240u)

@@ -212,6 +212,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "[FAIL] No HOST_VISIBLE | HOST_COHERENT UMA memory type found!\n");
         return 6;
     }
+    printf("  Selected MemType   : [%u] (flags=0x%x)\n",
+           mem_idx, memp.memoryTypes[mem_idx].propertyFlags);
 
     VkMemoryAllocateInfo mai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,

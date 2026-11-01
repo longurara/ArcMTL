@@ -393,9 +393,9 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
         return 0;
     }
 
-    /* D. DRM_XE_DEVICE_QUERY_ENGINES (RCS0 + CCS0 + BCS0) */
+    /* D. DRM_XE_DEVICE_QUERY_ENGINES (RCS0 Render + Compute on 128-EU Xe-LPG) */
     case DRM_XE_DEVICE_QUERY_ENGINES: {
-        const uint32_t num_eng = 3;
+        const uint32_t num_eng = 2;
         const uint32_t need = (uint32_t)(sizeof(struct drm_xe_query_engines) + num_eng * sizeof(struct drm_xe_engine));
         if (q->size == 0) {
             q->size = need;
@@ -415,10 +415,6 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
         qe->engines[1].instance.engine_class    = DRM_XE_ENGINE_CLASS_COMPUTE;
         qe->engines[1].instance.engine_instance = 0;
         qe->engines[1].instance.gt_id           = 0;
-
-        qe->engines[2].instance.engine_class    = DRM_XE_ENGINE_CLASS_COPY;
-        qe->engines[2].instance.engine_instance = 0;
-        qe->engines[2].instance.gt_id           = 0;
         return 0;
     }
 
@@ -613,15 +609,17 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
         struct ArcXeGemCreateIn in = {0};
         struct ArcXeGemCreateOut out = {0};
         in.size = gc->size;
-        if (gc->cpu_caching == DRM_XE_GEM_CPU_CACHING_WC) {
-            in.flags     = ARCXE_GEM_FLAG_CPU_WC;
+        if (gc->flags & DRM_XE_GEM_CREATE_FLAG_SCANOUT) {
+            in.flags     = ARCXE_GEM_FLAG_CPU_WC | ARCXE_GEM_FLAG_SCANOUT;
             in.pat_index = ARC_MTL_PAT_IDX_WT_NONCOH;
         } else {
+            /*
+             * XNU UMA Coherency: user-mappable GEM BOs are mapped via IOConnectMapMemory64
+             * with CPU WB caching, so always pair non-scanout BOs with PAT[4] (2-Way Coherent WB).
+             */
             in.flags     = ARCXE_GEM_FLAG_CPU_WB_COHERENT;
-            in.pat_index = ARC_MTL_PAT_IDX_WB_1WAY_COH;
+            in.pat_index = ARC_MTL_PAT_IDX_WB_2WAY_COH;
         }
-        if (gc->flags & DRM_XE_GEM_CREATE_FLAG_SCANOUT)
-            in.flags |= ARCXE_GEM_FLAG_SCANOUT;
 
         size_t out_sz = sizeof(out);
         kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodGemCreate,
