@@ -1,31 +1,41 @@
 #!/bin/bash
-# package/install_opencore_userspace.sh — Userspace-Only Installer when Arc*.kext are injected via OpenCore
+# package/install_opencore_userspace.sh — Hybrid OpenCore (ArcXe) + AuxKC (ArcFB/ArcAccel) + Userspace Installer
 #
-# Use this script inside macOS (15 Sequoia or 26 Tahoe) AFTER OpenCore (EFI/OC/Kexts) has injected:
-#   - ArcXe.kext
-#   - ArcFB.kext
-#   - ArcAccel15.kext (macOS 15) / ArcAccel26.kext (macOS 26)
+# Architecture on macOS 15 Sequoia & macOS 26 Tahoe with OpenCore + NullMoth RTX 4070:
+#   - ArcXe.kext      : Injected at boot by OpenCore (EFI/OC/Kexts/ArcXe.kext) — links only BootKC (IOPCIFamily).
+#   - ArcFB.kext      : Linked into /Library/KernelCollections/AuxiliaryKernelExtensions.kc alongside NullMoth
+#   - ArcAccel.kext   : Linked into /Library/KernelCollections/AuxiliaryKernelExtensions.kc alongside NullMoth
+#                       (required because IOGraphicsFamily, IOAcceleratorFamily2 & IOSurface live in SystemKC, not BootKC).
+#   - GPUBundles      : /Library/GPUBundles/{ArcMTLDriver.bundle, arcmtl/*, arcmtl-allow.txt} + /Library/ArcDriver/fw.
 #
-# Why userspace-only?
-#   - Does NOT touch /Library/Extensions or AuxiliaryKernelExtensions.kc (zero kmutil rebuild, zero risk to NullMoth!).
-#   - Installs GuC v70 firmware, Mesa 26.2.6 ANV Vulkan ICD, SPIR-V translator, ArcMTLDriver.bundle, and test tools.
-#   - Immediately runs live GPU hardware verification (`arc_probe` + `vk_offscreen_test`).
-#
-# Optional flags:
-#   sudo bash install_opencore_userspace.sh                     # Install userspace + run live GPU & Vulkan tests
-#   sudo bash install_opencore_userspace.sh --enable-dual-metal # Also add `arc_headless=1` to mounted EFI config.plist
-#   sudo bash install_opencore_userspace.sh --enable-arc-desktop# Also add `arcaccel=1` to mounted EFI config.plist
+# Modes:
+#   sudo bash install_opencore_userspace.sh                      # Userspace only + live arc_probe & Vulkan 1.3 test
+#   sudo bash install_opencore_userspace.sh --enable-dual-metal  # + Install ArcFB/ArcAccel into AuxKC (preserving 100% NullMoth)
+#                                                                #   & set arc_headless=1 (IONDRV desktop + RTX 4070 & Intel Arc Metal 3)
+#   sudo bash install_opencore_userspace.sh --enable-arc-desktop # + Install ArcFB/ArcAccel into AuxKC (preserving 100% NullMoth)
+#                                                                #   & set arcfb=1 arcaccel=1 + block IONDRVSupport (full Arc Metal Desktop)
 
 set -euo pipefail
 
+die() {
+    echo "" >&2
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMP_EXTRACT=""
+cleanup() {
+    [ -z "$TMP_EXTRACT" ] || rm -rf "$TMP_EXTRACT"
+}
+trap cleanup EXIT
+
 if [ -d "$SCRIPT_DIR/out" ]; then
     OUT="$SCRIPT_DIR/out"
-elif [ -d "$SCRIPT_DIR/../out" ]; then
+elif [ -d "$SCRIPT_DIR/../out" ] && [ -d "$SCRIPT_DIR/../out/arcmtl" ]; then
     OUT="$(cd "$SCRIPT_DIR/../out" && pwd)"
 elif [ -f "$SCRIPT_DIR/ArcMTL-macos26-15-x86_64.tar.gz" ]; then
     TMP_EXTRACT="$(mktemp -d /var/tmp/arcmtl_extract.XXXXXX)"
-    trap 'rm -rf "$TMP_EXTRACT"' EXIT
     echo "[*] Extracting $SCRIPT_DIR/ArcMTL-macos26-15-x86_64.tar.gz ..."
     tar -xzf "$SCRIPT_DIR/ArcMTL-macos26-15-x86_64.tar.gz" -C "$TMP_EXTRACT"
     if [ -d "$TMP_EXTRACT/ArcMTL-macos26-15-x86_64/out" ]; then
@@ -33,34 +43,49 @@ elif [ -f "$SCRIPT_DIR/ArcMTL-macos26-15-x86_64.tar.gz" ]; then
     else
         OUT="$TMP_EXTRACT/out"
     fi
+    # Overlay latest fast-built kexts if ArcKexts-macos26-15-x86_64.tar.gz is present alongside main bundle
+    if [ -f "$SCRIPT_DIR/ArcKexts-macos26-15-x86_64.tar.gz" ]; then
+        echo "[*] Overlaying latest kexts from $SCRIPT_DIR/ArcKexts-macos26-15-x86_64.tar.gz ..."
+        tar -xzf "$SCRIPT_DIR/ArcKexts-macos26-15-x86_64.tar.gz" -C "$OUT"
+    fi
 else
-    echo "[ERROR] Cannot locate out/ directory or ArcMTL-macos26-15-x86_64.tar.gz next to script." >&2
-    exit 1
+    die "Cannot locate out/ directory or ArcMTL-macos26-15-x86_64.tar.gz next to script."
 fi
 
 MODE="${1:-}"
 
 if [ "$(uname -s)" != "Darwin" ]; then
-    echo "[ERROR] Must be run inside macOS." >&2
-    exit 1
+    die "Must be run inside macOS."
 fi
 if [ "$(id -u)" -ne 0 ]; then
-    echo "[ERROR] Run with sudo: sudo bash $0 $MODE" >&2
-    exit 1
+    die "Run with sudo: sudo bash $0 $MODE"
 fi
 
 OS_VER="$(sw_vers -productVersion)"
+OS_MAJ="${OS_VER%%.*}"
+DARWIN_MAJ="$(uname -r | cut -d. -f1)"
+if [ "$OS_MAJ" != "15" ] && [ "$OS_MAJ" != "26" ]; then
+    if [ "$DARWIN_MAJ" = "24" ]; then
+        OS_MAJ="15"
+    elif [ "$DARWIN_MAJ" = "25" ]; then
+        OS_MAJ="26"
+    else
+        die "Unsupported macOS version '$OS_VER' (Darwin $DARWIN_MAJ). Expected macOS 15 or 26."
+    fi
+fi
+
 echo "=================================================================="
-echo " ArcMTL Userspace Installer (OpenCore Kext Injection Mode)"
-echo " macOS $OS_VER | Preserving NullMoth RTX 4070 AuxKC untouched"
+echo " ArcMTL Installer for OpenCore + NullMoth Dual-GPU Optimus"
+echo " macOS $OS_VER (ABI $OS_MAJ / Darwin $DARWIN_MAJ)"
 echo "=================================================================="
 
 echo ""
-echo "[1/4] Checking OpenCore-injected Arc kexts in running kernel..."
-kextstat | grep -E "com\.arc\.|com\.nullmoth\." || true
+echo "[1/5] Checking running ArcXe & NullMoth kexts in kernel..."
+kmutil showloaded --list-only 2>/dev/null | grep -E "com\.arc\.|com\.nullmoth\." || \
+    kextstat 2>/dev/null | grep -E "com\.arc\.|com\.nullmoth\." || true
 
 echo ""
-echo "[2/4] Installing GuC v70 firmware & diagnostic tools..."
+echo "[2/5] Installing GuC v70 firmware & diagnostic tools..."
 mkdir -p /Library/ArcDriver/fw /usr/local/bin
 install -m 644 "$OUT/fw/mtl_guc_70.bin" /Library/ArcDriver/fw/mtl_guc_70.bin
 chown -R root:wheel /Library/ArcDriver
@@ -73,7 +98,7 @@ for tool in arc_probe vk_offscreen_test mtl_offscreen_test; do
 done
 
 echo ""
-echo "[3/4] Installing Mesa 26.2.6 ANV (/Library/GPUBundles/arcmtl) & ArcMTLDriver.bundle..."
+echo "[3/5] Installing Mesa 26.2.6 ANV (/Library/GPUBundles/arcmtl) & ArcMTLDriver.bundle..."
 GB="/Library/GPUBundles"
 mkdir -p "$GB/arcmtl"
 
@@ -85,34 +110,204 @@ for dylib in "$GB/arcmtl"/*.dylib; do
     [ -f "$dylib" ] || continue
     codesign --force --sign - "$dylib"
 done
-chown -R root:wheel "$GB/arcmtl"
-chmod -R 755 "$GB/arcmtl"
 
 rm -rf "$GB/ArcMTLDriver.bundle"
 ditto "$OUT/GPUBundles/ArcMTLDriver.bundle" "$GB/ArcMTLDriver.bundle"
 codesign --force --deep --sign - "$GB/ArcMTLDriver.bundle"
-chown -R root:wheel "$GB/ArcMTLDriver.bundle"
-chmod -R 755 "$GB/ArcMTLDriver.bundle"
 install -m 644 "$OUT/GPUBundles/arcmtl-allow.txt" "$GB/arcmtl-allow.txt"
-chown root:wheel "$GB/arcmtl-allow.txt"
+
+chown -R root:wheel "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" "$GB/arcmtl-allow.txt"
+chmod -R go-w,a+rX "$GB/ArcMTLDriver.bundle" "$GB/arcmtl"
+chmod 644 "$GB/arcmtl-allow.txt"
 xattr -cr "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" 2>/dev/null || true
 
 echo ""
-echo "[4/4] Running live Intel Arc Xe-LPG hardware & Vulkan tests..."
+echo "[4/5] Running LIVE Intel Arc Xe-LPG hardware & Vulkan 1.3 tests..."
 if [ -x /usr/local/bin/arc_probe ]; then
-    echo "--- Running arc_probe ---"
-    /usr/local/bin/arc_probe || echo "[WARN] arc_probe returned non-zero (check if BIOS is in Optimus mode and ArcXe.kext attached)"
+    echo "--- [Test A] arc_probe (48-bit PPGTT + RCS0 128-EU Command Streamer) ---"
+    /usr/local/bin/arc_probe || echo "[WARN] arc_probe returned non-zero"
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
-    echo "--- Running vk_offscreen_test (Mesa 26.2.6 ANV on XNU) ---"
+    echo "--- [Test B] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Triangle Render) ---"
     VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test /var/tmp/arc_vk_test.ppm \
-        && echo "[OK] Vulkan offscreen render saved to /var/tmp/arc_vk_test.ppm" \
+        && echo "[OK] Vulkan 1.3 offscreen triangle rendered to /var/tmp/arc_vk_test.ppm" \
         || echo "[WARN] vk_offscreen_test returned non-zero"
 fi
+if (kmutil showloaded --list-only 2>/dev/null || kextstat 2>/dev/null) | grep -q "com\.arc\.ArcAccel"; then
+    if [ -x /usr/local/bin/mtl_offscreen_test ]; then
+        echo "--- [Test C] mtl_offscreen_test (Metal 3 MTLCopyAllDevices + Render/Compute) ---"
+        /usr/local/bin/mtl_offscreen_test /var/tmp/arc_mtl_test.ppm \
+            && echo "[OK] Metal 3 render saved to /var/tmp/arc_mtl_test.ppm" \
+            || echo "[WARN] mtl_offscreen_test returned non-zero"
+    fi
+fi
 
-update_oc_boot_arg() {
-    local add_arg="$1"
-    local remove_arg="$2"
+stamp_host_deps() {
+    local kext_dir="$1"
+    local plist="$kext_dir/Contents/Info.plist"
+    local pairs=(
+        "com.apple.iokit.IOPCIFamily:/System/Library/Extensions/IOPCIFamily.kext/Contents/Info.plist"
+        "com.apple.iokit.IOGraphicsFamily:/System/Library/Extensions/IOGraphicsFamily.kext/Contents/Info.plist"
+        "com.apple.iokit.IOAcceleratorFamily2:/System/Library/Extensions/IOAcceleratorFamily2.kext/Contents/Info.plist"
+        "com.apple.iokit.IOSurface:/System/Library/Extensions/IOSurface.kext/Contents/Info.plist"
+    )
+    for item in "${pairs[@]}"; do
+        local bid="${item%%:*}"
+        local sle="${item#*:}"
+        if /usr/libexec/PlistBuddy -c "Print :OSBundleLibraries:$bid" "$plist" >/dev/null 2>&1 && [ -f "$sle" ]; then
+            local ver
+            ver="$(/usr/libexec/PlistBuddy -c 'Print :OSBundleCompatibleVersion' "$sle" 2>/dev/null || \
+                   /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$sle" 2>/dev/null || true)"
+            if [ -n "$ver" ]; then
+                /usr/libexec/PlistBuddy -c "Set :OSBundleLibraries:$bid $ver" "$plist"
+            fi
+        fi
+    done
+    codesign --force --sign - "$kext_dir"
+}
+
+install_auxkc_arcfb_arcaccel() {
+    echo ""
+    echo "[5/5] Linking ArcFB.kext & ArcAccel.kext (macOS $OS_MAJ) into AuxKC alongside NullMoth..."
+    local KB="" KS=""
+    for p in /System/Library/KernelCollections/BootKernelExtensions.kc \
+             /Library/Apple/System/Library/KernelCollections/BootKernelExtensions.kc; do
+        [ -f "$p" ] && { KB="$p"; break; }
+    done
+    for p in /System/Library/KernelCollections/SystemKernelExtensions.kc \
+             /Library/Apple/System/Library/KernelCollections/SystemKernelExtensions.kc; do
+        [ -f "$p" ] && { KS="$p"; break; }
+    done
+    [ -n "$KB" ] && [ -n "$KS" ] || die "Could not locate BootKernelExtensions.kc / SystemKernelExtensions.kc"
+
+    local KM_ARGS=(--allow-missing-kdk)
+    if [ -f "/System/Library/Kernels/kernel" ]; then
+        KM_ARGS+=(--kernel "/System/Library/Kernels/kernel")
+    fi
+
+    local LE="/Library/Extensions"
+    local KC_DIR="/Library/KernelCollections"
+    local AUX_KC="$KC_DIR/AuxiliaryKernelExtensions.kc"
+    local STAGE_DIR
+    STAGE_DIR="$(mktemp -d /var/tmp/arc_auxkc_stage.XXXXXX)"
+    local STAGE_EXT="$STAGE_DIR/Extensions"
+    mkdir -p "$STAGE_EXT"
+
+    local PRESERVED_IDS=()
+    if [ -d "$LE" ]; then
+        for existing in "$LE"/*.kext; do
+            [ -d "$existing" ] || continue
+            local bname
+            bname="$(basename "$existing")"
+            case "$bname" in
+                ArcXe.kext|ArcFB.kext|ArcAccel.kext) continue ;;
+            esac
+            if [ -f "$existing/Contents/Info.plist" ]; then
+                local bid
+                bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$existing/Contents/Info.plist" 2>/dev/null || true)"
+                echo "      Preserving existing kext: $bname ($bid)"
+                ditto "$existing" "$STAGE_EXT/$bname"
+                chown -R root:wheel "$STAGE_EXT/$bname"
+                chmod -R go-w "$STAGE_EXT/$bname"
+                case "$bid" in
+                    com.nullmoth.*) PRESERVED_IDS+=("$bid") ;;
+                esac
+            fi
+        done
+    fi
+
+    local ACCEL_SRC="$OUT/kexts/$OS_MAJ/ArcAccel.kext"
+    [ -d "$ACCEL_SRC" ] || ACCEL_SRC="$OUT/kexts/ArcAccel.kext"
+    [ -f "$OUT/kexts/ArcFB.kext/Contents/MacOS/ArcFB" ] || die "Missing $OUT/kexts/ArcFB.kext"
+    [ -f "$ACCEL_SRC/Contents/MacOS/ArcAccel" ] || die "Missing $ACCEL_SRC"
+
+    # Note: ArcXe.kext stays injected via OpenCore (EFI/OC/Kexts/ArcXe.kext); only ArcFB & ArcAccel go into AuxKC
+    ditto "$OUT/kexts/ArcFB.kext" "$STAGE_EXT/ArcFB.kext"
+    ditto "$ACCEL_SRC" "$STAGE_EXT/ArcAccel.kext"
+    stamp_host_deps "$STAGE_EXT/ArcFB.kext"
+    stamp_host_deps "$STAGE_EXT/ArcAccel.kext"
+    chown -R root:wheel "$STAGE_EXT/ArcFB.kext" "$STAGE_EXT/ArcAccel.kext"
+    chmod -R 755 "$STAGE_EXT/ArcFB.kext" "$STAGE_EXT/ArcAccel.kext"
+
+    echo "      Running pre-flight kmutil validation in /var/tmp..."
+    if ! kmutil create -n aux \
+            --volume-root / \
+            "${KM_ARGS[@]}" \
+            -B "$KB" -S "$KS" \
+            --repository "$STAGE_EXT" \
+            -A "$STAGE_DIR/test_aux.kc" -z >"$STAGE_DIR/kmutil_pre.log" 2>&1; then
+        tail -n 30 "$STAGE_DIR/kmutil_pre.log" >&2
+        rm -rf "$STAGE_DIR"
+        die "Pre-flight kmutil failed! Live /Library/Extensions & AuxKC were NOT modified."
+    fi
+
+    local INSPECT_OUT
+    INSPECT_OUT="$(kmutil inspect -a x86_64 -A "$STAGE_DIR/test_aux.kc" 2>/dev/null)" || {
+        rm -rf "$STAGE_DIR"
+        die "kmutil inspect failed on pre-flight test_aux.kc"
+    }
+    for req in com.arc.ArcFB com.arc.ArcAccel; do
+        if ! printf '%s\n' "$INSPECT_OUT" | grep -Fq "$req"; then
+            tail -n 25 "$STAGE_DIR/kmutil_pre.log" >&2
+            rm -rf "$STAGE_DIR"
+            die "Pre-flight AuxKC missing $req!"
+        fi
+    done
+    for nid in ${PRESERVED_IDS[@]+"${PRESERVED_IDS[@]}"}; do
+        if ! printf '%s\n' "$INSPECT_OUT" | grep -Fq "$nid"; then
+            tail -n 25 "$STAGE_DIR/kmutil_pre.log" >&2
+            rm -rf "$STAGE_DIR"
+            die "SAFETY ABORT: Pre-flight AuxKC dropped NullMoth kext '$nid'!"
+        fi
+    done
+    echo "      [OK] Pre-flight AuxKC verified (com.arc.ArcFB + com.arc.ArcAccel + all NullMoth kexts present)."
+
+    local TS BK
+    TS="$(date +%Y%m%d-%H%M%S)"
+    BK="/Library/ArcDriver/backups/$TS"
+    mkdir -p "$BK" "$LE" "$KC_DIR"
+    [ ! -f "$AUX_KC" ] || cp -p "$AUX_KC" "$BK/AuxiliaryKernelExtensions.kc"
+    [ ! -f "$AUX_KC.elides" ] || cp -p "$AUX_KC.elides" "$BK/AuxiliaryKernelExtensions.kc.elides"
+    ln -sfn "$BK" "/Library/ArcDriver/backups/latest"
+
+    rm -rf "$LE/ArcXe.kext" "$LE/ArcFB.kext" "$LE/ArcAccel.kext"
+    ditto "$STAGE_EXT/ArcFB.kext" "$LE/ArcFB.kext"
+    ditto "$STAGE_EXT/ArcAccel.kext" "$LE/ArcAccel.kext"
+    chown -R root:wheel "$LE/ArcFB.kext" "$LE/ArcAccel.kext"
+    chmod -R 755 "$LE/ArcFB.kext" "$LE/ArcAccel.kext"
+
+    echo "      Building live $AUX_KC..."
+    local NEW_KC="$STAGE_DIR/live_aux.kc"
+    if ! kmutil create -n aux \
+            --volume-root / \
+            "${KM_ARGS[@]}" \
+            -B "$KB" -S "$KS" \
+            --repository "$LE" \
+            -A "$NEW_KC" -z >"$STAGE_DIR/kmutil_live.log" 2>&1; then
+        tail -n 30 "$STAGE_DIR/kmutil_live.log" >&2
+        rm -rf "$STAGE_DIR"
+        die "Live kmutil build failed! Backup preserved at $BK."
+    fi
+
+    cp -f "$NEW_KC" "$AUX_KC.arcnew"
+    chown root:wheel "$AUX_KC.arcnew"
+    chmod 644 "$AUX_KC.arcnew"
+    mv -f "$AUX_KC.arcnew" "$AUX_KC"
+    if [ -f "$NEW_KC.elides" ]; then
+        cp -f "$NEW_KC.elides" "$AUX_KC.elides"
+        chown root:wheel "$AUX_KC.elides"
+        chmod 644 "$AUX_KC.elides"
+    fi
+    if [ -x /usr/sbin/kcditto ]; then
+        echo "      Syncing Preboot KernelCollections via /usr/sbin/kcditto..."
+        /usr/sbin/kcditto || echo "[WARN] kcditto returned non-zero (non-fatal)"
+    fi
+    rm -rf "$STAGE_DIR"
+    echo "      [OK] Live AuxKC updated and synced (backup: $BK)."
+}
+
+update_oc_config() {
+    local target_mode="$1"
     local plist=""
     for candidate in /Volumes/EFI/EFI/OC/config.plist /Volumes/ESP/EFI/OC/config.plist "$SCRIPT_DIR/../EFI/OC/config.plist"; do
         if [ -f "$candidate" ]; then
@@ -121,43 +316,68 @@ update_oc_boot_arg() {
         fi
     done
     if [ -z "$plist" ]; then
-        echo "[INFO] EFI partition not currently mounted at /Volumes/EFI."
-        echo "       Run 'sudo diskutil mount EFI' and re-run with $MODE, or add '$add_arg' to boot-args manually."
-        return 0
+        echo "[WARN] EFI config.plist not found at /Volumes/EFI/EFI/OC/config.plist."
+        echo "       Run 'sudo diskutil mount EFI' and re-run with $target_mode."
+        return 1
     fi
     cp "$plist" "${plist}.bak-userspace-$(date +%Y%m%d-%H%M%S)"
-    python3 - "$plist" "$add_arg" "$remove_arg" <<'PY'
+    python3 - "$plist" "$target_mode" <<'PY'
 import sys, plistlib
-path, add_arg, rem_arg = sys.argv[1], sys.argv[2], sys.argv[3]
+path, mode = sys.argv[1], sys.argv[2]
 with open(path, 'rb') as f:
     cfg = plistlib.load(f)
+
 nv = cfg['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']
-tokens = [t for t in nv.get('boot-args', '').split() if t != rem_arg and t != add_arg]
-tokens.append(add_arg)
+remove_set = {'arc_headless=1', 'arcaccel=1', 'arcfb=1'}
+tokens = [t for t in nv.get('boot-args', '').split() if t not in remove_set]
+
+block_iondrv = False
+if mode == 'dual-metal':
+    tokens.append('arc_headless=1')
+    block_iondrv = False
+elif mode == 'arc-desktop':
+    tokens.extend(['arcfb=1', 'arcaccel=1'])
+    block_iondrv = True
+
 nv['boot-args'] = ' '.join(tokens)
+
+for entry in cfg.get('Kernel', {}).get('Block', []):
+    if entry.get('Identifier') == 'com.apple.iokit.IONDRVSupport':
+        entry['Enabled'] = block_iondrv
+
+for entry in cfg.get('Kernel', {}).get('Add', []):
+    bp = entry.get('BundlePath', '')
+    if bp == 'ArcXe.kext':
+        entry['Enabled'] = True
+    elif bp in ('ArcFB.kext', 'ArcAccel15.kext', 'ArcAccel26.kext'):
+        entry['Enabled'] = False
+
 with open(path, 'wb') as f:
     plistlib.dump(cfg, f, sort_keys=False)
-print(f"[OK] Updated {path} boot-args -> {nv['boot-args']}")
+print(f"[OK] Updated OpenCore config.plist ({mode}): IONDRVSupport blocked={block_iondrv}, boot-args='{nv['boot-args']}'")
 PY
 }
 
 if [ "$MODE" = "--enable-dual-metal" ]; then
-    echo ""
-    update_oc_boot_arg "arc_headless=1" "arcaccel=1"
+    install_auxkc_arcfb_arcaccel
+    update_oc_config "dual-metal"
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
-    echo ""
-    update_oc_boot_arg "arcaccel=1" "arc_headless=1"
+    install_auxkc_arcfb_arcaccel
+    update_oc_config "arc-desktop"
 fi
 
 echo ""
 echo "=================================================================="
-echo " Userspace installation COMPLETE!"
-echo " - To enable Intel Arc as 2nd Metal 3 GPU alongside RTX 4070:"
-echo "     sudo diskutil mount EFI"
-echo "     sudo bash $0 --enable-dual-metal && sudo reboot"
-echo " - To enable Intel Arc full Metal 3 Desktop DisplayPipe on ArcFB:"
-echo "     sudo diskutil mount EFI"
-echo "     sudo bash $0 --enable-arc-desktop && sudo reboot"
-echo " - After reboot, test Metal 3:"
-echo "     /usr/local/bin/mtl_offscreen_test /var/tmp/arc_mtl_test.ppm"
+echo " ArcMTL Setup COMPLETE!"
+if [ "$MODE" = "--enable-dual-metal" ]; then
+    echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc)!"
+    echo " -> After reboot, run: /usr/local/bin/mtl_offscreen_test /var/tmp/arc_mtl_test.ppm"
+    echo " -> Once verified, switch to full Intel Arc Metal Desktop + Brightness anytime via:"
+    echo "      sudo diskutil mount EFI && sudo bash $0 --enable-arc-desktop && sudo reboot"
+elif [ "$MODE" = "--enable-arc-desktop" ]; then
+    echo " -> Next: Run 'sudo reboot' to boot full Intel Arc Metal 3 Desktop (ArcFB + ArcAccel)!"
+else
+    echo " -> To activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc): sudo bash $0 --enable-dual-metal && sudo reboot"
+    echo " -> To activate full Intel Arc Metal 3 Desktop (ArcFB):  sudo bash $0 --enable-arc-desktop && sudo reboot"
+fi
 echo "=================================================================="
