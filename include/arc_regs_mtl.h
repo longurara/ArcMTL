@@ -4,13 +4,20 @@
  * Intel Meteor Lake (Xe-LPG Graphics IP 12.70 / Media Xe-LPM+ IP 13.00 / Display IP 14)
  * Hardware Register, GTT/PAT, Execlist/LRC, GuC v70, and MI Instruction Definitions.
  *
- * Derived from MIT-licensed Linux drivers/gpu/drm/xe/regs/* and drivers/gpu/drm/i915/display/*.
+ * Derived from MIT-licensed Linux drivers/gpu/drm/xe/regs/ and drivers/gpu/drm/i915/display/.
  * Target Primary Hardware: Intel Core Ultra 7 155H - Intel(R) Arc(TM) Graphics (PCI 8086:7D55).
  */
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
+
+#ifdef __cplusplus
+#define ARC_STATIC_ASSERT(cond, msg) static_assert((cond), msg)
+#else
+#define ARC_STATIC_ASSERT(cond, msg) _Static_assert((cond), msg)
+#endif
 
 /* ============================================================================
  * 1. PCI Configuration & Device IDs (Meteor Lake / Arrow Lake Xe-LPG)
@@ -366,11 +373,11 @@ struct ArcUcCssHeader {
     char     buildnumber[12];
     uint32_t sw_version;            /* Major[23:16], Minor[15:8], Patch[7:0] */
     uint32_t vf_version;
-    uint32_t reserved0[12];
+    uint32_t reserved0[11];
     uint32_t private_data_size;
     uint32_t header_info;
 };
-static_assert(sizeof(ArcUcCssHeader) == 128, "Intel GuC CSS header must be 128 bytes");
+ARC_STATIC_ASSERT(sizeof(struct ArcUcCssHeader) == 128, "Intel GuC CSS header must be 128 bytes");
 
 /* GuC MMIO & CTB Handshake Constants (GuC v70 ABI) */
 #define ARC_GUC_HXG_TYPE_REQUEST            0u
@@ -387,7 +394,7 @@ struct ArcGucCtbDesc {
     uint32_t status;
     uint32_t reserved[13];
 };
-static_assert(sizeof(ArcGucCtbDesc) == 64, "GuC CTB descriptor must be 64 bytes");
+ARC_STATIC_ASSERT(sizeof(struct ArcGucCtbDesc) == 64, "GuC CTB descriptor must be 64 bytes");
 
 /* ============================================================================
  * 7. Display IP Version 14 (Meteor Lake) Pipe, Plane & South PWM Registers

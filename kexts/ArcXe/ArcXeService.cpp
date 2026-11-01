@@ -6,12 +6,11 @@
  */
 
 #include "ArcXeService.h"
+#include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <sys/sysctl.h>
-
-extern "C" uint64_t max_mem;
 
 OSDefineMetaClassAndStructors(ArcXeService, IOService)
 

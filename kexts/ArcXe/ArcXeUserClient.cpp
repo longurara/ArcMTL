@@ -6,9 +6,8 @@
  */
 
 #include "ArcXeService.h"
+#include <mach/vm_param.h>
 #include <kern/clock.h>
-
-extern "C" uint64_t max_mem;
 
 OSDefineMetaClassAndStructors(ArcXeUserClient, IOUserClient)
 

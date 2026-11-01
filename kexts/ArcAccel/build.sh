@@ -25,7 +25,7 @@ CFLAGS=(
   ${TAHOE_FLAG[@]+"${TAHOE_FLAG[@]}"}
   -mmacosx-version-min=15.0 -g0
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
-  -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2
+  -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -Wno-deprecated-declarations -O2
 )
 
 echo "=== Building ArcAccel.kext ==="
