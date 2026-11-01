@@ -135,6 +135,7 @@ public:
     /* Forcewake Management */
     IOLock                     *fFwLock             = nullptr;
     int32_t                     fFwRefCount         = 0;
+    bool                        fEnginesHoldForceWake = false;
 
     /* GGTT Manager */
     IOLock                     *fGgttLock           = nullptr;
