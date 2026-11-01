@@ -340,7 +340,8 @@ def main() -> None:
         "   {\n"
         '      const char *aux_env = getenv("ARCMTL_AUX_CCS");\n'
         "      if (!(aux_env && aux_env[0] == '1')) {\n"
-        "         intel_debug |= DEBUG_NO_CCS;\n"
+        "         process_intel_debug_variable();\n"
+        "         BITSET_SET(intel_debug, DEBUG_NO_CCS);\n"
         "         devinfo.has_aux_map = false;\n"
         "         devinfo.has_flat_ccs = false;\n"
         "      }\n"
