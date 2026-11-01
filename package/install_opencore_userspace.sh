@@ -384,6 +384,9 @@ elif mode == 'safe-stage1':
     effective_desc = 'safe-stage1 (ArcXe only, IONDRVFramebuffer desktop)'
 
 nv['boot-args'] = ' '.join(tokens)
+nv_del = cfg.setdefault('NVRAM', {}).setdefault('Delete', {}).setdefault('7C436110-AB2A-4BBB-A880-FE41995C9F82', [])
+if 'boot-args' not in nv_del:
+    nv_del.append('boot-args')
 
 for entry in cfg.get('Kernel', {}).get('Block', []):
     if entry.get('Identifier') == 'com.apple.iokit.IONDRVSupport':

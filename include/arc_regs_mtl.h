@@ -182,7 +182,8 @@ static inline bool arcIsSupportedXeLpgDevice(uint16_t vendor, uint16_t device)
 #define ARC_PTE_ADDR_MASK                   0x000FFFFFFFFFF000ULL  /* Bits [51:12] */
 #define ARC_DMA_PHYS_MASK_46BIT             0x00003FFFFFFFF000ULL  /* MTL 46-bit physical DMA mask */
 
-/* Xe-LPG GGTT PTE PAT Bits (Bits 52 & 53) */
+/* Xe-LPG GGTT PTE Flags & PAT Bits (Bits 1, 52 & 53) */
+#define ARC_XELPG_GGTT_PTE_DM               (1ULL << 1)  /* Stolen Memory (GSM + DSM) offset rather than System RAM PA */
 #define ARC_XELPG_GGTT_PTE_PAT0             (1ULL << 52)
 #define ARC_XELPG_GGTT_PTE_PAT1             (1ULL << 53)
 

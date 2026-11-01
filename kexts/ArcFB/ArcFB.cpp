@@ -306,49 +306,99 @@ bool ArcFB::resolveScanoutPhysical(IOPhysicalAddress bar2Base, IOPhysicalLength 
     const uint64_t needed = (uint64_t)fRowBytes * (uint64_t)fHeight;
     fScanoutBytes = (IOPhysicalLength)((needed + 0xFFFULL) & ~0xFFFULL);
 
+    /* Never map low physical DRAM (< 256 MiB, where XNU kernel text/page tables reside) as VRAM */
+    static constexpr uint64_t kMinValidScanoutPhys = 0x10000000ULL;
+    static constexpr uint64_t kInvalidBaseMask     = (~0ULL & ~0xFFFFFULL);
+
+    /*
+     * Read Data Stolen Memory (DSMBASE, e.g. 0x78800000) and GTT Stolen Memory (GSMBASE, e.g. 0x78000000).
+     * On Meteor Lake Xe-LPG (Display IP 14), GGTT PTE BIT(1) (ARC_XELPG_GGTT_PTE_DM / XE_GGTT_PTE_DM)
+     * means bits [51:12] encode an offset from the start of Total Stolen Memory (GSMBASE = DSMBASE - 8 MiB),
+     * NOT a raw System RAM physical address (e.g. PTE addr 0x00800000 -> 0x78000000 + 0x00800000 = 0x78800000).
+     */
+    uint64_t dsmBase = (((uint64_t)rd32(ARC_REG_DSMBASE_HI) << 32) | rd32(ARC_REG_DSMBASE_LO)) & ~0xFFFFFULL;
+    if ((dsmBase == 0 || dsmBase == kInvalidBaseMask) && fPCI) {
+        const uint64_t bdsmLo = fPCI->configRead32(ARC_PCI_BDSM_64_LO);
+        const uint64_t bdsmHi = fPCI->configRead32(ARC_PCI_BDSM_64_HI);
+        dsmBase = ((bdsmHi << 32) | bdsmLo) & ~0xFFFFFULL;
+    }
+    if (dsmBase == kInvalidBaseMask)
+        dsmBase = 0;
+
+    uint64_t gsmBase = (((uint64_t)rd32(ARC_REG_GSMBASE_HI) << 32) | rd32(ARC_REG_GSMBASE_LO)) & ~0xFFFFFULL;
+    if ((gsmBase == 0 || gsmBase == kInvalidBaseMask || (dsmBase != 0 && gsmBase > dsmBase)) && dsmBase != 0 && fPCI) {
+        const uint16_t gmch    = fPCI->configRead16(ARC_PCI_GMCH_CTRL);
+        const uint32_t ggms    = (gmch >> ARC_GMCH_GGMS_SHIFT) & ARC_GMCH_GGMS_MASK;
+        const uint64_t gsmSize = ggms ? (1ULL << (20u + ggms)) : 0x800000ULL; /* 8 MiB GSM on MTL */
+        gsmBase = (dsmBase >= gsmSize) ? (dsmBase - gsmSize) : 0ULL;
+    }
+    if (gsmBase == kInvalidBaseMask)
+        gsmBase = 0;
+
+    auto decodeGgttPtePhys = [&](uint64_t pte) -> uint64_t {
+        const uint64_t rawAddr = pte & ARC_PTE_ADDR_MASK;
+        if (fVer >= 13 && ((pte & ARC_XELPG_GGTT_PTE_DM) || (rawAddr < kMinValidScanoutPhys && dsmBase != 0))) {
+            if (gsmBase != 0 && (gsmBase + rawAddr) >= dsmBase)
+                return gsmBase + rawAddr;
+            if (dsmBase != 0)
+                return dsmBase + rawAddr;
+        }
+        return rawAddr;
+    };
+
+    const uint64_t efiConsolePhys = (uint64_t)PE_state.video.v_baseAddr & ~0xFFFULL;
+
     /*
      * Path 1 (Primary on Xe-LPG / Display IP 13-20): Inspect GGTT PTEs in BAR0 + 8 MiB.
      * Note: Meteor Lake Xe-LPG (Graphics IP 12.70/12.71, Display IP 14) has NO CPU-mappable
      * GGTT aperture on BAR2 (0x90000000); UEFI GOP allocates the linear scanout surface in
-     * contiguous Data Stolen Memory (DSM, e.g. 0x78800000) and maps it via GGTT PTEs.
+     * contiguous Data Stolen Memory (DSM, e.g. 0x78800000) and maps it via GGTT PTEs with DM=1.
      */
     uint64_t pte0 = rdGgttPte(fBootSurfGgtt);
     if ((pte0 != ~0ULL) && (pte0 & ARC_PTE_PRESENT)) {
-        uint64_t basePhys = pte0 & ARC_PTE_ADDR_MASK;
+        uint64_t basePhys = decodeGgttPtePhys(pte0);
         const uint32_t numPages = (uint32_t)(fScanoutBytes >> 12);
-        bool contiguous = (basePhys != 0);
+        bool contiguous = (basePhys >= kMinValidScanoutPhys);
+        if (!contiguous) {
+            AFBLOG("rejecting low GGTT PTE base 0x%llx (raw pte0=0x%llx gsm=0x%llx dsm=0x%llx)",
+                   (unsigned long long)basePhys, (unsigned long long)pte0,
+                   (unsigned long long)gsmBase, (unsigned long long)dsmBase);
+        }
         for (uint32_t pg = 1; contiguous && pg < numPages; pg++) {
             uint64_t pte = rdGgttPte(fBootSurfGgtt + (pg << 12));
-            if (!(pte & ARC_PTE_PRESENT) || ((pte & ARC_PTE_ADDR_MASK) != basePhys + ((uint64_t)pg << 12))) {
+            if (!(pte & ARC_PTE_PRESENT) || (decodeGgttPtePhys(pte) != basePhys + ((uint64_t)pg << 12))) {
                 AFBLOG("GOP GGTT pages non-contiguous at page %u/%u", pg, numPages);
                 contiguous = false;
             }
         }
         if (contiguous) {
             fScanoutPhys = (IOPhysicalAddress)basePhys;
-            AFBLOG("scanout resolved from contiguous DSM GGTT PTEs: phys 0x%llx (%llu KiB)",
-                   (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
+            AFBLOG("scanout resolved from contiguous DSM GGTT PTEs: phys 0x%llx (%llu KiB, dsm=0x%llx, v_base=0x%llx)",
+                   (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10),
+                   (unsigned long long)dsmBase, (unsigned long long)efiConsolePhys);
             return true;
         }
     }
 
     /* Path 2: XNU UEFI GOP boot console physical base (PE_state.video.v_baseAddr) */
-    if (PE_state.video.v_baseAddr != 0) {
-        fScanoutPhys = (IOPhysicalAddress)PE_state.video.v_baseAddr;
+    if (efiConsolePhys >= kMinValidScanoutPhys) {
+        fScanoutPhys = (IOPhysicalAddress)efiConsolePhys;
         AFBLOG("scanout resolved from XNU PE_state.video.v_baseAddr: phys 0x%llx (%llu KiB)",
                (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
         return true;
     }
 
     /* Path 3: Legacy Gen12 (Display IP <= 12) CPU-mappable BAR2 GMADR Aperture window */
-    if (fVer <= 12 && bar2Base && bar2Len && ((uint64_t)fBootSurfGgtt + fScanoutBytes <= (uint64_t)bar2Len)) {
+    if (fVer <= 12 && bar2Base >= kMinValidScanoutPhys && bar2Len &&
+        ((uint64_t)fBootSurfGgtt + fScanoutBytes <= (uint64_t)bar2Len)) {
         fScanoutPhys = bar2Base + fBootSurfGgtt;
         AFBLOG("scanout mapped via legacy BAR2 GMADR: phys 0x%llx (%llu KiB)",
                (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
         return true;
     }
 
-    AFBLOG("failed to resolve CPU physical scanout address for GGTT 0x%x", fBootSurfGgtt);
+    AFBLOG("failed to resolve CPU physical scanout address for GGTT 0x%x (dsm=0x%llx v_base=0x%llx)",
+           fBootSurfGgtt, (unsigned long long)dsmBase, (unsigned long long)efiConsolePhys);
     return false;
 }
 
@@ -468,24 +518,19 @@ bool ArcFB::start(IOService *provider)
         return false;
     }
 
-    publishBacklight();
-
-    if (!IOFramebuffer::start(provider)) {
-        if (fBacklight) {
-            fBacklight->detach(this);
-            OSSafeReleaseNULL(fBacklight);
-        }
+    if (IODeviceMemory *sm = IODeviceMemory::withRange(fScanoutPhys, fScanoutBytes)) {
+        fSurfMap = sm->map(kIOMapWriteCombineCache);
+        sm->release();
+    }
+    if (!fSurfMap) {
+        AFBLOG("failed to create WC kernel map for scanout phys 0x%llx (%llu KiB)",
+               (unsigned long long)fScanoutPhys, (unsigned long long)(fScanoutBytes >> 10));
         OSSafeReleaseNULL(fMMIO);
         fRegs = nullptr;
         return false;
     }
 
-    if (IODeviceMemory *sm = IODeviceMemory::withRange(fScanoutPhys, fScanoutBytes)) {
-        fSurfMap = sm->map(kIOMapWriteCombineCache);
-        sm->release();
-    }
-
-    /* Bind head 0 to ArcAccel.kext */
+    /* Bind head 0 properties BEFORE IOFramebuffer::start registers/publishes the framebuffer */
     setProperty("IOFBDependentID", kArcDependentID, 64);
     setProperty("IOFBDependentIndex", 0ULL, 32);
     setProperty("ArcFBPipe", (uint64_t)fPipe, 32);
@@ -496,6 +541,19 @@ bool ArcFB::start(IOService *provider)
     /* Publish GOP reserved GGTT range on IOPCIDevice so ArcXe.kext never overwrites the boot scanout */
     fPCI->setProperty("arc-gop-ggtt-base", (uint64_t)fBootSurfGgtt, 64);
     fPCI->setProperty("arc-gop-ggtt-size", (uint64_t)fScanoutBytes, 64);
+
+    publishBacklight();
+
+    if (!IOFramebuffer::start(provider)) {
+        if (fBacklight) {
+            fBacklight->detach(this);
+            OSSafeReleaseNULL(fBacklight);
+        }
+        OSSafeReleaseNULL(fSurfMap);
+        OSSafeReleaseNULL(fMMIO);
+        fRegs = nullptr;
+        return false;
+    }
 
     armVblTimer();
     registerPowerDriver(this, kArcFbPowerStates, 2);

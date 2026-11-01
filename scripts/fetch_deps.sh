@@ -50,8 +50,22 @@ fi
 # 3. Upstream Mesa (tag $MESA_TAG) for Intel ANV (Xe-LPG 12.70)
 if [ ! -d "$TP/mesa/.git" ]; then
     echo "[2/3] Cloning Mesa ($MESA_TAG)..."
-    git clone --depth 1 --branch "$MESA_TAG" https://gitlab.freedesktop.org/mesa/mesa.git "$TP/mesa" \
-      || git clone --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git "$TP/mesa"
+    MESA_CLONED=0
+    for url in "https://gitlab.freedesktop.org/mesa/mesa.git" "https://github.com/Mesa3D/mesa.git"; do
+        for attempt in 1 2; do
+            rm -rf "$TP/mesa"
+            if git clone --depth 1 --branch "$MESA_TAG" "$url" "$TP/mesa"; then
+                MESA_CLONED=1
+                break 2
+            fi
+            echo "[WARN] Mesa clone attempt $attempt from $url failed; retrying..."
+            sleep 3
+        done
+    done
+    if [ "$MESA_CLONED" != "1" ]; then
+        echo "[ERROR] Failed to clone Mesa tag '$MESA_TAG' from GitLab and GitHub mirrors." >&2
+        exit 1
+    fi
 else
     echo "[2/3] Mesa already present ($TP/mesa)"
 fi

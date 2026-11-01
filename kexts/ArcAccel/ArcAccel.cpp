@@ -573,6 +573,9 @@ public:
         if (isHeadlessMode) {
             /* Keep IOAcceleratorFamily2 completely detached from IONDRVFramebuffer display pipes on 00:02.0 */
             gArcIopEnabled = 0;
+        } else if (gArcIopEnabled) {
+            /* Publish DisplayPipe capabilities before IOGraphicsAccelerator2::start so family-swept pipes see them */
+            publishDisplayPipeCapabilities(true);
         }
 
         fPCI = pci;
