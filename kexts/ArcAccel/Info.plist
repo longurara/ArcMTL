@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>ArcAccel</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.arc.ArcAccel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ArcAccel</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>ArcAccel</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.arc.ArcAccel</string>
+			<key>IOClass</key>
+			<string>ArcAccel</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIMatch</key>
+			<string>0x7d558086 0x7d408086 0x7d418086 0x7d458086 0x7d518086 0x7d608086 0x7d678086 0x7dd18086 0x7dd58086</string>
+			<key>IOProbeScore</key>
+			<integer>40000</integer>
+			<key>IOKitDebug</key>
+			<integer>0</integer>
+			<key>IOSourceVersion</key>
+			<string>0.1.0</string>
+			<key>IOAcceleratorTypes</key>
+			<string>IOService:/AppleACPIPlatformExpert</string>
+			<key>IOAccelIndex</key>
+			<integer>0</integer>
+			<key>IOAccelRevision</key>
+			<integer>2</integer>
+			<key>MetalPluginName</key>
+			<string>../../../Library/GPUBundles/ArcMTLDriver</string>
+			<key>MetalPluginClassName</key>
+			<string>ArcMTLDevice</string>
+			<key>MetalStatisticsName</key>
+			<string>IntelArcStatistics</string>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>1.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>2.1</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>2.9</string>
+		<key>com.apple.iokit.IOSurface</key>
+		<string>1.0.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>16.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>16.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>16.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>16.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>16.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Safe Boot</string>
+</dict>
+</plist>

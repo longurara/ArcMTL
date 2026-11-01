@@ -1,0 +1,15 @@
+# ArcMTLDriver process allow-list (/Library/GPUBundles/arcmtl-allow.txt)
+# Rules are evaluated top-to-bottom:
+#   -ProcessName   Deny Metal device creation in ProcessName
+#   !ProcessName   Allow only when ArcAccel framebuffer mode is armed (debug.arcaccelfb=1)
+#   ProcessName    Allow ProcessName
+#   *              Allow all remaining user applications & CLI compute workloads
+
+# WindowServer is doubly gated:
+#  1. In Dual-GPU headless mode (boot-arg arc_headless=1 -> debug.arcaccel_headless=1),
+#     WindowServer is rejected before reading this file so RTX 4070 owns the desktop.
+#  2. Even when headless=0, '!WindowServer' requires debug.arcaccelfb=1 (arcaccel=1).
+!WindowServer
+
+# Grant Metal 3 access on Intel Arc (Xe-LPG) to all applications & compute tools
+*

@@ -1,0 +1,28 @@
+# Third-Party Notices & Credits
+
+This noncommercial research project brings Apple Metal 3 & Display hardware acceleration to Intel Arc integrated GPUs (Meteor Lake Xe-LPG `8086:7D55` and related Xe-LPG devices) on macOS 15 Sequoia and newer. It builds upon and incorporates open-source and noncommercial components under their respective licenses:
+
+1. **NullMoth NVIDIA Driver for macOS (`nullmoth/nvidia-macos-driver`)**
+   - Reconstructed `IOAcceleratorFamily2` / `IOGraphicsAccelerator2` headers (`kexts/ArcAccel/iofam/`, `kexts/ArcAccel/re/`, `tahoe_fwd.h`), `NMIntelFB` GOP takeover & VBlank architecture, and Metal-to-Vulkan plugin design (`plugin/`).
+   - License: **PolyForm Noncommercial License 1.0.0**
+   - Required Notice: `Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)`
+
+2. **Shader Translator (`translator/` — `metal2vulkan`)**
+   - Apple AIR to Vulkan SPIR-V compiler and structured CFG relooper.
+   - License: **GNU Lesser General Public License v3.0 or later (LGPL-3.0-or-later)**.
+
+3. **Mesa 3D Graphics Library (`ANV`, `ISL`, `BRW`, `nir`)**
+   - Intel Vulkan driver (`src/intel/vulkan`), Intel Surface Layout (`src/intel/isl`), Intel Shader Compiler (`src/intel/compiler`), and `anv_kmd_backend` interface (`mesa-anv/`).
+   - License: **MIT License** — `Copyright (c) 2015-2026 Intel Corporation and Mesa Contributors`.
+
+4. **Linux `drm/xe` and `drm/i915` Hardware Register & UAPI Definitions**
+   - Intel Xe-LPG (Graphics IP 12.70), Display IP Version 14, GGTT/PPGTT PAT definitions, GuC v70 WOPCM/CTB ABI, and `xe_drm.h` structures (`include/arc_regs_mtl.h`, `mesa-anv/anv_xnu_drm_shim.h`).
+   - License: **MIT License** — `Copyright (c) 2021-2025 Intel Corporation`.
+
+5. **WhateverXe (`b00t0x/WhateverXe`, derived from `acidanthera/WhateverGreen`)**
+   - South Display PCH PWM backlight scaling methodology (`BXT_BLC_PWM_CTL/FREQ/DUTY`).
+   - License: **BSD-3-Clause** — `Copyright (c) 2018 vit9696`, `Copyright (c) 2025-2026 b00t0x`.
+
+6. **Intel GuC Firmware (`mtl_guc_70.bin`)**
+   - Redistributable binary microcontroller firmware from `linux-firmware` (`intel/xe/mtl_guc_70.bin`).
+   - License: **Intel Firmware Redistribution License (`LICENSE.i915`)** — `Copyright (c) Intel Corporation`.

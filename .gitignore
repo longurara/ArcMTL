@@ -1,0 +1,17 @@
+# Third-party fetched trees
+/third_party/
+
+# Intermediate build directories
+/build/arc-plugin-src/
+/build/mesa-anv-build/
+/build/xlate-target/
+
+# Compiled outputs
+/out/
+
+# OS & Editor metadata
+.DS_Store
+*.o
+*.dSYM/
+__pycache__/
+*.pyc
