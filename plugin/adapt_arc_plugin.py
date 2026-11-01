@@ -437,23 +437,42 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
             memset(&cb2, 0, sizeof(cb2));
 
             const float clear1[4] = { 0.25f, 0.50f, 0.75f, 1.0f };
+            const float zblend[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
             nvk_pipeline *pass1Pipe = haveGpPipe ? &gpPipe : &triPipe;
-            if (!inf1 || !inf2 ||
-                nvmtl_vk_cmd_begin(&vq, &cb1) != 0 ||
-                nvmtl_vk_cmd_begin_render(&cb1, &dstImg, pass1Pipe, clear1) != 0) {
+            if (!inf1 || !inf2 || nvmtl_vk_cmd_begin(&vq, &cb1) != 0) {
+                fprintf(stderr, "  [FAIL] Failed to allocate 2560x1600 async CommandBuffer #1!\\n");
+                return 14;
+            }
+            nvmtl_vk_cmd_set_blend_color(&cb1, zblend);
+            nvmtl_vk_cmd_set_line_width(&cb1, 1.0f);
+            (void)nvmtl_vk_cmd_set_polygon_mode(&cb1, 0);
+            nvmtl_vk_cmd_set_depth_bias(&cb1, 0.0f, 0.0f, 0.0f);
+            nvmtl_vk_cmd_set_provoking_last(&cb1, 0);
+            (void)nvmtl_vk_cmd_set_depth_clip(&cb1, 1);
+            nvmtl_vk_cmd_set_stencil_ref(&cb1, 0, 0);
+            (void)nvmtl_vk_cmd_prepare_sampled_image(&cb1, &srcImg, 0);
+            if (nvmtl_vk_cmd_begin_render(&cb1, &dstImg, pass1Pipe, clear1) != 0) {
                 fprintf(stderr, "  [FAIL] Failed to begin 2560x1600 async RenderPass #1!\\n");
                 return 14;
             }
             nvmtl_vk_cmd_set_viewport(&cb1, 0.0f, 0.0f, (float)dw, (float)dh, 0.0f, 1.0f);
             nvmtl_vk_cmd_set_scissor(&cb1, 0, 0, dw, dh);
             nvmtl_vk_cmd_set_cull(&cb1, 0);
-            for (uint32_t bi = 0; bi < 4; bi++) {
+            for (uint32_t bi = 0; bi < 8; bi++) {
                 (void)nvmtl_vk_bind_buffer(&cb1, 0, bi, &vbuf, 0);
                 (void)nvmtl_vk_bind_buffer(&cb1, 1, bi, &vbuf, 0);
             }
-            (void)nvmtl_vk_bind_texture(&cb1, 1, 0, &srcImg);
-            if (samp.s) (void)nvmtl_vk_bind_sampler(&cb1, 1, 0, &samp);
+            for (uint32_t ti = 0; ti < 4; ti++) {
+                (void)nvmtl_vk_bind_texture(&cb1, 0, ti, &srcImg);
+                (void)nvmtl_vk_bind_texture(&cb1, 1, ti, &srcImg);
+                if (samp.s) {
+                    (void)nvmtl_vk_bind_sampler(&cb1, 0, ti, &samp);
+                    (void)nvmtl_vk_bind_sampler(&cb1, 1, ti, &samp);
+                }
+            }
             nvmtl_vk_cmd_bind_set(&cb1, pass1Pipe);
+            (void)nvmtl_vk_cmd_set_topology(&cb1, haveGpPipe ? 4u : 3u);
+            (void)nvmtl_vk_cmd_vertex_inputs(&cb1, pass1Pipe, NULL, 0);
             nvmtl_vk_cmd_draw(&cb1, 0, haveGpPipe ? 4u : 3u, 1u, 0u);
             nvmtl_vk_cmd_end_render(&cb1);
 
@@ -463,8 +482,19 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
                 return 15;
             }
 
-            if (nvmtl_vk_cmd_begin(&vq, &cb2) != 0 ||
-                nvmtl_vk_cmd_begin_render_ex(&cb2, &dstImg, &triPipe, clear1, NVMTL_LOAD_COLOUR(0)) != 0) {
+            if (nvmtl_vk_cmd_begin(&vq, &cb2) != 0) {
+                (void)nvmtl_vk_submit_finish(inf1);
+                fprintf(stderr, "  [FAIL] Failed to allocate 2560x1600 async CommandBuffer #2!\\n");
+                return 16;
+            }
+            nvmtl_vk_cmd_set_blend_color(&cb2, zblend);
+            nvmtl_vk_cmd_set_line_width(&cb2, 1.0f);
+            (void)nvmtl_vk_cmd_set_polygon_mode(&cb2, 0);
+            nvmtl_vk_cmd_set_depth_bias(&cb2, 0.0f, 0.0f, 0.0f);
+            nvmtl_vk_cmd_set_provoking_last(&cb2, 0);
+            (void)nvmtl_vk_cmd_set_depth_clip(&cb2, 1);
+            nvmtl_vk_cmd_set_stencil_ref(&cb2, 0, 0);
+            if (nvmtl_vk_cmd_begin_render_ex(&cb2, &dstImg, &triPipe, clear1, NVMTL_LOAD_COLOUR(0)) != 0) {
                 (void)nvmtl_vk_submit_finish(inf1);
                 fprintf(stderr, "  [FAIL] Failed to begin 2560x1600 async RenderPass #2!\\n");
                 return 16;
@@ -472,7 +502,13 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
             nvmtl_vk_cmd_set_viewport(&cb2, 0.0f, 0.0f, (float)dw, (float)dh, 0.0f, 1.0f);
             nvmtl_vk_cmd_set_scissor(&cb2, 0, 0, dw, dh);
             nvmtl_vk_cmd_set_cull(&cb2, 0);
+            for (uint32_t bi = 0; bi < 4; bi++) {
+                (void)nvmtl_vk_bind_buffer(&cb2, 0, bi, &vbuf, 0);
+                (void)nvmtl_vk_bind_buffer(&cb2, 1, bi, &vbuf, 0);
+            }
             nvmtl_vk_cmd_bind_set(&cb2, &triPipe);
+            (void)nvmtl_vk_cmd_set_topology(&cb2, 3u);
+            (void)nvmtl_vk_cmd_vertex_inputs(&cb2, &triPipe, NULL, 0);
             nvmtl_vk_cmd_draw(&cb2, 0, 3u, 1u, 0u);
             nvmtl_vk_cmd_end_render(&cb2);
 
