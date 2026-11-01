@@ -54,6 +54,7 @@ struct ArcPtPage {
     uint64_t                    physAddr;
     volatile uint64_t          *entries;
     ArcPtPage                  *children[512];  /* Null at leaf level 0 (PT) */
+    bool                        isNullBacked;   /* True if split from a 2 MiB VM_BIND_FLAG_NULL slot */
 };
 
 /* Per-Process 48-bit GPU Virtual Address Space */
@@ -137,13 +138,20 @@ public:
     int32_t                     fFwRefCount         = 0;
     bool                        fEnginesHoldForceWake = false;
 
-    /* GGTT Manager */
+    /* GGTT Manager & Global 48-bit PPGTT Scratch/Null Hierarchy */
     IOLock                     *fGgttLock           = nullptr;
     IORangeAllocator           *fGgttAlloc          = nullptr;
     uint64_t                    fGgttUsableStart    = ARC_GGTT_WOPCM_RESERVED_BASE;
     uint64_t                    fGgttUsableSize     = 0;
     uint32_t                    fGgttWriteCount     = 0;
     ArcBo                      *fScratchPageBo      = nullptr;
+    ArcBo                      *fNullPageBo         = nullptr;
+    ArcPtPage                  *fScratchPt          = nullptr;
+    ArcPtPage                  *fScratchPd          = nullptr;
+    ArcPtPage                  *fScratchPdp         = nullptr;
+    ArcPtPage                  *fNullPt             = nullptr;
+    uint64_t                    fScratchLeafPte     = 0;
+    uint64_t                    fNullLeafPte        = 0;
 
     /* Per-Engine Global Hardware Status Pages (HWSP), Idle Contexts & Submission Locks */
     IOLock                     *fEngineLock         = nullptr;
@@ -210,7 +218,7 @@ public:
     void   retainBo(ArcBo *bo);
     void   releaseBo(ArcBo *bo);
 
-    ArcPtPage *allocPtPage();
+    ArcPtPage *allocPtPage(uint64_t fillEntry = 0ULL);
     void       freePtTree(ArcPtPage *node, int level);
     ArcVm     *createVm();
     void       destroyVm(ArcVm *vm);
@@ -229,7 +237,8 @@ public:
     IOReturn      submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno);
     IOReturn      waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                  uint64_t *outCompleted, bool *outTimedOut,
-                                 ArcXeWaitQueueOut *outDiag = nullptr);
+                                 ArcXeWaitQueueOut *outDiag = nullptr,
+                                 bool resetOnTimeout = true);
     bool          tryLoadGucFirmwareFromDisk(const char *fwPath);
     static void   gucLoaderThreadEntry(void *arg, wait_result_t);
 

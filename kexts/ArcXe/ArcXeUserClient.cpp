@@ -773,6 +773,12 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             clock_get_uptime(&curAbs);
             absolutetime_to_nanoseconds(curAbs, &curNs);
             if (curNs - absStartNs >= maxWaitNs) {
+                if (maxWaitNs >= 100000000ULL && pendingQ) {
+                    uint64_t done = 0;
+                    bool to = false;
+                    fOwner->waitQueueSeqno(pendingQ, pendingSeq, 0ULL, &done, &to,
+                                           nullptr, /*resetOnTimeout=*/true);
+                }
                 out->timed_out = 1;
                 args->structureOutputSize = sizeof(*out);
                 return kIOReturnSuccess;
@@ -783,7 +789,8 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             if (pendingQ) {
                 uint64_t done = 0;
                 bool to = false;
-                fOwner->waitQueueSeqno(pendingQ, pendingSeq, sliceNs, &done, &to);
+                fOwner->waitQueueSeqno(pendingQ, pendingSeq, sliceNs, &done, &to,
+                                       nullptr, /*resetOnTimeout=*/false);
             } else {
                 IOSleep(1);
             }

@@ -131,6 +131,7 @@ if [ -x /usr/local/bin/arc_probe ]; then
         PROBE_OK=1
     else
         echo "[WARN] arc_probe returned non-zero"
+        log show --last 2m --style compact --predicate 'eventMessage CONTAINS "ArcXe:"' 2>/dev/null | tail -n 25 || true
     fi
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
@@ -140,6 +141,7 @@ if [ -x /usr/local/bin/vk_offscreen_test ]; then
         echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
     else
         echo "[WARN] vk_offscreen_test returned non-zero"
+        log show --last 2m --style compact --predicate 'eventMessage CONTAINS "ArcXe:"' 2>/dev/null | tail -n 25 || true
     fi
 fi
 if (kmutil showloaded --list-only 2>/dev/null || kextstat 2>/dev/null) | grep -q "com\.arc\.ArcAccel"; then

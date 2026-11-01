@@ -504,8 +504,9 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     q->ringTail = initDw * 4u;
     reg[ARC_CTX_RING_HEAD_VAL] = 0u;
     reg[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
-    clflushRange(q->ctxRegsCpu, 0x140);
-    clflushRange(q->ringCpu, q->ringTail + 64u);
+    /* Flush all 76 KiB of lrcBo + 4 KiB fenceBo so zeroed WB cachelines never collide with HW Context-Save */
+    clflushRange(cpuBase, totalSize);
+    clflushRange(fenceCpuBase, 4096);
     q->holdsForceWake = forceWakeGet();
 
     return q;
@@ -648,6 +649,24 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
     return parkedOk;
 }
 
+static inline void readEngineDiagMmio(const ArcXeService *svc, uint32_t b, ArcXeWaitQueueOut *d)
+{
+    if (!d) return;
+    d->engine_status    = svc->rd32(ARC_RING_EXECLIST_STATUS_LO(b));
+    d->engine_status_hi = svc->rd32(ARC_RING_EXECLIST_STATUS_HI(b));
+    d->current_lrca     = svc->rd32(ARC_RING_CURRENT_LRCA(b));
+    d->ring_head        = svc->rd32(ARC_RING_HEAD(b));
+    d->ring_tail        = svc->rd32(ARC_RING_TAIL(b));
+    d->ring_start       = svc->rd32(ARC_RING_START(b));
+    d->ring_ctl         = svc->rd32(ARC_RING_CTL(b));
+    d->acthd_lo         = svc->rd32(ARC_RING_ACTHD(b));
+    d->acthd_hi         = svc->rd32(ARC_RING_ACTHD_UDW(b));
+    d->ipehr            = svc->rd32(ARC_RING_IPEHR(b));
+    d->esr              = svc->rd32(ARC_RING_ESR(b));
+    d->instdone         = svc->rd32(ARC_RING_INSTDONE(b));
+    d->mi_mode          = svc->rd32(ARC_RING_MI_MODE(b));
+}
+
 IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno)
 {
     if (!q || !q->lrcBo || !q->fenceBo || fStopping) return kIOReturnBadArgument;
@@ -673,11 +692,41 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     ArcExecQueue *idleQ  = (q->mmioBase == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
     ArcExecQueue *&lastQ = (q->mmioBase == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
     if (lastQ && lastQ->seqnoCpu) {
-        const uint64_t prevTarget = lastQ->lastSubmittedSeqno;
-        for (uint32_t us = 0; us < 500000u && *lastQ->seqnoCpu < prevTarget; us += 5u) {
+        ArcExecQueue *prevQ = lastQ;
+        const uint64_t prevTarget = prevQ->lastSubmittedSeqno;
+        for (uint32_t us = 0; us < 500000u && *prevQ->seqnoCpu < prevTarget; us += 5u) {
             IODelay(5);
         }
-        (void)parkEngineOnIdleContextLocked(q->mmioBase, lastQ);
+        const bool prevDone = (*prevQ->seqnoCpu >= prevTarget);
+        const bool parked   = prevDone ? parkEngineOnIdleContextLocked(q->mmioBase, prevQ) : false;
+        if (!prevDone || !parked) {
+            ArcXeWaitQueueOut snap = {};
+            readEngineDiagMmio(this, q->mmioBase, &snap);
+            AXELOG("submitBatch predecessor stall (prevQ=%u target=%llu cur=%llu parked=%d): "
+                   "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
+                   "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
+                   prevQ->queueId, (unsigned long long)prevTarget, (unsigned long long)(*prevQ->seqnoCpu),
+                   parked ? 1 : 0,
+                   snap.engine_status_hi, snap.engine_status, snap.current_lrca,
+                   snap.ring_head, snap.ring_tail, snap.ring_start, snap.ring_ctl,
+                   snap.acthd_hi, snap.acthd_lo, snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
+
+            ArcBo *hwsp = nullptr;
+            (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
+            if (hwsp) {
+                (void)resetEngineHw(q->mmioBase, hwsp);
+            }
+            prevQ->isLoadedOnHw    = false;
+            prevQ->hasSavedHwState = false;
+            if (prevQ->ctxRegsCpu) {
+                prevQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+                    ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
+                prevQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = prevQ->ringTail;
+                prevQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = prevQ->ringTail;
+                clflushRange(prevQ->ctxRegsCpu, 0x140);
+            }
+            lastQ = nullptr;
+        }
     }
 
     const uint64_t seqno = ++q->lastSubmittedSeqno;
@@ -823,27 +872,10 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     return kIOReturnSuccess;
 }
 
-static inline void readEngineDiagMmio(const ArcXeService *svc, uint32_t b, ArcXeWaitQueueOut *d)
-{
-    if (!d) return;
-    d->engine_status    = svc->rd32(ARC_RING_EXECLIST_STATUS_LO(b));
-    d->engine_status_hi = svc->rd32(ARC_RING_EXECLIST_STATUS_HI(b));
-    d->current_lrca     = svc->rd32(ARC_RING_CURRENT_LRCA(b));
-    d->ring_head        = svc->rd32(ARC_RING_HEAD(b));
-    d->ring_tail        = svc->rd32(ARC_RING_TAIL(b));
-    d->ring_start       = svc->rd32(ARC_RING_START(b));
-    d->ring_ctl         = svc->rd32(ARC_RING_CTL(b));
-    d->acthd_lo         = svc->rd32(ARC_RING_ACTHD(b));
-    d->acthd_hi         = svc->rd32(ARC_RING_ACTHD_UDW(b));
-    d->ipehr            = svc->rd32(ARC_RING_IPEHR(b));
-    d->esr              = svc->rd32(ARC_RING_ESR(b));
-    d->instdone         = svc->rd32(ARC_RING_INSTDONE(b));
-    d->mi_mode          = svc->rd32(ARC_RING_MI_MODE(b));
-}
-
 IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                       uint64_t *outCompleted, bool *outTimedOut,
-                                      ArcXeWaitQueueOut *outDiag)
+                                      ArcXeWaitQueueOut *outDiag,
+                                      bool resetOnTimeout)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
     if (targetSeqno == 0) targetSeqno = q->lastSubmittedSeqno;
@@ -887,6 +919,13 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
         uint64_t elapsedNs = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - startAbs, &elapsedNs);
         if (elapsedNs >= timeoutNs) {
+            /* Intermediate 5 ms polling slices from kArcXeMethodSyncobjWait must NEVER reset the engine! */
+            if (!resetOnTimeout && !outDiag) {
+                if (outCompleted) *outCompleted = cur;
+                if (outTimedOut)  *outTimedOut  = true;
+                return kIOReturnSuccess;
+            }
+
             ArcXeWaitQueueOut snap = {};
             snap.completed_seqno = cur;
             snap.timed_out       = 1u;
@@ -895,21 +934,32 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
             if (forceWakeGet()) {
                 const uint32_t b = q->mmioBase;
                 readEngineDiagMmio(this, b, &snap);
-                AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
-                       "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
-                       "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
-                       q->queueId, (unsigned long long)targetSeqno, (unsigned long long)cur,
-                       snap.engine_status_hi, snap.engine_status,
-                       snap.current_lrca,
-                       snap.ring_head, snap.ring_tail,
-                       snap.ring_start, snap.ring_ctl,
-                       snap.acthd_hi, snap.acthd_lo,
-                       snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
+                if (resetOnTimeout) {
+                    AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
+                           "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
+                           "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
+                           q->queueId, (unsigned long long)targetSeqno, (unsigned long long)cur,
+                           snap.engine_status_hi, snap.engine_status,
+                           snap.current_lrca,
+                           snap.ring_head, snap.ring_tail,
+                           snap.ring_start, snap.ring_ctl,
+                           snap.acthd_hi, snap.acthd_lo,
+                           snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
 
-                ArcBo *hwsp = nullptr;
-                (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
-                if (hwsp) {
-                    (void)resetEngineHw(b, hwsp);
+                    ArcBo *hwsp = nullptr;
+                    (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
+                    if (hwsp) {
+                        (void)resetEngineHw(b, hwsp);
+                    }
+                    q->isLoadedOnHw    = false;
+                    q->hasSavedHwState = false;
+                    if (q->ctxRegsCpu) {
+                        q->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+                            ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
+                        q->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = q->ringTail;
+                        q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
+                        clflushRange(q->ctxRegsCpu, 0x140);
+                    }
                 }
                 forceWakePut();
             }

@@ -8,8 +8,23 @@
 #include "ArcXeService.h"
 #include <libkern/c++/OSNumber.h>
 
+static inline void arcClflushEntry(const volatile void *addr)
+{
+    __asm__ __volatile__("clflush (%0)" :: "r"(addr) : "memory");
+}
+
+static inline void arcClflushRange(const volatile void *addr, size_t bytes)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(63u);
+    const uintptr_t end   = (reinterpret_cast<uintptr_t>(addr) + bytes + 63u) & ~static_cast<uintptr_t>(63u);
+    for (uintptr_t p = start; p < end; p += 64u) {
+        __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
+    }
+    __asm__ __volatile__("mfence" ::: "memory");
+}
+
 /* ============================================================================
- * 1. Global GTT (GGTT) Allocator & PTE Programming
+ * 1. Global GTT (GGTT) Allocator & Global 48-bit PPGTT Scratch/Null Hierarchy
  * ============================================================================ */
 
 bool ArcXeService::initGgtt()
@@ -17,12 +32,45 @@ bool ArcXeService::initGgtt()
     fGgttLock = IOLockAlloc();
     if (!fGgttLock) return false;
 
-    /* Allocate 4KB physical scratch page so unmapped GGTT entries never fault into random RAM */
-    fScratchPageBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT, ARC_MTL_PAT_IDX_WB_NONCOH, true);
-    if (!fScratchPageBo) {
-        AXELOG("initGgtt: failed to allocate scratch page");
+    /*
+     * Allocate dedicated 4 KiB physical scratch & null pages:
+     *   - fScratchPageBo: backs unmapped GGTT slots AND the full 48-bit PPGTT SCRATCH_PAGE
+     *     hierarchy (required by Mesa ANV on Graphics IP < 20 for out-of-BO EU/VF/Sampler/SBA prefetch).
+     *   - fNullPageBo: dedicated zeroed 4 KiB page (0x00000000 = MI_NOOP) backing DRM_XE_VM_BIND_FLAG_NULL
+     *     (Mesa ANV's 8 GiB null_initialized_heap used for batch_bo_pool CS prefetch isolation; Xe-LPG
+     *     12.71 has no hardware PTE BIT(9) NULL support, which only arrived in Xe2 IP >= 20).
+     */
+    fScratchPageBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT, ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+    fNullPageBo    = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT, ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+    if (!fScratchPageBo || !fScratchPageBo->kernMap || !fNullPageBo || !fNullPageBo->kernMap) {
+        AXELOG("initGgtt: failed to allocate scratch/null pages");
+        teardownGgtt();
         return false;
     }
+    arcClflushRange(reinterpret_cast<const void *>(fScratchPageBo->kernMap->getVirtualAddress()), 4096);
+    arcClflushRange(reinterpret_cast<const void *>(fNullPageBo->kernMap->getVirtualAddress()), 4096);
+
+    const uint64_t scratchPhys = fScratchPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    const uint64_t nullPhys    = fNullPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    if (!scratchPhys || !nullPhys) {
+        AXELOG("initGgtt: invalid scratch/null physical segment");
+        teardownGgtt();
+        return false;
+    }
+
+    fScratchLeafPte = arcEncodePpgttPte(scratchPhys, ARC_MTL_PAT_IDX_WB_1WAY_COH, /*readWrite=*/true, /*nullPage=*/false);
+    fNullLeafPte    = arcEncodePpgttPte(nullPhys,    ARC_MTL_PAT_IDX_WB_1WAY_COH, /*readWrite=*/true, /*nullPage=*/false);
+
+    fScratchPt  = allocPtPage(fScratchLeafPte);
+    fScratchPd  = fScratchPt  ? allocPtPage(arcEncodePpgttPde(fScratchPt->physAddr)) : nullptr;
+    fScratchPdp = fScratchPd  ? allocPtPage(arcEncodePpgttPde(fScratchPd->physAddr)) : nullptr;
+    fNullPt     = allocPtPage(fNullLeafPte);
+    if (!fScratchPt || !fScratchPd || !fScratchPdp || !fNullPt) {
+        AXELOG("initGgtt: failed to allocate global PPGTT scratch/null hierarchy");
+        teardownGgtt();
+        return false;
+    }
+    fNullPt->isNullBacked = true;
 
     /* Check if ArcFB or BIOS GOP has a scanout surface above 24 MiB so we never clobber it */
     uint64_t usableStart = ARC_GGTT_WOPCM_RESERVED_BASE;
@@ -49,12 +97,14 @@ bool ArcXeService::initGgtt()
     fGgttAlloc = IORangeAllocator::withRange((IORangeScalar)fGgttUsableSize, 4096);
     if (!fGgttAlloc) {
         AXELOG("initGgtt: IORangeAllocator creation failed");
+        teardownGgtt();
         return false;
     }
 
-    AXELOG("GGTT online: usable VA [0x%llx .. 0x%x) (%llu MiB)",
+    AXELOG("GGTT online: usable VA [0x%llx .. 0x%x) (%llu MiB), PPGTT scratch=0x%llx null=0x%llx",
            (unsigned long long)fGgttUsableStart, ARC_GUC_GGTT_TOP,
-           (unsigned long long)(fGgttUsableSize >> 20));
+           (unsigned long long)(fGgttUsableSize >> 20),
+           (unsigned long long)scratchPhys, (unsigned long long)nullPhys);
     return true;
 }
 
@@ -66,6 +116,16 @@ void ArcXeService::teardownGgtt()
             fScanoutPins[i].md->release();
             fScanoutPins[i].md = nullptr;
         }
+    }
+    if (fNullPt)     { freePtTree(fNullPt, 0);     fNullPt     = nullptr; }
+    if (fScratchPdp) { freePtTree(fScratchPdp, 0); fScratchPdp = nullptr; }
+    if (fScratchPd)  { freePtTree(fScratchPd, 0);  fScratchPd  = nullptr; }
+    if (fScratchPt)  { freePtTree(fScratchPt, 0);  fScratchPt  = nullptr; }
+    fScratchLeafPte = 0;
+    fNullLeafPte    = 0;
+    if (fNullPageBo) {
+        releaseBo(fNullPageBo);
+        fNullPageBo = nullptr;
     }
     if (fScratchPageBo) {
         releaseBo(fScratchPageBo);
@@ -151,21 +211,6 @@ void ArcXeService::freeGgttRange(uint32_t ggttOffset, uint32_t ggttSize)
 /* ============================================================================
  * 2. UMA Buffer Objects (Kernel Allocated & Zero-Copy Task / IOSurface Imports)
  * ============================================================================ */
-
-static inline void arcClflushEntry(const volatile void *addr)
-{
-    __asm__ __volatile__("clflush (%0)" :: "r"(addr) : "memory");
-}
-
-static inline void arcClflushRange(const volatile void *addr, size_t bytes)
-{
-    const uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~static_cast<uintptr_t>(63u);
-    const uintptr_t end   = (reinterpret_cast<uintptr_t>(addr) + bytes + 63u) & ~static_cast<uintptr_t>(63u);
-    for (uintptr_t p = start; p < end; p += 64u) {
-        __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
-    }
-    __asm__ __volatile__("mfence" ::: "memory");
-}
 
 ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patIndex, bool mapInKernel)
 {
@@ -323,7 +368,7 @@ void ArcXeService::releaseBo(ArcBo *bo)
  * 3. 48-bit 4-Level PPGTT Virtual Memory Manager (PML4 -> PDP -> PD -> PT)
  * ============================================================================ */
 
-ArcPtPage *ArcXeService::allocPtPage()
+ArcPtPage *ArcXeService::allocPtPage(uint64_t fillEntry)
 {
     IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
@@ -356,7 +401,13 @@ ArcPtPage *ArcXeService::allocPtPage()
         return nullptr;
     }
     pt->entries = reinterpret_cast<volatile uint64_t *>(kva);
-    bzero(kva, 4096);
+    if (fillEntry == 0ULL) {
+        bzero(kva, 4096);
+    } else {
+        for (uint32_t i = 0; i < 512u; i++) {
+            pt->entries[i] = fillEntry;
+        }
+    }
     arcClflushRange(kva, 4096);
     return pt;
 }
@@ -386,7 +437,8 @@ ArcVm *ArcXeService::createVm()
     ArcVm *vm = IONewZero(ArcVm, 1);
     if (!vm) return nullptr;
     vm->lock = IOLockAlloc();
-    vm->pml4 = allocPtPage();
+    const uint64_t defaultPdpPde = fScratchPdp ? arcEncodePpgttPde(fScratchPdp->physAddr) : 0ULL;
+    vm->pml4 = allocPtPage(defaultPdpPde);
     if (!vm->lock || !vm->pml4) {
         destroyVm(vm);
         return nullptr;
@@ -423,6 +475,12 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
     const uint64_t scratchPhys = fScratchPageBo
         ? fScratchPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone)
         : 0;
+    const uint64_t nullPhys = fNullPageBo
+        ? fNullPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone)
+        : scratchPhys;
+    const uint64_t scratchPdPde = fScratchPd ? arcEncodePpgttPde(fScratchPd->physAddr) : 0ULL;
+    const uint64_t scratchPtPde = fScratchPt ? arcEncodePpgttPde(fScratchPt->physAddr) : 0ULL;
+    const uint64_t nullPtPde    = fNullPt    ? arcEncodePpgttPde(fNullPt->physAddr)    : scratchPtPde;
 
     IOLockLock(vm->lock);
 
@@ -456,16 +514,30 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
             if (isUnmap) {
                 ArcPtPage *pdp = vm->pml4->children[idx3];
                 ArcPtPage *pd  = pdp ? pdp->children[idx2] : nullptr;
-                ArcPtPage *pt  = pd  ? pd->children[idx1]  : nullptr;
-                if (pt) {
-                    pt->entries[idx0] = 0ULL;
-                    arcClflushEntry(&pt->entries[idx0]);
+                if (!pd) {
+                    const uint64_t remTo2M = 0x200000ULL - (va & 0x1FFFFFULL);
+                    if ((chunkBytes - sub) > remTo2M)
+                        sub += (remTo2M - 4096ULL);
+                    continue;
                 }
+                ArcPtPage *pt = pd->children[idx1];
+                if (!pt) {
+                    if ((va & 0x1FFFFFULL) == 0ULL && (chunkBytes - sub) >= 0x200000ULL) {
+                        if (pd->entries[idx1] != scratchPtPde) {
+                            pd->entries[idx1] = scratchPtPde;
+                            arcClflushEntry(&pd->entries[idx1]);
+                        }
+                        sub += (0x200000ULL - 4096ULL);
+                    }
+                    continue;
+                }
+                pt->entries[idx0] = pt->isNullBacked ? fNullLeafPte : fScratchLeafPte;
+                arcClflushEntry(&pt->entries[idx0]);
                 continue;
             }
 
             if (!vm->pml4->children[idx3]) {
-                ArcPtPage *pdp = allocPtPage();
+                ArcPtPage *pdp = allocPtPage(scratchPdPde);
                 if (!pdp) { IOLockUnlock(vm->lock); return false; }
                 vm->pml4->children[idx3] = pdp;
                 vm->pml4->entries[idx3]  = arcEncodePpgttPde(pdp->physAddr);
@@ -474,7 +546,7 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
             ArcPtPage *pdp = vm->pml4->children[idx3];
 
             if (!pdp->children[idx2]) {
-                ArcPtPage *pd = allocPtPage();
+                ArcPtPage *pd = allocPtPage(scratchPtPde);
                 if (!pd) { IOLockUnlock(vm->lock); return false; }
                 pdp->children[idx2] = pd;
                 pdp->entries[idx2]  = arcEncodePpgttPde(pd->physAddr);
@@ -482,17 +554,31 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
             }
             ArcPtPage *pd = pdp->children[idx2];
 
+            /* Fast 2 MiB shared fNullPt bind for Mesa ANV's 8 GiB null_initialized_heap */
+            if (isNull && !pd->children[idx1] && fNullPt &&
+                (va & 0x1FFFFFULL) == 0ULL && (chunkBytes - sub) >= 0x200000ULL) {
+                if (pd->entries[idx1] != nullPtPde) {
+                    pd->entries[idx1] = nullPtPde;
+                    arcClflushEntry(&pd->entries[idx1]);
+                }
+                sub += (0x200000ULL - 4096ULL);
+                continue;
+            }
+
             if (!pd->children[idx1]) {
-                ArcPtPage *pt = allocPtPage();
+                const bool wasNullSlot = (nullPtPde != 0ULL && pd->entries[idx1] == nullPtPde);
+                ArcPtPage *pt = allocPtPage(wasNullSlot ? fNullLeafPte : fScratchLeafPte);
                 if (!pt) { IOLockUnlock(vm->lock); return false; }
+                pt->isNullBacked   = wasNullSlot;
                 pd->children[idx1] = pt;
                 pd->entries[idx1]  = arcEncodePpgttPde(pt->physAddr);
                 arcClflushEntry(&pd->entries[idx1]);
             }
             ArcPtPage *pt = pd->children[idx1];
 
-            const uint64_t targetPhys = isNull ? 0ULL : (physPage + sub);
-            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, /*readWrite=*/true, isNull);
+            /* Xe-LPG 12.71 (< Xe2 IP 20) does NOT have hardware PTE BIT(9) NULL; map null binds to zeroed fNullPageBo */
+            const uint64_t targetPhys = isNull ? nullPhys : (physPage + sub);
+            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, /*readWrite=*/true, /*nullPage=*/false);
             arcClflushEntry(&pt->entries[idx0]);
         }
 
