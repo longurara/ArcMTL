@@ -21,7 +21,10 @@ bool ArcXeUserClient::initWithTask(task_t owningTask, void *securityToken, UInt3
         return false;
     fTask = owningTask;
     fClientLock = IOLockAlloc();
-    return fClientLock != nullptr;
+    fUserPtrBinds = IONewZero(ArcUserPtrBind, kArcMaxUserPtrBinds);
+    if (!fClientLock || !fUserPtrBinds)
+        return false;
+    return true;
 }
 
 bool ArcXeUserClient::start(IOService *provider)
@@ -30,6 +33,41 @@ bool ArcXeUserClient::start(IOService *provider)
         return false;
     fOwner = OSDynamicCast(ArcXeService, provider);
     return fOwner != nullptr;
+}
+
+void ArcXeUserClient::releaseUserPtrBinds(uint32_t vmId, uint64_t gpuVa, uint64_t rangeSize, bool allInVm)
+{
+    if (!fOwner || !fClientLock || !fUserPtrBinds)
+        return;
+
+    const uint64_t vaStart = gpuVa & 0x0000FFFFFFFFF000ULL;
+    const uint64_t vaEnd   = vaStart + ((rangeSize + 0xFFFULL) & ~0xFFFULL);
+
+    while (true) {
+        ArcBo *batch[32] = {};
+        uint32_t count = 0;
+
+        IOLockLock(fClientLock);
+        for (uint32_t i = 0; i < kArcMaxUserPtrBinds && count < 32; i++) {
+            ArcUserPtrBind &e = fUserPtrBinds[i];
+            if (!e.bo)
+                continue;
+            if (vmId != 0 && e.vmId != vmId)
+                continue;
+            const uint64_t eEnd = e.gpuVa + e.size;
+            if (allInVm || (e.gpuVa < vaEnd && eEnd > vaStart)) {
+                batch[count++] = e.bo;
+                e = {};
+            }
+        }
+        IOLockUnlock(fClientLock);
+
+        if (count == 0)
+            break;
+        for (uint32_t i = 0; i < count; i++) {
+            fOwner->releaseBo(batch[i]);
+        }
+    }
 }
 
 IOReturn ArcXeUserClient::clientClose()
@@ -58,6 +96,7 @@ IOReturn ArcXeUserClient::clientClose()
             }
         }
         IOLockUnlock(fClientLock);
+        releaseUserPtrBinds(0, 0, 0, true);
     }
 
     if (!isInactive())
@@ -73,6 +112,10 @@ void ArcXeUserClient::stop(IOService *provider)
 
 void ArcXeUserClient::free()
 {
+    if (fUserPtrBinds) {
+        IODelete(fUserPtrBinds, ArcUserPtrBind, kArcMaxUserPtrBinds);
+        fUserPtrBinds = nullptr;
+    }
     if (fClientLock) {
         IOLockFree(fClientLock);
         fClientLock = nullptr;
@@ -389,6 +432,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         IOLockUnlock(fClientLock);
 
         fOwner->destroyVm(vm);
+        releaseUserPtrBinds(in->vm_id, 0, 0, true);
         return kIOReturnSuccess;
     }
 
@@ -440,24 +484,42 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         const bool isUnmap = (in->op == kArcXeVmBindOpUnmap);
         const bool isNull  = (in->op == kArcXeVmBindOpMapNull);
         const uint64_t boOff = (in->op == kArcXeVmBindOpMapUserPtr) ? 0ULL : in->bo_offset;
+        const uint64_t canonicalVa = in->gpu_va & 0x0000FFFFFFFFF000ULL;
+        const uint64_t alignedSize = (in->range_size + 0xFFFULL) & ~0xFFFULL;
         const bool ok = fOwner->vmBindBo(vm, in->gpu_va, bo, boOff, in->range_size, pat, isUnmap, isNull);
 
+        if (ok) {
+            /* Release any previous userptr BO wired at this PPGTT VA range now that PTEs + TLB are updated */
+            releaseUserPtrBinds(in->vm_id, canonicalVa, alignedSize, false);
+        }
+
         if (tempUserBo) {
-            /* Keep userptr pages pinned by leaking neither BO nor descriptor: store in anonymous BO slot if space,
-             * or release after bind if backed by already-resident process heap/IOSurface */
-            IOLockLock(fClientLock);
-            bool saved = false;
-            for (uint32_t i = kArcMaxBosPerClient - 1; i >= kArcMaxBosPerClient - 512; i--) {
-                if (!fBos[i]) {
-                    tempUserBo->handle = i;
-                    fBos[i] = tempUserBo;
-                    saved = true;
-                    break;
-                }
-            }
-            IOLockUnlock(fClientLock);
-            if (!saved)
+            if (!ok) {
                 fOwner->releaseBo(tempUserBo);
+                return kIOReturnVMError;
+            }
+            /* Keep userptr pages wired for the exact lifetime of this PPGTT VA mapping */
+            bool saved = false;
+            if (fUserPtrBinds) {
+                IOLockLock(fClientLock);
+                for (uint32_t i = 0; i < kArcMaxUserPtrBinds; i++) {
+                    if (!fUserPtrBinds[i].bo) {
+                        fUserPtrBinds[i].vmId  = in->vm_id;
+                        fUserPtrBinds[i].gpuVa = canonicalVa;
+                        fUserPtrBinds[i].size  = alignedSize;
+                        fUserPtrBinds[i].bo    = tempUserBo;
+                        saved = true;
+                        break;
+                    }
+                }
+                IOLockUnlock(fClientLock);
+            }
+            if (!saved) {
+                AXELOG("VmBind(MapUserPtr): fUserPtrBinds table full (%u active mappings)!", kArcMaxUserPtrBinds);
+                fOwner->vmBindBo(vm, in->gpu_va, nullptr, 0, in->range_size, pat, /*isUnmap=*/true, /*isNull=*/false);
+                fOwner->releaseBo(tempUserBo);
+                return kIOReturnNoResources;
+            }
         } else if (bo) {
             fOwner->releaseBo(bo);
         }

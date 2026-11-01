@@ -10,10 +10,11 @@
 #
 # Modes:
 #   sudo bash install_opencore_userspace.sh                      # Userspace only + live arc_probe & Vulkan 1.3 test
-#   sudo bash install_opencore_userspace.sh --enable-dual-metal  # + Install ArcFB/ArcAccel into AuxKC (preserving 100% NullMoth)
-#                                                                #   & set arc_headless=1 (IONDRV desktop + RTX 4070 & Intel Arc Metal 3)
-#   sudo bash install_opencore_userspace.sh --enable-arc-desktop # + Install ArcFB/ArcAccel into AuxKC (preserving 100% NullMoth)
-#                                                                #   & set arcfb=1 arcaccel=1 + block IONDRVSupport (full Arc Metal Desktop)
+#   sudo bash install_opencore_userspace.sh --enable-dual-metal  # + Link ArcFB/ArcAccel into AuxKC (preserving 100% NullMoth)
+#                                                                #   & auto-detect Optimus (arcfb=1 arcaccel=1 when Arc owns panel,
+#                                                                #   or arc_headless=1 when dGPU owns panel; IONDRVSupport unblocked)
+#   sudo bash install_opencore_userspace.sh --enable-arc-desktop # + Link ArcFB/ArcAccel into AuxKC & set arcfb=1 arcaccel=1
+#   sudo bash install_opencore_userspace.sh --disable-arc-accel  # Strip arc_headless/arcfb/arcaccel from config.plist (safe Stage 1)
 
 set -euo pipefail
 
@@ -327,28 +328,60 @@ update_oc_config() {
         fi
     done
     if [ -z "$plist" ]; then
-        echo "[WARN] EFI config.plist not found at /Volumes/EFI/EFI/OC/config.plist."
-        echo "       Run 'sudo diskutil mount EFI' and re-run with $target_mode."
+        echo "[WARN] EFI config.plist not found at /Volumes/OPENCORE/EFI/OC/config.plist or /Volumes/EFI/EFI/OC/config.plist."
+        echo "       Run 'sudo diskutil mount OPENCORE' (or 'sudo diskutil mount EFI') and re-run with $MODE."
         return 1
     fi
+
+    local oc_dir
+    oc_dir="$(dirname "$plist")"
+    if [ -d "$OUT/kexts/ArcXe.kext" ] && [ -d "$oc_dir/Kexts" ]; then
+        echo "[*] Syncing latest ArcXe.kext -> $oc_dir/Kexts/ArcXe.kext ..."
+        rm -rf "$oc_dir/Kexts/ArcXe.kext"
+        cp -R "$OUT/kexts/ArcXe.kext" "$oc_dir/Kexts/ArcXe.kext"
+    fi
+
+    local nv_headless="0"
+    nv_headless="$(sysctl -n debug.nvaccel_headless 2>/dev/null || echo 0)"
+    local arc_owns_boot_display="0"
+    if ioreg -r -n IGPU -d 1 2>/dev/null | grep -Fq '"AAPL,boot-display" = Yes'; then
+        arc_owns_boot_display="1"
+    elif ioreg -l 2>/dev/null | grep -B 5 -A 15 '"arcxe-claimed" = Yes' | grep -Fq '"AAPL,boot-display" = Yes'; then
+        arc_owns_boot_display="1"
+    fi
+
     cp "$plist" "${plist}.bak-userspace-$(date +%Y%m%d-%H%M%S)"
-    python3 - "$plist" "$target_mode" <<'PY'
+    python3 - "$plist" "$target_mode" "$nv_headless" "$arc_owns_boot_display" <<'PY'
 import sys, plistlib
-path, mode = sys.argv[1], sys.argv[2]
+path, mode, nv_headless, arc_boot_disp = sys.argv[1], sys.argv[2], sys.argv[3] == '1', sys.argv[4] == '1'
 with open(path, 'rb') as f:
     cfg = plistlib.load(f)
 
 nv = cfg['NVRAM']['Add']['7C436110-AB2A-4BBB-A880-FE41995C9F82']
-remove_set = {'arc_headless=1', 'arcaccel=1', 'arcfb=1'}
-tokens = [t for t in nv.get('boot-args', '').split() if t not in remove_set]
+raw_tokens = nv.get('boot-args', '').split()
+has_nvrmheadless = ('nvrmheadless=1' in raw_tokens)
+optimus_arc_display = nv_headless or arc_boot_disp or has_nvrmheadless
 
+remove_set = {'arc_headless=1', 'arcaccel=1', 'arcfb=1', 'arcflip=1', '-arcnoflip'}
+tokens = [t for t in raw_tokens if t not in remove_set]
+
+# Never block IONDRVSupport: ArcFB (IOProbeScore=65000) wins matching automatically when arcfb=1 is set,
+# while keeping IONDRVFramebuffer available as an instant fail-safe if -arcfboff or -arcoff is passed!
 block_iondrv = False
+effective_desc = mode
+
 if mode == 'dual-metal':
-    tokens.append('arc_headless=1')
-    block_iondrv = False
+    if optimus_arc_display:
+        tokens.extend(['arcfb=1', 'arcaccel=1'])
+        effective_desc = 'dual-metal (Optimus: Intel Arc owns display -> arcfb=1 arcaccel=1 + RTX 4070 headless Metal)'
+    else:
+        tokens.append('arc_headless=1')
+        effective_desc = 'dual-metal (dGPU owns display -> arc_headless=1 secondary Intel Arc Metal)'
 elif mode == 'arc-desktop':
     tokens.extend(['arcfb=1', 'arcaccel=1'])
-    block_iondrv = True
+    effective_desc = 'arc-desktop (arcfb=1 arcaccel=1, IONDRVSupport unblocked fallback)'
+elif mode == 'safe-stage1':
+    effective_desc = 'safe-stage1 (ArcXe only, IONDRVFramebuffer desktop)'
 
 nv['boot-args'] = ' '.join(tokens)
 
@@ -365,20 +398,23 @@ for entry in cfg.get('Kernel', {}).get('Add', []):
 
 with open(path, 'wb') as f:
     plistlib.dump(cfg, f, sort_keys=False)
-print(f"[OK] Updated OpenCore config.plist ({mode}): IONDRVSupport blocked={block_iondrv}, boot-args='{nv['boot-args']}'")
+arc_flags = ' '.join(t for t in tokens if t.startswith('arc') or t.startswith('-arc')) or '(none)'
+print(f"[OK] Updated OpenCore config.plist [{effective_desc}]: arc_flags='{arc_flags}', IONDRVSupport blocked={block_iondrv}")
 PY
 }
 
 FORCE_ARG="${2:-}"
 
-if [ "$MODE" = "--enable-dual-metal" ]; then
+if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
+    update_oc_config "safe-stage1"
+elif [ "$MODE" = "--enable-dual-metal" ]; then
     install_auxkc_arcfb_arcaccel
     if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
         update_oc_config "dual-metal"
     else
         echo ""
         echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
-        echo "               Keeping arc_headless=1 DISABLED in config.plist so your desktop stays 100% clean on reboot."
+        echo "               Keeping ArcAccel DISABLED in config.plist so your desktop stays 100% clean on reboot."
         update_oc_config "safe-stage1" || true
     fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
@@ -388,27 +424,28 @@ elif [ "$MODE" = "--enable-arc-desktop" ]; then
     else
         echo ""
         echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
-        echo "               Refusing to block IONDRVSupport so your desktop stays 100% bootable."
+        echo "               Keeping ArcFB/ArcAccel DISABLED in config.plist so your desktop stays 100% bootable."
+        update_oc_config "safe-stage1" || true
     fi
 fi
 
 echo ""
 echo "=================================================================="
 echo " ArcMTL Setup COMPLETE!"
-if [ "$MODE" = "--enable-dual-metal" ]; then
+if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
+    echo " -> Reset OpenCore boot-args to safe Stage 1 (ArcXe only)."
+elif [ "$MODE" = "--enable-dual-metal" ]; then
     if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
-        echo " -> Stage 1 (ArcXe RCS0) & Stage 2 (Mesa ANV Vulkan 1.3) PASSED!"
-        echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc)!"
-        echo " -> After reboot, run: /usr/local/bin/mtl_offscreen_test"
-        echo " -> Once verified, switch to full Intel Arc Metal Desktop + Brightness anytime via:"
-        echo "      sudo diskutil mount EFI && sudo bash $0 --enable-arc-desktop && sudo reboot"
+        echo " -> Stage 1 (ArcXe BCS0+RCS0) & Stage 2 (Mesa ANV Vulkan 1.3) PASSED!"
+        echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (Intel Arc Display+Metal 3 + RTX 4070 Metal 3)!"
+        echo " -> After reboot, verify both GPUs in Metal 3 via: /usr/local/bin/mtl_offscreen_test"
     else
-        echo " -> SAFETY GUARD kept arc_headless=1 off so your desktop stays clean. Share the output above to debug!"
+        echo " -> SAFETY GUARD kept ArcAccel off so your desktop stays clean. Share the output above to debug!"
     fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
     echo " -> Next: Run 'sudo reboot' to boot full Intel Arc Metal 3 Desktop (ArcFB + ArcAccel)!"
 else
-    echo " -> To activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc): sudo bash $0 --enable-dual-metal && sudo reboot"
-    echo " -> To activate full Intel Arc Metal 3 Desktop (ArcFB):  sudo bash $0 --enable-arc-desktop && sudo reboot"
+    echo " -> To activate Dual-GPU Metal 3 (Intel Arc + RTX 4070): sudo bash $0 --enable-dual-metal && sudo reboot"
+    echo " -> To reset to Stage 1 safe mode anytime:               sudo bash $0 --disable-arc-accel && sudo reboot"
 fi
 echo "=================================================================="

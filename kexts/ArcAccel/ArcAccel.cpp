@@ -81,7 +81,7 @@ static constexpr unsigned kArcMaxFB = 4;
 static int      gArcAccelArmed      = 0;
 static int      gArcHeadless        = 0;
 static int      gArcIopEnabled      = 1;
-static int      gArcIopFlip         = 1;
+static int      gArcIopFlip         = 0;
 static unsigned gArcHeadsPublished  = 0;
 static unsigned gArcHeadsRegistered = 0;
 static unsigned gArcHeadsPiped      = 0;
@@ -409,12 +409,34 @@ public:
     unsigned registerPendingLocked(const char *why) {
         if (!fDM) return 0;
         unsigned added = 0;
+        const uint8_t *dm = reinterpret_cast<const uint8_t *>(fDM);
         for (unsigned i = 0; i < kArcMaxFB; i++) {
             IOService *fb = fFBs[i];
             if (!fb) break;
             if (fFBRegistered & (1u << i)) continue;
 
             const unsigned before = fDM->getFramebufferCount();
+            bool alreadyInDm = false;
+            for (unsigned s = 0; s < before && s < 16; s++) {
+                void *existingPipe = *reinterpret_cast<void *const volatile *>(dm + 0x88 + 8 * s);
+                if (existingPipe) {
+                    IOService *pfb = *reinterpret_cast<IOService *const volatile *>(
+                                         reinterpret_cast<const uint8_t *>(existingPipe) + 0x98);
+                    if (pfb == fb) {
+                        alreadyInDm = true;
+                        fFBRegistered |= (1u << i);
+                        gArcHeadsRegistered = fFBRegistered;
+                        gArcHeadsPiped |= (1u << i);
+                        added++;
+                        AALOG("%s: head %u (%s) already bound by family sweep to pipe %u (%p)",
+                              why, i, fb->getName(), s, existingPipe);
+                        break;
+                    }
+                }
+            }
+            if (alreadyInDm)
+                continue;
+
             AALOG("%s: calling found_framebuffer(%s head %u) count_before=%u", why, fb->getName(), i, before);
             fDM->found_framebuffer(reinterpret_cast<IOFramebuffer *>(fb));
             const unsigned after = fDM->getFramebufferCount();
@@ -425,7 +447,6 @@ public:
                 AALOG("%s: head %u not added by family (%u -> %u)", why, i, before, after);
                 break;
             }
-            const uint8_t *dm = reinterpret_cast<const uint8_t *>(fDM);
             void *pipe = (before < 16) ? *reinterpret_cast<void *const volatile *>(dm + 0x88 + 8 * before) : nullptr;
             if (!pipe) {
                 *reinterpret_cast<volatile uint32_t *>(const_cast<uint8_t *>(dm) + 0x108) = before;
@@ -440,10 +461,10 @@ public:
     }
 
     void armDesktopAcceleratorLocked() {
-        deliverModeChange();
-        gArcAccelArmed = 1;
         if (gArcIopEnabled)
             publishDisplayPipeCapabilities(true);
+        deliverModeChange();
+        gArcAccelArmed = 1;
         if (fSavedMetalPlugin && !getProperty("MetalPluginName")) {
             setProperty("MetalPluginName", fSavedMetalPlugin);
             AALOG("MetalPluginName restored -> WindowServer & apps can now load ArcMTLDriver.bundle");
@@ -534,6 +555,9 @@ public:
             return false;
         }
 
+        uint32_t flipArg = 0;
+        if (PE_parse_boot_argn("arcflip", &flipArg, sizeof(flipArg)))
+            gArcIopFlip = flipArg ? 1 : 0;
         uint32_t noFlip = 0;
         if (PE_parse_boot_argn("-arcnoflip", &noFlip, sizeof(noFlip)))
             gArcIopFlip = 0;
@@ -569,11 +593,43 @@ public:
         arcAccelInstallSysctls();
 
         if (isHeadlessMode) {
-            /* Dual-GPU Mode: IONDRVFramebuffer/RTX 4070 owns WindowServer; Intel Arc iGPU is 2nd Metal 3 device */
+            /*
+             * Optimus Boot-Display Safety Guard:
+             * If 00:02.0 (Intel Arc) physically owns the active UEFI GOP boot display (AAPL,boot-display)
+             * while ArcFB/arcaccel=1 is NOT active, publishing MetalPluginName in headless mode would make
+             * CoreDisplay demand a MetalDevice on 00:02.0 for WindowServer — which headless mode refuses,
+             * causing WindowServer to abort at the Apple logo ("Failed to create MetalDevice").
+             * Withhold MetalPluginName in that topology so WindowServer boots cleanly on IONDRVFramebuffer!
+             */
+            bool ownsUnaccelBootDisplay = (pci->getProperty("AAPL,boot-display") == kOSBooleanTrue);
+            if (!ownsUnaccelBootDisplay) {
+                if (OSIterator *cit = pci->getClientIterator()) {
+                    while (OSObject *co = cit->getNextObject()) {
+                        IOService *cs = OSDynamicCast(IOService, co);
+                        if (cs && cs->metaCast("IOFramebuffer") && !cs->metaCast("ArcFB")) {
+                            ownsUnaccelBootDisplay = true;
+                            break;
+                        }
+                    }
+                    cit->release();
+                }
+            }
             setProperty("ArcAccelHeadless", kOSBooleanTrue);
             setProperty("NMXAccelHeadless", kOSBooleanTrue);
+            if (ownsUnaccelBootDisplay) {
+                if (OSObject *mp = getProperty("MetalPluginName")) {
+                    mp->retain();
+                    fSavedMetalPlugin = mp;
+                    removeProperty("MetalPluginName");
+                }
+                registerService();
+                AALOG("headless guard: %04x:%04x owns the boot display without ArcFB — MetalPluginName withheld "
+                      "so WindowServer boots cleanly on IONDRVFramebuffer (use arcfb=1 arcaccel=1 for Metal desktop)",
+                      pci->configRead16(0), pci->configRead16(2));
+                return true;
+            }
             registerService();
-            AALOG("READY in Dual-GPU Headless Mode (WindowServer detached; Metal apps see Intel Arc)");
+            AALOG("READY in Dual-GPU Headless Mode (WindowServer on dGPU; Metal apps see Intel Arc)");
             return true;
         }
 
@@ -664,7 +720,8 @@ void *ArcResource::getApertureMemoryDescriptor(unsigned long long *offsetOut)
     if (offsetOut) *offsetOut = 0;
     if (fApDesc) return fApDesc;
     ArcVidMemory *m = arcResVidMem(this);
-    if (!m || !m->fPhys || !m->fBytes)
+    /* Only contiguous scanout ranges may wrap a physical range; UMA buffers use scattered pages in fUmaBuf */
+    if (!m || !m->fScanout || !m->fPhys || !m->fBytes)
         return nullptr;
     fApDesc = IODeviceMemory::withRange((IOPhysicalAddress)m->fPhys, (IOPhysicalLength)m->fBytes);
     return fApDesc;

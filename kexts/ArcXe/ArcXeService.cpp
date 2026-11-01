@@ -554,11 +554,24 @@ IOReturn ArcXeService::callPlatformFunction(const OSSymbol *functionName, bool w
             uint64_t now = 0;
             clock_get_uptime(&now);
 
+            auto flushScanoutCache = [](IOMemoryMap *m, uint64_t bytes) {
+                if (!m || !m->getVirtualAddress() || !bytes)
+                    return;
+                const uint64_t len = (bytes <= m->getLength()) ? bytes : m->getLength();
+                const uintptr_t start = static_cast<uintptr_t>(m->getVirtualAddress()) & ~static_cast<uintptr_t>(63u);
+                const uintptr_t end   = (static_cast<uintptr_t>(m->getVirtualAddress()) + (uintptr_t)len + 63u) & ~static_cast<uintptr_t>(63u);
+                for (uintptr_t p = start; p < end; p += 64u) {
+                    __asm__ __volatile__("clflush (%0)" :: "r"(reinterpret_cast<const void *>(p)) : "memory");
+                }
+                __asm__ __volatile__("mfence" ::: "memory");
+            };
+
             IOLockLock(fEngineLock);
             /* 1. Fast path: already pinned in scanout LRU cache */
             for (uint32_t i = 0; i < kMaxScanoutPins; i++) {
                 if (fScanoutPins[i].md == md) {
                     fScanoutPins[i].lastUsedTick = now;
+                    flushScanoutCache(fScanoutPins[i].kernMap, req->size);
                     req->out_ggtt_offset = fScanoutPins[i].ggttOffset;
                     req->status = 0;
                     IOLockUnlock(fEngineLock);
@@ -581,23 +594,39 @@ IOReturn ArcXeService::callPlatformFunction(const OSSymbol *functionName, bool w
 
             if (!foundEmpty && fScanoutPins[victim].md) {
                 freeGgttRange(fScanoutPins[victim].ggttOffset, fScanoutPins[victim].ggttSize);
+                if (fScanoutPins[victim].kernMap) {
+                    fScanoutPins[victim].kernMap->release();
+                    fScanoutPins[victim].kernMap = nullptr;
+                }
+                if (fScanoutPins[victim].prepared) {
+                    fScanoutPins[victim].md->complete();
+                    fScanoutPins[victim].prepared = false;
+                }
                 fScanoutPins[victim].md->release();
-                fScanoutPins[victim].md = nullptr;
+                fScanoutPins[victim] = {};
             }
 
-            /* 3. Bind Display scanout surface into GGTT with WT non-coherent scanout PAT */
+            /* 3. Wire IOSurface pages & bind Display scanout surface into GGTT with WT non-coherent scanout PAT */
+            const bool prepOk = (md->prepare() == kIOReturnSuccess);
             uint32_t ggttOff = 0, ggttSz = 0;
             if (!allocGgttAndBind(md, req->size, ARC_MTL_PAT_IDX_WT_NONCOH, &ggttOff, &ggttSz)) {
+                if (prepOk)
+                    md->complete();
                 req->status = -1;
                 IOLockUnlock(fEngineLock);
                 return kIOReturnNoResources;
             }
 
+            IOMemoryMap *kmap = md->map(kIOMapReadOnly);
+            flushScanoutCache(kmap, req->size);
+
             md->retain();
             fScanoutPins[victim].md           = md;
+            fScanoutPins[victim].kernMap      = kmap;
             fScanoutPins[victim].ggttOffset   = ggttOff;
             fScanoutPins[victim].ggttSize     = ggttSz;
             fScanoutPins[victim].lastUsedTick = now;
+            fScanoutPins[victim].prepared     = prepOk;
 
             req->out_ggtt_offset = ggttOff;
             req->status = 0;
@@ -614,6 +643,8 @@ IOReturn ArcXeService::callPlatformFunction(const OSSymbol *functionName, bool w
                 if ((md && fScanoutPins[i].md == md) ||
                     (req->out_ggtt_offset && fScanoutPins[i].ggttOffset == req->out_ggtt_offset)) {
                     freeGgttRange(fScanoutPins[i].ggttOffset, fScanoutPins[i].ggttSize);
+                    if (fScanoutPins[i].kernMap) fScanoutPins[i].kernMap->release();
+                    if (fScanoutPins[i].prepared && fScanoutPins[i].md) fScanoutPins[i].md->complete();
                     if (fScanoutPins[i].md) fScanoutPins[i].md->release();
                     fScanoutPins[i] = {};
                 }

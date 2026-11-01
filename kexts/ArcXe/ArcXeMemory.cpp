@@ -113,6 +113,14 @@ void ArcXeService::teardownGgtt()
     for (uint32_t i = 0; i < kMaxScanoutPins; i++) {
         if (fScanoutPins[i].md) {
             freeGgttRange(fScanoutPins[i].ggttOffset, fScanoutPins[i].ggttSize);
+            if (fScanoutPins[i].kernMap) {
+                fScanoutPins[i].kernMap->release();
+                fScanoutPins[i].kernMap = nullptr;
+            }
+            if (fScanoutPins[i].prepared) {
+                fScanoutPins[i].md->complete();
+                fScanoutPins[i].prepared = false;
+            }
             fScanoutPins[i].md->release();
             fScanoutPins[i].md = nullptr;
         }

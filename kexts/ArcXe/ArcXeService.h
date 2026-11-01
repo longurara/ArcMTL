@@ -28,6 +28,7 @@
 
 static constexpr uint32_t kArcMaxClients        = 128;
 static constexpr uint32_t kArcMaxBosPerClient   = 4096;
+static constexpr uint32_t kArcMaxUserPtrBinds   = 2048;
 static constexpr uint32_t kArcMaxVmsPerClient   = 64;
 static constexpr uint32_t kArcMaxQueuesPerClient= 64;
 static constexpr uint32_t kArcMaxSyncobjs       = 2048;
@@ -176,9 +177,11 @@ public:
     /* Scanout GGTT Pin Cache for ArcAccel Zero-Copy Page Flips */
     struct PinnedScanoutSlot {
         IOMemoryDescriptor     *md;
+        IOMemoryMap            *kernMap;
         uint32_t                ggttOffset;
         uint32_t                ggttSize;
         uint64_t                lastUsedTick;
+        bool                    prepared;
     };
     static constexpr uint32_t   kMaxScanoutPins     = 12;
     PinnedScanoutSlot           fScanoutPins[kMaxScanoutPins] = {};
@@ -252,6 +255,13 @@ public:
                                     void *param1, void *param2, void *param3, void *param4) override;
 };
 
+struct ArcUserPtrBind {
+    uint32_t                    vmId;
+    uint64_t                    gpuVa;
+    uint64_t                    size;
+    ArcBo                      *bo;
+};
+
 class ArcXeUserClient : public IOUserClient {
     OSDeclareDefaultStructors(ArcXeUserClient)
 
@@ -264,10 +274,12 @@ private:
     ArcVm                      *fVms[kArcMaxVmsPerClient]       = {};
     ArcExecQueue               *fQueues[kArcMaxQueuesPerClient] = {};
     ArcSyncobj                  fSyncobjs[kArcMaxSyncobjs]      = {};
+    ArcUserPtrBind             *fUserPtrBinds                   = nullptr;
 
     ArcBo        *lookupBoLocked(uint32_t handle) const;
     ArcVm        *lookupVmLocked(uint32_t vmId) const;
     ArcExecQueue *lookupQueueLocked(uint32_t queueId) const;
+    void          releaseUserPtrBinds(uint32_t vmId, uint64_t gpuVa, uint64_t rangeSize, bool allInVm);
 
 public:
     bool     initWithTask(task_t owningTask, void *securityToken, UInt32 type, OSDictionary *properties) override;
