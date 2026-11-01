@@ -104,8 +104,9 @@ codesign -f -s - "$DEST"
 
 cp -f "$ROOT/mesa-anv/intel_icd.json" "$OUT_DIR/intel_icd.json"
 
-# Verify Vulkan ICD entrypoints exist
-if ! nm -gU "$DEST" | awk '{print $3}' | grep -Eq '^(_vk_icdGetInstanceProcAddr|_vkGetInstanceProcAddr)$'; then
+# Verify Vulkan ICD entrypoints exist (avoid SIGPIPE on llvm-nm under set -o pipefail)
+ICD_SYMS="$(nm -gU "$DEST" | awk '{print $3}')"
+if ! grep -Eq '^(_vk_icdGetInstanceProcAddr|_vkGetInstanceProcAddr)$' <<<"$ICD_SYMS"; then
     echo "[ERROR] $DEST does not export vk_icdGetInstanceProcAddr / vkGetInstanceProcAddr!"
     exit 3
 fi

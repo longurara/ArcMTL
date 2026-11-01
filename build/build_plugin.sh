@@ -44,6 +44,7 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
     cd "$PLUGIN_BUILD_SRC"
     xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O2 $RDEF \
         -Wno-protocol -Wno-incomplete-implementation -Wno-deprecated-declarations \
+        -Wno-objc-protocol-method-implementation \
         -I"$VULKAN_INC" -I"$PLUGIN_BUILD_SRC" \
         -o "$BUNDLE_MACOS/ArcMTLDriver" \
         "$PLUGIN_BUILD_SRC/ArcMTLDevice.m" \
@@ -58,12 +59,13 @@ cp -f "$ROOT/plugin/Info.plist" "$BUNDLE_CONTENTS/Info.plist"
 cp -f "$ROOT/plugin/arcmtl-allow.txt" "$OUT_GPUBUNDLES/arcmtl-allow.txt"
 
 # Verify Dual-GPU Objective-C runtime class isolation (ArcMTLDevice present, zero NVMTL* classes)
-if ! nm -gU "$BUNDLE_MACOS/ArcMTLDriver" | grep -q '_OBJC_CLASS_\$_ArcMTLDevice'; then
+PLUGIN_SYMS="$(nm -gU "$BUNDLE_MACOS/ArcMTLDriver")"
+if ! grep -Fq '_OBJC_CLASS_$_ArcMTLDevice' <<<"$PLUGIN_SYMS"; then
     echo "[ERROR] _OBJC_CLASS_\$_ArcMTLDevice missing from $BUNDLE_MACOS/ArcMTLDriver!"
     exit 2
 fi
 
-COLLISIONS="$(nm -gU "$BUNDLE_MACOS/ArcMTLDriver" | grep '_OBJC_CLASS_\$_NVMTL' || true)"
+COLLISIONS="$(grep -F '_OBJC_CLASS_$_NVMTL' <<<"$PLUGIN_SYMS" || true)"
 if [ -n "$COLLISIONS" ]; then
     echo "[ERROR] Found colliding NVMTL* ObjC class symbols in ArcMTLDriver:"
     echo "$COLLISIONS"
