@@ -426,6 +426,59 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
      *   3. LRI_CS_MMIO(CS_DEBUG_MODE2, INSTRUCTION_STATE_CACHE_INV) — Wa_18022495364
      *   4. Zeroed 3DSTATE_MESH_CONTROL — Wa_14019789679 (initial run uses RESTORE_INHIBIT=1)
      */
+    static const struct { uint32_t instr; uint16_t numDw; } kXeHpgSvgState[] = {
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x15), 11 }, /* 3DSTATE_CONSTANT_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x19), 11 }, /* 3DSTATE_CONSTANT_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1A), 11 }, /* 3DSTATE_CONSTANT_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x16), 11 }, /* 3DSTATE_CONSTANT_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x09), 69 }, /* 3DSTATE_VERTEX_ELEMENTS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x55),  5 }, /* 3DSTATE_VF_COMPONENT_PACKING */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x4A),  2 }, /* 3DSTATE_VF_SGVS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x56),  3 }, /* 3DSTATE_VF_SGVS_2 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x10),  9 }, /* 3DSTATE_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x26),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2B),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x58),  3 }, /* 3DSTATE_URB_ALLOC_VS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1E),  5 }, /* 3DSTATE_STREAMOUT */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x60),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_0 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x61),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_1 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x62),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_2 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x63),  8 }, /* 3DSTATE_SO_BUFFER_INDEX_3 */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x12),  4 }, /* 3DSTATE_CLIP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x6C),  6 }, /* 3DSTATE_PRIMITIVE_REPLICATION */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x81),  2 }, /* 3DSTATE_CLIP_MESH */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x13),  4 }, /* 3DSTATE_SF */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x0F),  2 }, /* 3DSTATE_SCISSOR_STATE_POINTERS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x21),  2 }, /* 3DSTATE_VIEWPORT_STATE_POINTERS_SF_CLIP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x50),  5 }, /* 3DSTATE_RASTER */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x6E),  4 }, /* 3DSTATE_TBIMR_TILE_PASS_INFO */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x52),  6 }, /* 3DSTATE_WM_HZ_OP */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x0D),  2 }, /* 3DSTATE_MULTISAMPLE */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1B),  9 }, /* 3DSTATE_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x27),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2C),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x59),  3 }, /* 3DSTATE_URB_ALLOC_HS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7C),  3 }, /* 3DSTATE_TASK_CONTROL */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7D),  7 }, /* 3DSTATE_TASK_SHADER */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7E), 10 }, /* 3DSTATE_TASK_SHADER_DATA */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x80),  3 }, /* 3DSTATE_URB_ALLOC_TASK */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1C),  5 }, /* 3DSTATE_TE */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x79),  2 }, /* 3DSTATE_TASK_REDISTRIB */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x1D), 11 }, /* 3DSTATE_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x28),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2D),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x5A),  3 }, /* 3DSTATE_URB_ALLOC_DS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x11), 10 }, /* 3DSTATE_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x29),  2 }, /* 3DSTATE_BINDING_TABLE_POINTERS_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x2E),  2 }, /* 3DSTATE_SAMPLER_STATE_POINTERS_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x5B),  3 }, /* 3DSTATE_URB_ALLOC_GS */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x77),  3 }, /* 3DSTATE_MESH_CONTROL */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7B), 10 }, /* 3DSTATE_MESH_SHADER_DATA */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7F),  3 }, /* 3DSTATE_URB_ALLOC_MESH */
+        { ARC_GFXPIPE_3D_CMD(0x0, 0x7A),  8 }, /* 3DSTATE_MESH_SHADER */
+        { ARC_GFXPIPE_3D_CMD(0x1, 0x00),  4 }, /* 3DSTATE_DRAWING_RECTANGLE */
+    };
+
     uint32_t initDw = 0;
     q->ringCpu[initDw++] = ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE;
     if (isRcs) {
@@ -434,12 +487,15 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_DISABLE_STATE_CACHE_PERF_FIX);
 
         q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
-        q->ringCpu[initDw++] = ARC_RING_CS_DEBUG_MODE2(base);
+        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(0) */
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_INSTRUCTION_STATE_CACHE_INV);
 
-        q->ringCpu[initDw++] = ARC_CMD_3DSTATE_MESH_CONTROL;
-        q->ringCpu[initDw++] = 0u;
-        q->ringCpu[initDw++] = 0u;
+        for (const auto &st : kXeHpgSvgState) {
+            q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
+            for (uint16_t z = 1; z < st.numDw; z++) {
+                q->ringCpu[initDw++] = 0u;
+            }
+        }
     } else {
         q->ringCpu[initDw++] = ARC_MI_NOOP;
     }
