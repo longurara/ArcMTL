@@ -266,11 +266,12 @@ public:
         if (((uintptr_t)p & 0xFFFu) + 0x70u > 0x1000u)
             return;
 
+        const uint32_t maxFbCfg = gArcHeadless ? 0u : kArcMaxFB;
         *(uint64_t *)(p + 0x00) = reinterpret_cast<uint64_t>("IntelArcAccelerator");
         *(uint32_t *)(p + 0x08) = 0x30844300u;
         *(uint32_t *)(p + 0x0c) = 15u;          /* AccelCaps = 15 (Metal + DisplayPipe) */
         *(uint32_t *)(p + 0x18) = 8u;
-        *(uint32_t *)(p + 0x28) = kArcMaxFB;
+        *(uint32_t *)(p + 0x28) = maxFbCfg;
         *(uint32_t *)(p + 0x30) = 0x40004000u;  /* Max 2D texture 16384 x 16384 */
         *(uint32_t *)(p + 0x34) = 0x00008000u;
         *(uint32_t *)(p + 0x38) = 0x00008000u;
@@ -281,7 +282,7 @@ public:
         *(uint64_t *)(p + 0x50) = 0x7FFFFFFF0000001FULL;
         *(uint64_t *)(p + 0x58) = 0x0000000C00000000ULL;
         *(uint32_t *)(p + 0x64) = 0x4Bu;
-        AALOG("populateAccelConfig(%p) -> IntelArcAccelerator (UMA=1, maxFB=%u, maxTex=16384)", p, kArcMaxFB);
+        AALOG("populateAccelConfig(%p) -> IntelArcAccelerator (UMA=1, maxFB=%u, maxTex=16384)", p, maxFbCfg);
     }
 
     bool configureDevice(IOPCIDevice *pci) APPLE_KEXT_OVERRIDE {
@@ -543,10 +544,17 @@ public:
         if (PE_parse_boot_argn("-arcmanualfb", &manualFb, sizeof(manualFb)))
             fManualFbArm = true;
 
+        const bool isHeadlessMode = (wantHeadless && !wantDesktop);
+        gArcHeadless = isHeadlessMode ? 1 : 0;
+        if (isHeadlessMode) {
+            /* Keep IOAcceleratorFamily2 completely detached from IONDRVFramebuffer display pipes on 00:02.0 */
+            gArcIopEnabled = 0;
+        }
+
         fPCI = pci;
         AALOG("Starting IOGraphicsAccelerator2 on Intel Arc %04x:%04x (mode=%s)",
               pci->configRead16(0), pci->configRead16(2),
-              (wantHeadless && !wantDesktop) ? "Dual-GPU Headless Metal 3" : "Primary Desktop Display+Metal 3");
+              isHeadlessMode ? "Dual-GPU Headless Metal 3" : "Primary Desktop Display+Metal 3");
 
         if (!IOGraphicsAccelerator2::start(provider)) {
             AALOG("IOGraphicsAccelerator2::start failed");
@@ -560,13 +568,12 @@ public:
         enableFromHook("start");
         arcAccelInstallSysctls();
 
-        if (wantHeadless && !wantDesktop) {
-            /* Dual-GPU Mode: RTX 4070 owns WindowServer; Intel Arc iGPU is exposed as 2nd Metal 3 device for apps */
-            gArcHeadless = 1;
+        if (isHeadlessMode) {
+            /* Dual-GPU Mode: IONDRVFramebuffer/RTX 4070 owns WindowServer; Intel Arc iGPU is 2nd Metal 3 device */
             setProperty("ArcAccelHeadless", kOSBooleanTrue);
             setProperty("NMXAccelHeadless", kOSBooleanTrue);
             registerService();
-            AALOG("READY in Dual-GPU Headless Mode (WindowServer stays on RTX 4070; Metal apps see Intel Arc)");
+            AALOG("READY in Dual-GPU Headless Mode (WindowServer detached; Metal apps see Intel Arc)");
             return true;
         }
 

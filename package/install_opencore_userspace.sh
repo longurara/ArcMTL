@@ -123,21 +123,30 @@ xattr -cr "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" 2>/dev/null || true
 
 echo ""
 echo "[4/5] Running LIVE Intel Arc Xe-LPG hardware & Vulkan 1.3 tests..."
+PROBE_OK=0
+VK_OK=0
 if [ -x /usr/local/bin/arc_probe ]; then
     echo "--- [Test A] arc_probe (48-bit PPGTT + RCS0 128-EU Command Streamer) ---"
-    /usr/local/bin/arc_probe || echo "[WARN] arc_probe returned non-zero"
+    if /usr/local/bin/arc_probe; then
+        PROBE_OK=1
+    else
+        echo "[WARN] arc_probe returned non-zero"
+    fi
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
-    echo "--- [Test B] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Triangle Render) ---"
-    VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test /var/tmp/arc_vk_test.ppm \
-        && echo "[OK] Vulkan 1.3 offscreen triangle rendered to /var/tmp/arc_vk_test.ppm" \
-        || echo "[WARN] vk_offscreen_test returned non-zero"
+    echo "--- [Test B] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
+    if VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
+        VK_OK=1
+        echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
+    else
+        echo "[WARN] vk_offscreen_test returned non-zero"
+    fi
 fi
 if (kmutil showloaded --list-only 2>/dev/null || kextstat 2>/dev/null) | grep -q "com\.arc\.ArcAccel"; then
     if [ -x /usr/local/bin/mtl_offscreen_test ]; then
         echo "--- [Test C] mtl_offscreen_test (Metal 3 MTLCopyAllDevices + Render/Compute) ---"
-        /usr/local/bin/mtl_offscreen_test /var/tmp/arc_mtl_test.ppm \
-            && echo "[OK] Metal 3 render saved to /var/tmp/arc_mtl_test.ppm" \
+        /usr/local/bin/mtl_offscreen_test \
+            && echo "[OK] Metal 3 end-to-end render & compute verification PASSED!" \
             || echo "[WARN] mtl_offscreen_test returned non-zero"
     fi
 fi
@@ -309,7 +318,7 @@ install_auxkc_arcfb_arcaccel() {
 update_oc_config() {
     local target_mode="$1"
     local plist=""
-    for candidate in /Volumes/EFI/EFI/OC/config.plist /Volumes/ESP/EFI/OC/config.plist "$SCRIPT_DIR/../EFI/OC/config.plist"; do
+    for candidate in /Volumes/OPENCORE/EFI/OC/config.plist /Volumes/EFI/EFI/OC/config.plist /Volumes/ESP/EFI/OC/config.plist "$SCRIPT_DIR/../EFI/OC/config.plist"; do
         if [ -f "$candidate" ]; then
             plist="$candidate"
             break
@@ -358,22 +367,42 @@ print(f"[OK] Updated OpenCore config.plist ({mode}): IONDRVSupport blocked={bloc
 PY
 }
 
+FORCE_ARG="${2:-}"
+
 if [ "$MODE" = "--enable-dual-metal" ]; then
     install_auxkc_arcfb_arcaccel
-    update_oc_config "dual-metal"
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
+        update_oc_config "dual-metal"
+    else
+        echo ""
+        echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
+        echo "               Keeping arc_headless=1 DISABLED in config.plist so your desktop stays 100% clean on reboot."
+        update_oc_config "safe-stage1" || true
+    fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
     install_auxkc_arcfb_arcaccel
-    update_oc_config "arc-desktop"
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
+        update_oc_config "arc-desktop"
+    else
+        echo ""
+        echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
+        echo "               Refusing to block IONDRVSupport so your desktop stays 100% bootable."
+    fi
 fi
 
 echo ""
 echo "=================================================================="
 echo " ArcMTL Setup COMPLETE!"
 if [ "$MODE" = "--enable-dual-metal" ]; then
-    echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc)!"
-    echo " -> After reboot, run: /usr/local/bin/mtl_offscreen_test /var/tmp/arc_mtl_test.ppm"
-    echo " -> Once verified, switch to full Intel Arc Metal Desktop + Brightness anytime via:"
-    echo "      sudo diskutil mount EFI && sudo bash $0 --enable-arc-desktop && sudo reboot"
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
+        echo " -> Stage 1 (ArcXe RCS0) & Stage 2 (Mesa ANV Vulkan 1.3) PASSED!"
+        echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (RTX 4070 + Intel Arc)!"
+        echo " -> After reboot, run: /usr/local/bin/mtl_offscreen_test"
+        echo " -> Once verified, switch to full Intel Arc Metal Desktop + Brightness anytime via:"
+        echo "      sudo diskutil mount EFI && sudo bash $0 --enable-arc-desktop && sudo reboot"
+    else
+        echo " -> SAFETY GUARD kept arc_headless=1 off so your desktop stays clean. Share the output above to debug!"
+    fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
     echo " -> Next: Run 'sudo reboot' to boot full Intel Arc Metal 3 Desktop (ArcFB + ArcAccel)!"
 else

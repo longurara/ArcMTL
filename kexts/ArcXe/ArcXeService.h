@@ -71,7 +71,7 @@ struct ArcExecQueue {
     uint16_t                    engineInstance;
     uint32_t                    mmioBase;
     uint32_t                    swCtxId;
-    ArcBo                      *lrcBo;          /* [0..16K): Ring | [16K..20K): PPHWSP | [20K..36K): Context Image */
+    ArcBo                      *lrcBo;          /* [0..16K): Ring | [16K..20K): PPHWSP | [20K..+56K): Context Image */
     uint32_t                    ringGgttAddr;
     uint32_t                    pphwspGgttAddr;
     uint32_t                    ctxImgGgttAddr;
@@ -182,6 +182,7 @@ public:
     void forceWakePut();
     void readTopologyAndClocks();
     void programMtlPatTable();
+    void programMtlMocsTable();
     void invalidateGlobalTlb();
 
     /* Memory & Page Table Subsystem (ArcXeMemory.cpp) */

@@ -245,7 +245,15 @@ jobs:
           [ -f "/System/Library/Kernels/kernel" ] && KM_ARGS+=(--kernel "/System/Library/Kernels/kernel")
           sudo kmutil create -n aux --volume-root / "${KM_ARGS[@]}" -B "$KB" -S "$KS" --repository "$STAGE/Extensions" -A "$STAGE/test_aux.kc" -z
           sudo rm -rf "$STAGE"
-          tar -czf ArcKexts-macos26-15-x86_64.tar.gz -C out kexts
+          mkdir -p out/tools
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -O2 -Wall -I"$PWD/include" \
+            tools/arc_probe.c -o out/tools/arc_probe \
+            -framework IOKit -framework CoreFoundation
+          xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -fobjc-arc -O2 -Wall \
+            tools/mtl_offscreen_test.m -o out/tools/mtl_offscreen_test \
+            -framework Foundation -framework Metal -framework IOSurface
+          codesign -f -s - out/tools/arc_probe out/tools/mtl_offscreen_test
+          tar -czf ArcKexts-macos26-15-x86_64.tar.gz -C out kexts tools
 
       - name: Upload Fast Kexts Artifact
         uses: actions/upload-artifact@v4

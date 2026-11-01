@@ -134,8 +134,24 @@ static inline bool arcIsSupportedXeLpgDevice(uint16_t vendor, uint16_t device)
 #define ARC_REG_CCS0_CCS1_INTR_MASK         0x190100u
 
 /* ============================================================================
- * 3. Page Attribute Table (PAT) & GGTT / 48-bit PPGTT PTE Encodings (Xe-LPG)
+ * 3. Page Attribute Table (PAT), MOCS & GGTT / 48-bit PPGTT PTE Encodings (Xe-LPG)
  * ============================================================================ */
+#define ARC_REG_MTL_MCR_SELECTOR            0x000FD4u
+#define   ARC_MCR_MULTICAST                 (1u << 31)
+
+#define ARC_REG_GLOBAL_MOCS(i)              (0x004000u + (uint32_t)(i) * 4u)
+#define   ARC_MOCS_IG_PAT                   (1u << 8)
+#define   ARC_MOCS_L4_WB                    (0u << 2)
+#define   ARC_MOCS_L4_WT                    (1u << 2)
+#define   ARC_MOCS_L4_UC                    (3u << 2)
+#define ARC_REG_LNCFCMOCS(i)                (0x00B020u + (uint32_t)(i) * 4u)
+#define   ARC_L3_LKUP                       (1u << 7)
+#define   ARC_L3_GLBGO                      (1u << 6)
+#define   ARC_L3_1_UC                       (1u << 4)
+#define   ARC_L3_3_WB                       (3u << 4)
+#define ARC_MTL_NUM_MOCS_ENTRIES            16u
+#define ARC_MTL_MOCS_UC_INDEX               9u
+
 #define ARC_REG_PAT_ATS                     0x0047FCu
 #define ARC_REG_PAT_INDEX(i)                ((i) < 8 ? (0x004800u + (uint32_t)(i) * 4u) \
                                                      : (0x004848u + ((uint32_t)(i) - 8u) * 4u))
@@ -277,22 +293,33 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define ARC_MI_ARB_ON_OFF                   (0x08u << 23)
 #define   ARC_MI_ARB_ENABLE                 (1u << 0)
 #define ARC_MI_BATCH_BUFFER_END             (0x0Au << 23)
+#define ARC_MI_BATCH_BUFFER_END_CTX         ((0x0Au << 23) | 1u) /* BIT(0) = End Context Restore */
 #define ARC_MI_LOAD_REGISTER_IMM(n)         ((0x22u << 23) | (2u * (uint32_t)(n) - 1u))
+#define   ARC_MI_LRI_FORCE_POSTED           (1u << 12)
+#define   ARC_MI_LRI_CS_MMIO                (1u << 19)
 #define ARC_MI_STORE_DATA_IMM               (0x20u << 23)
 #define   ARC_MI_SDI_USE_GGTT               (1u << 22)
-#define   ARC_MI_SDI_DWORD_LEN              2u            /* Total 4 dwords - 2 */
-#define   ARC_MI_SDI_QWORD_LEN              3u            /* Total 5 dwords - 2 */
+#define   ARC_MI_SDI_DWORD_LEN              2u                   /* MI_SDI_NUM_DW(1): 4 dwords - 2 */
+#define   ARC_MI_SDI_QWORD_LEN              ((1u << 21) | 3u)    /* MI_SDI_NUM_QW(1): BIT(21) | (5 - 2) */
 #define ARC_MI_FLUSH_DW                     (0x26u << 23)
 #define   ARC_MI_FLUSH_DW_STORE_INDEX       (1u << 21)
 #define   ARC_MI_FLUSH_DW_INV_TLB           (1u << 18)
 #define   ARC_MI_FLUSH_DW_OP_STOREDW        (1u << 14)
+#define   ARC_MI_FLUSH_DW_IMM_LEN           2u                   /* 4-dword MI_FLUSH_DW length (4 - 2) */
 #define   ARC_MI_FLUSH_DW_USE_GGTT          (1u << 2)
 #define ARC_MI_BATCH_BUFFER_START_PPGTT     ((0x31u << 23) | (1u << 8) | 1u) /* 3 dwords, PPGTT (bit 8) */
 #define ARC_MI_BATCH_BUFFER_START_GGTT      ((0x31u << 23) | 1u)             /* 3 dwords, GGTT */
 
 /* 3D Pipeline PIPE_CONTROL (6 dwords on Gen12 / Xe-LPG) */
 #define ARC_GFX_OP_PIPE_CONTROL(len)        ((0x3u << 29) | (0x3u << 27) | (0x2u << 24) | ((uint32_t)(len) - 2u))
-#define   ARC_PC_GROUP0_HDC_FLUSH           (1u << 9)
+/* Dword 0 flags */
+#define   ARC_PC0_L3_RO_CACHE_INVALIDATE    (1u << 10)
+#define   ARC_PC0_HDC_PIPELINE_FLUSH        (1u << 9)
+#define   ARC_PC_GROUP0_HDC_FLUSH           ARC_PC0_HDC_PIPELINE_FLUSH
+/* Dword 1 flags */
+#define   ARC_PC_CMD_CACHE_INVALIDATE       (1u << 29)
+#define   ARC_PC_TILE_CACHE_FLUSH           (1u << 28)
+#define   ARC_PC_GLOBAL_GTT                 (1u << 24)    /* PIPE_CONTROL_GLOBAL_GTT_IVB (in dword 1!) */
 #define   ARC_PC_CS_STALL                   (1u << 20)
 #define   ARC_PC_TLB_INVALIDATE             (1u << 18)
 #define   ARC_PC_QW_WRITE                   (1u << 14)
@@ -303,11 +330,11 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_PC_INDIRECT_STATE_DISABLE     (1u << 9)
 #define   ARC_PC_FLUSH_ENABLE               (1u << 7)
 #define   ARC_PC_DC_FLUSH_ENABLE            (1u << 5)
+#define   ARC_PC_VF_CACHE_INVALIDATE        (1u << 4)
 #define   ARC_PC_CONST_CACHE_INVALIDATE     (1u << 3)
 #define   ARC_PC_STATE_CACHE_INVALIDATE     (1u << 2)
 #define   ARC_PC_STALL_AT_SCOREBOARD        (1u << 1)
 #define   ARC_PC_DEPTH_CACHE_FLUSH          (1u << 0)
-#define   ARC_PC_POST_SYNC_GGTT             (1u << 2)     /* In dword 2 address */
 
 /* ============================================================================
  * 6. GuC v70 Firmware Loader & CTB Registers (mtl_guc_70.bin)

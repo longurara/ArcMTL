@@ -198,6 +198,51 @@ void ArcXeService::programMtlPatTable()
            rd32(ARC_REG_PAT_INDEX(4)));
 }
 
+void ArcXeService::programMtlMocsTable()
+{
+    /*
+     * Canonical Meteor Lake Xe-LPG MOCS Table (Linux drivers/gpu/drm/xe/xe_mocs.c: mtl_mocs_desc):
+     *   Mesa ANV tags buffers and surfaces with MOCS indices 1..15; IG_PAT (bit 8) MUST be set
+     *   on entries 1..15 so Xe-LPG honours our coherent UMA PPGTT/GGTT PAT attributes instead
+     *   of falling back to non-coherent MOCS 0. Unused indices (10..13) map to entry 1.
+     */
+    struct MocsEntry { uint32_t glob; uint16_t l3cc; };
+    static const MocsEntry kMtlMocs[ARC_MTL_NUM_MOCS_ENTRIES] = {
+        { 0u,                                   ARC_L3_LKUP | ARC_L3_3_WB },               /*  0: Error / Reserved */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_3_WB },               /*  1: Cached L3 + L4 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_1_UC },               /*  2: L4 - GO:L3 */
+        { ARC_MOCS_IG_PAT | ARC_MOCS_L4_UC,     ARC_L3_LKUP | ARC_L3_1_UC },               /*  3: Uncached - GO:L3 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_GLBGO | ARC_L3_1_UC },/*  4: L4 - GO:Mem */
+        { ARC_MOCS_IG_PAT | ARC_MOCS_L4_UC,     ARC_L3_LKUP | ARC_L3_GLBGO | ARC_L3_1_UC },/*  5: Uncached - GO:Mem */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_1_UC },                             /*  6: L4 - L3:NoLKUP; GO:L3 */
+        { ARC_MOCS_IG_PAT | ARC_MOCS_L4_UC,     ARC_L3_1_UC },                             /*  7: UC - L3:NoLKUP; GO:L3 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_GLBGO | ARC_L3_1_UC },              /*  8: L4 - L3:NoLKUP; GO:Mem */
+        { ARC_MOCS_IG_PAT | ARC_MOCS_L4_UC,     ARC_L3_GLBGO | ARC_L3_1_UC },              /*  9: UC - L3:NoLKUP; GO:Mem */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_3_WB },               /* 10: Unused -> entry 1 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_3_WB },               /* 11: Unused -> entry 1 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_3_WB },               /* 12: Unused -> entry 1 */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_LKUP | ARC_L3_3_WB },               /* 13: Unused -> entry 1 */
+        { ARC_MOCS_IG_PAT | ARC_MOCS_L4_WT,     ARC_L3_LKUP | ARC_L3_3_WB },               /* 14: Display L3 + L4:WT */
+        { ARC_MOCS_IG_PAT,                      ARC_L3_GLBGO | ARC_L3_1_UC },              /* 15: CCS Non-Displayable */
+    };
+
+    /* Ensure GT0 MCR steering is in multicast broadcast mode across all DSS/L3 banks */
+    const uint32_t prevMcr = rd32(ARC_REG_MTL_MCR_SELECTOR);
+    wr32(ARC_REG_MTL_MCR_SELECTOR, prevMcr | ARC_MCR_MULTICAST);
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+
+    for (uint32_t i = 0; i < ARC_MTL_NUM_MOCS_ENTRIES; i++) {
+        wr32(ARC_REG_GLOBAL_MOCS(i), kMtlMocs[i].glob);
+    }
+    for (uint32_t i = 0; i < (ARC_MTL_NUM_MOCS_ENTRIES / 2u); i++) {
+        const uint32_t l3pair = (uint32_t)kMtlMocs[2u * i].l3cc |
+                                ((uint32_t)kMtlMocs[2u * i + 1u].l3cc << 16);
+        wr32(ARC_REG_LNCFCMOCS(i), l3pair);
+    }
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+    AXELOG("Programmed Xe-LPG GLOBAL_MOCS[0..15] (IG_PAT=1) & LNCFCMOCS[0..7]");
+}
+
 void ArcXeService::invalidateGlobalTlb()
 {
     if (!forceWakeGet()) return;
@@ -311,6 +356,7 @@ bool ArcXeService::start(IOService *provider)
 
     readTopologyAndClocks();
     programMtlPatTable();
+    programMtlMocsTable();
 
     if (!initGgtt()) {
         forceWakePut();
