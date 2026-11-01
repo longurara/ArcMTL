@@ -9,6 +9,9 @@
 # Compiled outputs
 /out/
 
+# Local EFI & personal backups (never commit SMBIOS / serials)
+/backup/
+
 # OS & Editor metadata
 .DS_Store
 *.o
