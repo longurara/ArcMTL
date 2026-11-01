@@ -33,6 +33,8 @@
 #include <mach/kmod.h>
 #include <sys/sysctl.h>
 
+extern "C" void proc_selfname(char *buf, int size);
+
 #include "IOAccelerator.h"
 #include "IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
@@ -368,15 +370,27 @@ public:
      */
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
                            IOUserClient **handler) APPLE_KEXT_OVERRIDE {
+        char caller[32] = {};
+        proc_selfname(caller, sizeof(caller));
+        static volatile SInt32 sUcLogCnt = 0;
+        const SInt32 logSeq = OSIncrementAtomic(&sUcLogCnt) + 1;
+
         if ((type & 0xFFFF0000u) != ARC_XE_ACCEL_OPEN_TYPE) {
-            return IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
+            IOReturn famRc = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);
+            if (logSeq <= 24 || famRc != kIOReturnSuccess) {
+                AALOG("newUserClient(type=0x%x, proc=%s) -> family rc=0x%x uc=%s",
+                      (unsigned)type, caller[0] ? caller : "?", (unsigned)famRc,
+                      (famRc == kIOReturnSuccess && handler && *handler)
+                          ? (*handler)->getMetaClass()->getClassName() : "none");
+            }
+            return famRc;
         }
         if (!handler)
             return kIOReturnBadArgument;
 
         IOService *xe = getArcXeService();
         if (!xe) {
-            AALOG("newUserClient(0x%x): ArcXeService not found", (unsigned)type);
+            AALOG("newUserClient(0x%x, proc=%s): ArcXeService not found", (unsigned)type, caller);
             return kIOReturnNotAttached;
         }
         if (!fSymNewClient)
@@ -391,7 +405,8 @@ public:
             reinterpret_cast<void *>(static_cast<uintptr_t>(type & 0xFFFFu)),
             &uc, nullptr);
         if (rc != kIOReturnSuccess || !uc) {
-            AALOG("newUserClient(0x%x): ArcXeService refused bridge client (0x%x)", (unsigned)type, (unsigned)rc);
+            AALOG("newUserClient(0x%x, proc=%s): ArcXeService refused bridge client (0x%x)",
+                  (unsigned)type, caller, (unsigned)rc);
             return (rc != kIOReturnSuccess) ? rc : kIOReturnNoResources;
         }
 
@@ -400,24 +415,26 @@ public:
         for (unsigned i = 0; i < kArcCarriers && !carrier; i++)
             carrier = fCarriers[(startIdx + i) % kArcCarriers];
         if (!carrier) {
-            AALOG("newUserClient(0x%x): no IOAccelArcXeCarrier available", (unsigned)type);
+            AALOG("newUserClient(0x%x, proc=%s): no IOAccelArcXeCarrier available", (unsigned)type, caller);
             uc->release();
             return kIOReturnNoResources;
         }
         if (!uc->attach(carrier)) {
-            AALOG("newUserClient(0x%x): attach to carrier failed", (unsigned)type);
+            AALOG("newUserClient(0x%x, proc=%s): attach to carrier failed", (unsigned)type, caller);
             uc->release();
             return kIOReturnInternalError;
         }
         if (!uc->start(carrier)) {
-            AALOG("newUserClient(0x%x): start on carrier failed", (unsigned)type);
+            AALOG("newUserClient(0x%x, proc=%s): start on carrier failed", (unsigned)type, caller);
             uc->detach(carrier);
             uc->release();
             return kIOReturnInternalError;
         }
 
-        AALOGV("newUserClient(0x%x) -> %s attached under ArcAccel carrier",
-               (unsigned)type, uc->getMetaClass()->getClassName());
+        if (logSeq <= 24) {
+            AALOG("newUserClient(0x%x, proc=%s) -> %s attached under ArcAccel carrier",
+                  (unsigned)type, caller[0] ? caller : "?", uc->getMetaClass()->getClassName());
+        }
         *handler = uc;
         return kIOReturnSuccess;
     }
@@ -1032,8 +1049,12 @@ bool ArcDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 
 IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
-    if (!gArcIopEnabled)
+    if (!gArcIopEnabled) {
+        const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+        if (fn <= 4)
+            AALOG("iop fail #%lld: gArcIopEnabled == 0", (long long)fn);
         return (IOReturn)0xe00002c7; /* kIOReturnUnsupported */
+    }
     if (!txn) {
         OSAddAtomic64(1, &gCntArcFail);
         return kIOReturnBadArgument;
@@ -1043,7 +1064,10 @@ IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     unsigned head = 0;
     IOService *fb = a ? a->pipeFramebuffer(this, &head) : nullptr;
     if (!fb) {
-        OSAddAtomic64(1, &gCntArcFail);
+        const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+        if (fn <= 4)
+            AALOG("iop fail #%lld: pipeFramebuffer(%p) == nullptr (pipes=%u fbs_pub=0x%x)",
+                  (long long)fn, this, a ? a->fPipeCount : 0u, gArcHeadsPublished);
         return kIOReturnNotAttached;
     }
 
@@ -1056,7 +1080,10 @@ IOReturn ArcDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     ArcScanoutInfoReq scan = {};
     if (a->queryFbScanout(fb, &scan) != kIOReturnSuccess || !scan.width || !scan.height) {
-        OSAddAtomic64(1, &gCntArcFail);
+        const SInt64 fn = OSAddAtomic64(1, &gCntArcFail) + 1;
+        if (fn <= 4)
+            AALOG("iop fail #%lld: queryFbScanout(%s) failed (%ux%u)",
+                  (long long)fn, fb->getName(), scan.width, scan.height);
         return kIOReturnNotReady;
     }
 
@@ -1282,8 +1309,32 @@ static int arcaccelfb_sysctl SYSCTL_HANDLER_ARGS
     return 0;
 }
 
+static int arcaccel_metal_sysctl SYSCTL_HANDLER_ARGS
+{
+    ArcAccel *a = ArcAccel::gAccel;
+    int v = (a && a->getProperty("MetalPluginName") != nullptr) ? 1 : 0;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || req->newptr == 0)
+        return err;
+    if (!a) return ENXIO;
+    if (v >= 1) {
+        if (a->fSavedMetalPlugin) {
+            a->setProperty("MetalPluginName", a->fSavedMetalPlugin);
+        } else {
+            a->setProperty("MetalPluginName", "../../../Library/GPUBundles/ArcMTLDriver");
+        }
+        AALOG("sysctl debug.arcaccel_metal=1 -> MetalPluginName published for CLI testing");
+    } else {
+        a->removeProperty("MetalPluginName");
+        AALOG("sysctl debug.arcaccel_metal=0 -> MetalPluginName withheld");
+    }
+    return 0;
+}
+
 SYSCTL_PROC(_debug, OID_AUTO, arcaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             nullptr, 0, arcaccelfb_sysctl, "I", "Arm ArcFB display pipe with ArcAccel");
+SYSCTL_PROC(_debug, OID_AUTO, arcaccel_metal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            nullptr, 0, arcaccel_metal_sysctl, "I", "Publish MetalPluginName on ArcAccel without arming display pipes");
 SYSCTL_INT(_debug, OID_AUTO, arcaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN,
            &gArcHeadless, 0, "1 = Dual-GPU headless Metal 3 mode alongside RTX 4070");
 SYSCTL_INT(_debug, OID_AUTO, arcaccel_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
@@ -1301,6 +1352,7 @@ static void arcAccelInstallSysctls()
 {
     if (gArcSysctlInstalled) return;
     sysctl_register_oid(&sysctl__debug_arcaccelfb);
+    sysctl_register_oid(&sysctl__debug_arcaccel_metal);
     sysctl_register_oid(&sysctl__debug_arcaccel_headless);
     sysctl_register_oid(&sysctl__debug_arcaccel_flip);
     sysctl_register_oid(&sysctl__debug_arcaccel_flips);

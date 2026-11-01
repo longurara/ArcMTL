@@ -102,6 +102,7 @@ done
 [ -f "$OUT/arcmtl/libarcmtl_translate.dylib" ] || die "Missing $OUT/arcmtl/libarcmtl_translate.dylib"
 [ -f "$OUT/arcmtl/intel_icd.json" ] || die "Missing $OUT/arcmtl/intel_icd.json"
 [ -f "$OUT/GPUBundles/ArcMTLDriver.bundle/Contents/MacOS/ArcMTLDriver" ] || die "Missing $OUT/GPUBundles/ArcMTLDriver.bundle"
+[ -f "$OUT/GPUBundles/ArcMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib" ] || die "Missing bundled air-runtime/libLLVM.dylib inside $OUT/GPUBundles/ArcMTLDriver.bundle"
 [ -f "$OUT/GPUBundles/arcmtl-allow.txt" ] || die "Missing $OUT/GPUBundles/arcmtl-allow.txt"
 
 # 2. Locate Boot/System Kernel Collections & Kernel binary for kmutil (--allow-missing-kdk)
@@ -238,12 +239,19 @@ cp -f "$OUT/GPUBundles/arcmtl-allow.txt" "$GB/arcmtl-allow.txt"
 chown -R root:wheel "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" "$GB/arcmtl-allow.txt"
 chmod -R go-w,a+rX "$GB/ArcMTLDriver.bundle" "$GB/arcmtl"
 chmod 644 "$GB/arcmtl-allow.txt"
+mkdir -p "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
+chmod 0755 "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
 
 if id _windowserver >/dev/null 2>&1; then
+    chown -R _windowserver:wheel "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
     sudo -u _windowserver /bin/test -r "$GB/arcmtl-allow.txt" \
         || die "_windowserver cannot read $GB/arcmtl-allow.txt!"
     sudo -u _windowserver /bin/test -r "$GB/arcmtl/libvulkan_intel.dylib" \
         || die "_windowserver cannot read $GB/arcmtl/libvulkan_intel.dylib!"
+    sudo -u _windowserver /bin/test -r "$GB/ArcMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib" \
+        || die "_windowserver cannot read $GB/ArcMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib!"
+    sudo -u _windowserver /bin/test -w "$GB/arcmtl/spvcache" \
+        || die "_windowserver cannot write $GB/arcmtl/spvcache!"
 fi
 
 # Install stamped kexts from $STAGE_EXT into /Library/Extensions

@@ -26,3 +26,7 @@ This noncommercial research project brings Apple Metal 3 & Display hardware acce
 6. **Intel GuC Firmware (`mtl_guc_70.bin`)**
    - Redistributable binary microcontroller firmware from `linux-firmware` (`intel/xe/mtl_guc_70.bin`).
    - License: **Intel Firmware Redistribution License (`LICENSE.i915`)** — `Copyright (c) Intel Corporation`.
+
+7. **LLVM Bitcode Reader Runtime & Zstandard (`ArcMTLDriver.bundle/Contents/MacOS/air-runtime/`)**
+   - In-memory LLVM bitcode reader (`libLLVM.dylib`) and transitive Zstandard compression library (`libzstd.1.dylib`), bundled with license texts in `ArcMTLDriver.bundle/Contents/Resources/air-runtime/`.
+   - Licenses: **Apache License 2.0 with LLVM Exceptions (`Apache-2.0 WITH LLVM-exception`)** — `Copyright (c) LLVM Project Contributors`; **BSD-3-Clause** — `Copyright (c) Meta Platforms, Inc. and affiliates`.

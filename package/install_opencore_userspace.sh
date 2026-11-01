@@ -87,7 +87,28 @@ kmutil showloaded --list-only 2>/dev/null | grep -E "com\.arc\.|com\.nullmoth\."
 LATEST_WS_CRASH="$(ls -1t /Library/Logs/DiagnosticReports/WindowServer*.ips 2>/dev/null | head -n 1 || true)"
 if [ -n "$LATEST_WS_CRASH" ]; then
     echo "      [diag] Most recent WindowServer report: $LATEST_WS_CRASH"
-    grep -E '"termination"|"exception"|"asi"|"faultingThread"' "$LATEST_WS_CRASH" 2>/dev/null | head -n 4 || true
+    python3 - "$LATEST_WS_CRASH" <<'PY' 2>/dev/null || true
+import json, sys
+p = sys.argv[1]
+lines = open(p, 'r', encoding='utf-8', errors='replace').read().splitlines()
+if len(lines) >= 2:
+    hdr = json.loads(lines[0])
+    body = json.loads('\n'.join(lines[1:]))
+    print(f"      [diag] timestamp={hdr.get('timestamp')} osVersion={hdr.get('os_version')}")
+    print(f"      [diag] exception={body.get('exception')} termination={body.get('termination')}")
+    if body.get('asi'):
+        print(f"      [diag] asi={body.get('asi')}")
+    ft = body.get('faultingThread', 0)
+    threads = body.get('threads', [])
+    imgs = body.get('usedImages', [])
+    if isinstance(ft, int) and 0 <= ft < len(threads):
+        print(f"      [diag] faultingThread={ft} top frames:")
+        for idx, fr in enumerate(threads[ft].get('frames', [])[:10]):
+            ii = fr.get('imageIndex', -1)
+            iname = imgs[ii].get('name', '?') if (isinstance(ii, int) and 0 <= ii < len(imgs)) else '?'
+            sym = fr.get('symbol', hex(fr.get('imageOffset', 0)))
+            print(f"             #{idx}: {iname} :: {sym} (+{fr.get('symbolLocation', fr.get('imageOffset', 0))})")
+PY
 fi
 sysctl debug.arcaccelfb debug.arcaccel_headless debug.arcaccel_copies debug.arcaccel_blank debug.arcaccel_fail 2>/dev/null || true
 
@@ -107,11 +128,11 @@ done
 echo ""
 echo "[3/5] Installing Mesa 26.2.6 ANV (/Library/GPUBundles/arcmtl) & ArcMTLDriver.bundle..."
 GB="/Library/GPUBundles"
+[ -f "$OUT/GPUBundles/ArcMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib" ] \
+    || die "Missing air-runtime/libLLVM.dylib inside $OUT/GPUBundles/ArcMTLDriver.bundle!"
 mkdir -p "$GB/arcmtl"
 
-rm -rf "$GB/arcmtl/libvulkan_intel.dylib" \
-       "$GB/arcmtl/libarcmtl_translate.dylib" \
-       "$GB/arcmtl/intel_icd.json"
+rm -f "$GB/arcmtl/"*.dylib "$GB/arcmtl/intel_icd.json"
 ditto "$OUT/arcmtl" "$GB/arcmtl"
 for dylib in "$GB/arcmtl"/*.dylib; do
     [ -f "$dylib" ] || continue
@@ -120,20 +141,30 @@ done
 
 rm -rf "$GB/ArcMTLDriver.bundle"
 ditto "$OUT/GPUBundles/ArcMTLDriver.bundle" "$GB/ArcMTLDriver.bundle"
+for dylib in "$GB/ArcMTLDriver.bundle/Contents/MacOS/air-runtime"/*.dylib; do
+    [ -f "$dylib" ] || continue
+    codesign --force --sign - "$dylib"
+done
 codesign --force --deep --sign - "$GB/ArcMTLDriver.bundle"
 install -m 644 "$OUT/GPUBundles/arcmtl-allow.txt" "$GB/arcmtl-allow.txt"
 
 chown -R root:wheel "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" "$GB/arcmtl-allow.txt"
 chmod -R go-w,a+rX "$GB/ArcMTLDriver.bundle" "$GB/arcmtl"
 chmod 644 "$GB/arcmtl-allow.txt"
+mkdir -p "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
+chmod 0755 "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
+if id _windowserver >/dev/null 2>&1; then
+    chown -R _windowserver:wheel "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache"
+fi
 xattr -cr "$GB/ArcMTLDriver.bundle" "$GB/arcmtl" 2>/dev/null || true
 
 echo ""
-echo "[4/5] Running LIVE Intel Arc Xe-LPG hardware & Vulkan 1.3 tests..."
+echo "[4/5] Running LIVE Intel Arc Xe-LPG hardware, Vulkan 1.3 & CoreDisplay metallib tests..."
 PROBE_OK=0
 VK_OK=0
+BUNDLE_OK=0
 if [ -x /usr/local/bin/arc_probe ]; then
-    echo "--- [Test A] arc_probe (48-bit PPGTT + RCS0 128-EU Command Streamer) ---"
+    echo "--- [Test A] arc_probe (48-bit PPGTT + BCS0/RCS0 128-EU Command Streamers) ---"
     if /usr/local/bin/arc_probe; then
         PROBE_OK=1
     else
@@ -142,7 +173,7 @@ if [ -x /usr/local/bin/arc_probe ]; then
     fi
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
-    echo "--- [Test B] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
+    echo "--- [Test B1] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
     if VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
         VK_OK=1
         echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
@@ -150,6 +181,18 @@ if [ -x /usr/local/bin/vk_offscreen_test ]; then
         echo "[WARN] vk_offscreen_test returned non-zero"
         log show --last 2m --style compact --predicate 'eventMessage CONTAINS "ArcXe:"' 2>/dev/null | tail -n 25 || true
     fi
+fi
+if [ -x /usr/local/bin/mtl_offscreen_test ]; then
+    echo "--- [Test B2] mtl_offscreen_test --verify-bundle (CoreDisplay default.metallib -> AIR -> SPIR-V -> Xe-LPG VkPipeline) ---"
+    if /usr/local/bin/mtl_offscreen_test --verify-bundle "$GB/ArcMTLDriver.bundle" --with-vk; then
+        BUNDLE_OK=1
+    else
+        echo "[WARN] ArcMTLDriver.bundle CoreDisplay verification returned non-zero"
+    fi
+    if id _windowserver >/dev/null 2>&1; then
+        chown -R _windowserver:wheel "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache" 2>/dev/null || true
+    fi
+    chmod -R a+rX "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache" 2>/dev/null || true
 fi
 if (kmutil showloaded --list-only 2>/dev/null || kextstat 2>/dev/null) | grep -q "com\.arc\.ArcAccel"; then
     if [ -x /usr/local/bin/mtl_offscreen_test ]; then
@@ -418,21 +461,21 @@ if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
     update_oc_config "safe-stage1"
 elif [ "$MODE" = "--enable-dual-metal" ]; then
     install_auxkc_arcfb_arcaccel
-    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
+    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
         update_oc_config "dual-metal"
     else
         echo ""
-        echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
+        echo "[SAFETY GUARD] arc_probe ($PROBE_OK), vk_offscreen_test ($VK_OK), or CoreDisplay bundle test ($BUNDLE_OK) did NOT pass!"
         echo "               Keeping ArcAccel DISABLED in config.plist so your desktop stays 100% clean on reboot."
         update_oc_config "safe-stage1" || true
     fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
     install_auxkc_arcfb_arcaccel
-    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
+    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
         update_oc_config "arc-desktop"
     else
         echo ""
-        echo "[SAFETY GUARD] arc_probe ($PROBE_OK) or vk_offscreen_test ($VK_OK) did NOT pass!"
+        echo "[SAFETY GUARD] arc_probe ($PROBE_OK), vk_offscreen_test ($VK_OK), or CoreDisplay bundle test ($BUNDLE_OK) did NOT pass!"
         echo "               Keeping ArcFB/ArcAccel DISABLED in config.plist so your desktop stays 100% bootable."
         update_oc_config "safe-stage1" || true
     fi
@@ -444,8 +487,8 @@ echo " ArcMTL Setup COMPLETE!"
 if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
     echo " -> Reset OpenCore boot-args to safe Stage 1 (ArcXe only)."
 elif [ "$MODE" = "--enable-dual-metal" ]; then
-    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] || [ "$FORCE_ARG" = "--force" ]; then
-        echo " -> Stage 1 (ArcXe BCS0+RCS0) & Stage 2 (Mesa ANV Vulkan 1.3) PASSED!"
+    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
+        echo " -> Stage 1 (ArcXe BCS0+RCS0), Stage 2 (Mesa ANV Vulkan 1.3) & CoreDisplay SPIR-V/VkPipeline PASSED!"
         echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (Intel Arc Display+Metal 3 + RTX 4070 Metal 3)!"
         echo " -> After reboot, verify both GPUs in Metal 3 via: /usr/local/bin/mtl_offscreen_test"
     else

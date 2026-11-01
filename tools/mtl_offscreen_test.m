@@ -12,8 +12,10 @@
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static NSString *const kArcComputeMSL =
     @"#include <metal_stdlib>\n"
@@ -25,10 +27,62 @@ static NSString *const kArcComputeMSL =
      "    out[gid] = a[gid] * 2.5f + b[gid];\n"
      "}\n";
 
+typedef int (*arcmtl_self_test_metallib_fn)(const char *metallib_path, int test_vk_pipelines);
+
+static int run_verify_bundle(const char *bundleArg, int withVk, const char *metallibArg)
+{
+    @autoreleasepool {
+        printf("==================================================================\n");
+        printf(" Stage 2.5: ArcMTLDriver.bundle CoreDisplay Toolchain Verification\n");
+        printf("==================================================================\n");
+
+        NSString *p = [NSString stringWithUTF8String:bundleArg];
+        NSString *cand = [p stringByAppendingPathComponent:@"Contents/MacOS/ArcMTLDriver"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cand]) {
+            p = cand;
+        }
+        printf("  Loading bundle binary: %s (with_vk=%d)\n", p.UTF8String, withVk);
+
+        void *h = dlopen(p.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            fprintf(stderr, "  [FAIL] dlopen(%s) failed: %s\n", p.UTF8String, dlerror());
+            return 20;
+        }
+        arcmtl_self_test_metallib_fn fn =
+            (arcmtl_self_test_metallib_fn)dlsym(h, "arcmtl_self_test_metallib");
+        if (!fn) {
+            fprintf(stderr, "  [FAIL] arcmtl_self_test_metallib symbol missing from %s!\n", p.UTF8String);
+            return 21;
+        }
+        int rc = fn(metallibArg, withVk);
+        if (rc != 0) {
+            fprintf(stderr, "\n[FAIL] ArcMTLDriver.bundle CoreDisplay verification FAILED (rc=%d)!\n", rc);
+            return rc;
+        }
+        printf("\n[PASS] ArcMTLDriver.bundle CoreDisplay toolchain%s PASSED!\n",
+               withVk ? " + Xe-LPG VkPipeline build" : "");
+        return 0;
+    }
+}
+
 int main(int argc, const char *argv[])
 {
-    (void)argc;
-    (void)argv;
+    const char *verifyBundle = NULL;
+    const char *metallibPath = NULL;
+    int withVk = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--verify-bundle") && i + 1 < argc) {
+            verifyBundle = argv[++i];
+        } else if (!strcmp(argv[i], "--with-vk")) {
+            withVk = 1;
+        } else if (!strcmp(argv[i], "--metallib") && i + 1 < argc) {
+            metallibPath = argv[++i];
+        }
+    }
+    if (verifyBundle) {
+        return run_verify_bundle(verifyBundle, withVk, metallibPath);
+    }
+
     @autoreleasepool {
         printf("==================================================================\n");
         printf(" Stage 3: Metal 3 End-to-End & Dual-GPU Coexistence Verification\n");
@@ -72,7 +126,7 @@ int main(int argc, const char *argv[])
                arcDev.name.UTF8String, object_getClassName(arcDev));
 
         /* --- Test 1: Runtime MSL Compute Pipeline --- */
-        printf("\n  [Test 1/2] Compiling runtime MSL compute kernel -> SPIR-V -> Xe-LPG...\n");
+        printf("\n  [Test 1/3] Compiling runtime MSL compute kernel -> SPIR-V -> Xe-LPG...\n");
         NSError *err = nil;
         id<MTLLibrary> lib = [arcDev newLibraryWithSource:kArcComputeMSL options:nil error:&err];
         if (!lib) {
@@ -158,7 +212,7 @@ int main(int argc, const char *argv[])
                (unsigned long)count, (unsigned long)count);
 
         /* --- Test 2: IOSurface-backed Offscreen Render Pass Clear --- */
-        printf("  [Test 2/2] Rendering offscreen clear into IOSurface-backed BGRA8 MTLTexture...\n");
+        printf("  [Test 2/3] Rendering offscreen clear into IOSurface-backed BGRA8 MTLTexture...\n");
         const uint32_t w = 64, h = 64, bpr = 64 * 4;
         NSDictionary *surfProps = @{
             (id)kIOSurfaceWidth : @(w),
@@ -213,7 +267,40 @@ int main(int argc, const char *argv[])
             return 11;
         }
 
-        printf("\n[PASS] Stage 3 PASSED: Metal 3 Compute + IOSurface Render work end-to-end on Intel Arc!\n");
+        /* --- Test 3: CoreDisplay default.metallib Graphics Pipeline via Metal.framework --- */
+        NSString *cdLibPath = @"/System/Library/Frameworks/CoreDisplay.framework/Versions/A/Resources/default.metallib";
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cdLibPath]) {
+            printf("  [Test 3/3] Building CoreDisplay default.metallib (ViewportToNDC + GPUPass) MTLRenderPipelineState...\n");
+            err = nil;
+            id<MTLLibrary> cdLib = [arcDev newLibraryWithURL:[NSURL fileURLWithPath:cdLibPath] error:&err];
+            if (!cdLib) {
+                fprintf(stderr, "[FAIL] newLibraryWithURL(CoreDisplay default.metallib) failed: %s\n",
+                        err ? err.localizedDescription.UTF8String : "unknown");
+                return 12;
+            }
+            id<MTLFunction> vsFn = [cdLib newFunctionWithName:@"ViewportToNDC"];
+            id<MTLFunction> fsFn = [cdLib newFunctionWithName:@"GPUPass"];
+            if (!vsFn || !fsFn) {
+                fprintf(stderr, "[FAIL] ViewportToNDC (%p) or GPUPass (%p) missing from CoreDisplay MTLLibrary!\n",
+                        (__bridge void *)vsFn, (__bridge void *)fsFn);
+                return 13;
+            }
+            MTLRenderPipelineDescriptor *rpDesc = [[MTLRenderPipelineDescriptor alloc] init];
+            rpDesc.vertexFunction = vsFn;
+            rpDesc.fragmentFunction = fsFn;
+            rpDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            id<MTLRenderPipelineState> cdPso = [arcDev newRenderPipelineStateWithDescriptor:rpDesc error:&err];
+            if (!cdPso) {
+                fprintf(stderr, "[FAIL] newRenderPipelineStateWithDescriptor(CoreDisplay GPUPass) failed: %s\n",
+                        err ? err.localizedDescription.UTF8String : "unknown");
+                return 14;
+            }
+            printf("             Verified CoreDisplay ViewportToNDC + GPUPass MTLRenderPipelineState!\n");
+        } else {
+            printf("  [Test 3/3] CoreDisplay default.metallib not present at standard path — skipped.\n");
+        }
+
+        printf("\n[PASS] Stage 3 PASSED: Metal 3 Compute + IOSurface Render + CoreDisplay PSO work end-to-end on Intel Arc!\n");
         return 0;
     }
 }

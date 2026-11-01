@@ -134,6 +134,15 @@ jobs:
 
           codesign -f -s - out/tools/arc_probe out/tools/vk_offscreen_test out/tools/mtl_offscreen_test
 
+      - name: Verify ArcMTLDriver.bundle Translates macOS 26 Tahoe CoreDisplay default.metallib
+        run: |
+          TMP_CACHE="$(mktemp -d /var/tmp/arcmtl_ci_cache.XXXXXX)"
+          ARCMTL_AIRCACHE="$TMP_CACHE/aircache" \
+          ARCMTL_XLATE_LIB="$PWD/out/arcmtl/libarcmtl_translate.dylib" \
+            out/tools/mtl_offscreen_test --verify-bundle "$PWD/out/GPUBundles/ArcMTLDriver.bundle"
+          ls -la "$TMP_CACHE/aircache" "$TMP_CACHE/spvcache" || true
+          rm -rf "$TMP_CACHE"
+
       - name: Package Ready-to-Install Universal Distribution (macOS 26 Tahoe & 15 Sequoia)
         run: |
           DIST="ArcMTL-macos26-15-x86_64"

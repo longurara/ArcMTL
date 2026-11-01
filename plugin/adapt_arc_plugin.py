@@ -120,11 +120,183 @@ def transform_device_m(text: str) -> str:
     # 4. Chromium / Electron ANGLE Metal override for Intel GPUs
     text = text.replace('"disableMetalOnNvidia"', '"disableMetalOnIntel"')
 
-    return REQUIRED_NOTICE_BANNER + text
+    # 5. Export ArcMTLDevice explicitly when compiled with -fvisibility=hidden so internal C symbols
+    #    (_nvlog, _gNVMTLMainDevice, _nvmtl_vk_*) stay private to ArcMTLDriver.bundle in Dual-GPU processes
+    if "@interface ArcMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>" not in text:
+        raise RuntimeError("Failed to locate @interface ArcMTLDevice declaration in ArcMTLDevice.m")
+    text = text.replace(
+        "@interface ArcMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>",
+        '__attribute__((visibility("default")))\n@interface ArcMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>',
+        1,
+    )
+
+    # 6. Surface key startup / bitcode / translator milestones in Unified Log even under NVMTL_RELEASE=1
+    text = text.replace(
+        'if (nvmtl_log_failure(t)) syslog(LOG_ERR, "ArcMTL: %s", t);',
+        'if (nvmtl_log_failure(t) || strstr(t, "initWithAcceleratorPort:") || strstr(t, "vk: UP") || '
+        'strstr(t, "bitcode reader") || strstr(t, "translate:") || strstr(t, "library: metallib")) '
+        'syslog(LOG_ERR, "ArcMTL: %s", t);',
+    )
+
+    # 7. Never run NVIDIA NVDEC VTDecoderXPCService constructor from ArcMTLDriver.bundle on Dual-GPU systems
+    text = text.replace(
+        "__attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)\n{",
+        "__attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)\n{\n"
+        "    if (nvmtl_vk_vendor() != 0x10de) return;",
+    )
+
+    # 8. Intel Arc device & architecture naming
+    text = text.replace('(vkname ? vkname : "NVIDIA GPU")', '(vkname ? vkname : "Intel(R) Arc(TM) Graphics")')
+    text = text.replace('@" (NVK "', '@" (MTL)"')
+    text = text.replace('@"%@ (NVMTL over %@)"', '@"%@ (ArcMTL over %@)"')
+    text = text.replace('[NSMutableString stringWithString:@"nvk_"]', '[NSMutableString stringWithString:@"anv_"]')
+
+    # 9. Export end-to-end CoreDisplay / metallib toolchain & Vulkan pipeline self-test entrypoint
+    self_test_fn = """
+
+__attribute__((visibility("default")))
+int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
+{
+    @autoreleasepool {
+        const char *mpath = (metallib_path && *metallib_path)
+            ? metallib_path
+            : "/System/Library/Frameworks/CoreDisplay.framework/Versions/A/Resources/default.metallib";
+        printf("  [Bundle Self-Test] Verifying ArcMTLDriver toolchain against: %s\\n", mpath);
+        if (!nvmtl_bitcode_reader_ready()) {
+            fprintf(stderr, "  [FAIL] nvmtl_bitcode_reader_ready() == NO (air-runtime/libLLVM.dylib missing or failed to load)\\n");
+            return 1;
+        }
+        printf("  [OK] In-memory AIR bitcode reader (air-runtime/libLLVM.dylib) READY\\n");
+        if (!nvmtl_xlate_ready()) {
+            fprintf(stderr, "  [FAIL] nvmtl_xlate_ready() == 0 (libarcmtl_translate.dylib missing or failed to load)\\n");
+            return 2;
+        }
+        printf("  [OK] AIR -> SPIR-V translator (libarcmtl_translate.dylib) READY (tag=%s)\\n", gXlateTag);
+        NSData *raw = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:mpath]];
+        if (!raw || raw.length < 32) {
+            fprintf(stderr, "  [FAIL] Cannot read metallib at %s\\n", mpath);
+            return 3;
+        }
+        NSDictionary *stages = nil, *airs = nil;
+        NSDictionary<NSString *, NSData *> *fns = nvmtl_translate_metallib(raw, &stages, &airs);
+        if (!fns || fns.count == 0 || !stages || !airs) {
+            fprintf(stderr, "  [FAIL] nvmtl_translate_metallib(%s, %lu bytes) returned 0 entries!\\n",
+                    mpath, (unsigned long)raw.length);
+            return 4;
+        }
+        printf("  [OK] Indexed %lu shader entry points from metallib (%lu bytes)\\n",
+               (unsigned long)fns.count, (unsigned long)raw.length);
+
+        NSMutableDictionary<NSString *, NSData *> *spvMap = [NSMutableDictionary dictionary];
+        if (fns[@"ViewportToNDC"]) {
+            NSArray<NSString *> *mustCompile = @[@"ViewportToNDC", @"GPUPass", @"ColorFill", @"TextureCopy"];
+            NSUInteger compiledReq = 0;
+            for (NSString *fnName in mustCompile) {
+                NSData *airBlob = fns[fnName];
+                if (!airBlob) {
+                    if ([fnName isEqualToString:@"ViewportToNDC"] || [fnName isEqualToString:@"GPUPass"]) {
+                        fprintf(stderr, "  [FAIL] Required CoreDisplay shader '%s' missing from metallib index!\\n",
+                                fnName.UTF8String);
+                        return 5;
+                    }
+                    continue;
+                }
+                NSString *ll = airs[fnName];
+                NSString *st = stages[fnName];
+                NSString *errStr = nil;
+                NSData *spv = nvmtl_compile_library_entry(airBlob, ll, st, fnName, &errStr);
+                if (!spv || !nvmtl_is_spirv(spv)) {
+                    fprintf(stderr, "  [FAIL] Failed to translate CoreDisplay '%s' (%s) -> SPIR-V: %s\\n",
+                            fnName.UTF8String, st ? st.UTF8String : "?",
+                            errStr ? errStr.UTF8String : "invalid SPIR-V");
+                    return 5;
+                }
+                spvMap[fnName] = spv;
+                compiledReq++;
+                printf("  [OK] Translated CoreDisplay %-14s (%-8s) -> %lu bytes SPIR-V\\n",
+                       fnName.UTF8String, st.UTF8String, (unsigned long)spv.length);
+            }
+            NSUInteger prewarmed = compiledReq;
+            for (NSString *k in fns) {
+                if (spvMap[k]) continue;
+                NSString *st = stages[k];
+                if (!st || [st isEqualToString:@"visible"]) continue;
+                NSData *spv = nvmtl_compile_library_entry(fns[k], airs[k], st, k, NULL);
+                if (spv && nvmtl_is_spirv(spv)) prewarmed++;
+            }
+            printf("  [OK] Pre-warmed %lu / %lu shader entries into SPIR-V cache\\n",
+                   (unsigned long)prewarmed, (unsigned long)fns.count);
+        } else {
+            NSUInteger okCount = 0;
+            for (NSString *k in fns) {
+                NSString *st = stages[k];
+                if (!st || [st isEqualToString:@"visible"]) continue;
+                NSData *spv = nvmtl_compile_library_entry(fns[k], airs[k], st, k, NULL);
+                if (spv && nvmtl_is_spirv(spv)) okCount++;
+            }
+            if (okCount == 0) {
+                fprintf(stderr, "  [FAIL] Zero entries in %s compiled to valid SPIR-V!\\n", mpath);
+                return 5;
+            }
+            printf("  [OK] Compiled %lu / %lu entries to SPIR-V\\n",
+                   (unsigned long)okCount, (unsigned long)fns.count);
+        }
+
+        nvmtl_cache_io_drain();
+
+        if (test_vk_pipelines) {
+            if (nvmtl_vk_init() != 0) {
+                fprintf(stderr, "  [FAIL] nvmtl_vk_init() failed inside ArcMTLDriver!\\n");
+                return 6;
+            }
+            printf("  [OK] ArcMTLDriver Vulkan backend UP on \\"%s\\"\\n", nvmtl_vk_device_name());
+
+            nvk_buffer tb;
+            memset(&tb, 0, sizeof(tb));
+            if (nvmtl_vk_buffer_create(65536, 2, &tb) != 0) {
+                fprintf(stderr, "  [FAIL] nvmtl_vk_buffer_create(64 KiB shared) failed on UMA!\\n");
+                return 7;
+            }
+            nvmtl_vk_buffer_destroy(&tb);
+
+            nvk_image ti;
+            memset(&ti, 0, sizeof(ti));
+            if (nvmtl_vk_image_create_fmt(256, 256, 1, &ti) != 0) {
+                fprintf(stderr, "  [FAIL] nvmtl_vk_image_create_fmt(256x256 BGRA8) failed on UMA!\\n");
+                return 8;
+            }
+            nvmtl_vk_image_destroy(&ti);
+            printf("  [OK] UMA buffer + 256x256 BGRA8 optimal image allocation verified\\n");
+
+            NSData *vsSpv = spvMap[@"ViewportToNDC"];
+            if (vsSpv) {
+                for (NSString *fsName in @[@"GPUPass", @"ColorFill", @"TextureCopy"]) {
+                    NSData *fsSpv = spvMap[fsName];
+                    if (!fsSpv) continue;
+                    nvk_pipeline pipe;
+                    memset(&pipe, 0, sizeof(pipe));
+                    int rc = nvmtl_vk_pipeline_create_depth(
+                        vsSpv.bytes, vsSpv.length, fsSpv.bytes, fsSpv.length, 1, 0, &pipe);
+                    if (rc != 0) {
+                        fprintf(stderr, "  [FAIL] vkCreateGraphicsPipelines(ViewportToNDC + %s) FAILED (rc=%d)!\\n",
+                                fsName.UTF8String, rc);
+                        return 9;
+                    }
+                    printf("  [OK] Built Xe-LPG VkPipeline: ViewportToNDC + %-12s (%lu + %lu B SPIR-V)\\n",
+                           fsName.UTF8String, (unsigned long)vsSpv.length, (unsigned long)fsSpv.length);
+                    nvmtl_vk_pipeline_destroy(&pipe);
+                }
+            }
+        }
+        return 0;
+    }
+}
+"""
+    return REQUIRED_NOTICE_BANNER + text + self_test_fn
 
 
 def transform_library_load_m(text: str) -> str:
-    # Allow ARCMTL_XLATE_LIB env override for pre-install testing from out/arcmtl/libarcmtl_translate.dylib
+    # 1. Allow ARCMTL_XLATE_LIB env override for pre-install testing from out/arcmtl/libarcmtl_translate.dylib
     old_block = (
         "#ifndef NVMTL_XLATE_LIB\n"
         '#define NVMTL_XLATE_LIB nvmtl_pick_ll("/Library/GPUBundles/arcmtl/libarcmtl_translate.dylib", \\\n'
@@ -143,6 +315,47 @@ def transform_library_load_m(text: str) -> str:
     )
     if old_block in text:
         text = text.replace(old_block, new_block, 1)
+
+    # 2. Isolate bundled translator filename, cache subdirectories, dispatch queue label, and ARCMTL_AIRCACHE env
+    text = text.replace('@"libnvmtl_translate.dylib"', '@"libarcmtl_translate.dylib"')
+    text = text.replace('@"nvmtl/aircache"', '@"arcmtl/aircache"')
+    text = text.replace('@"nvmtl/spvcache"', '@"arcmtl/spvcache"')
+    text = text.replace('"nvmtl.cache-io"', '"arcmtl.cache-io"')
+    text = text.replace(
+        'const char *e = getenv("NVMTL_AIRCACHE");',
+        'const char *e = getenv("ARCMTL_AIRCACHE"); if (!e) e = getenv("NVMTL_AIRCACHE");',
+    )
+
+    # 3. Resilient multi-path dlopen for air-runtime/libLLVM.dylib inside nvmtl_bitcode_reader_ready()
+    old_llvm_block = (
+        '        NSString *path = [[@(info.dli_fname) stringByDeletingLastPathComponent]\n'
+        '                         stringByAppendingPathComponent:@"air-runtime/libLLVM.dylib"];\n'
+        '        void *library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);\n'
+        '        if (!library) { nvlog("library: in-memory bitcode reader unavailable: %s", dlerror()); return; }'
+    )
+    new_llvm_block = (
+        '        NSString *bundledPath = [[@(info.dli_fname) stringByDeletingLastPathComponent]\n'
+        '                                stringByAppendingPathComponent:@"air-runtime/libLLVM.dylib"];\n'
+        '        const char *envLlvm = getenv("ARCMTL_LLVM_LIB");\n'
+        '        const char *candidates[5] = {\n'
+        '            (envLlvm && *envLlvm) ? envLlvm : NULL,\n'
+        '            bundledPath.fileSystemRepresentation,\n'
+        '            "/Library/GPUBundles/arcmtl/air-runtime/libLLVM.dylib",\n'
+        '            "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/air-runtime/libLLVM.dylib",\n'
+        '            NULL\n'
+        '        };\n'
+        '        void *library = NULL;\n'
+        '        for (int ci = 0; ci < 4 && !library; ci++) {\n'
+        '            if (candidates[ci] && access(candidates[ci], R_OK) == 0)\n'
+        '                library = dlopen(candidates[ci], RTLD_NOW | RTLD_LOCAL);\n'
+        '        }\n'
+        '        if (!library) library = dlopen(bundledPath.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);\n'
+        '        if (!library) { nvlog("library: in-memory bitcode reader unavailable: %s", dlerror()); return; }'
+    )
+    if old_llvm_block not in text:
+        raise RuntimeError("Failed to locate air-runtime/libLLVM.dylib dlopen block in ArcMTLLibraryLoad.m")
+    text = text.replace(old_llvm_block, new_llvm_block, 1)
+
     return text
 
 
@@ -159,7 +372,43 @@ def transform_vendor_compiler_m(text: str) -> str:
 
 
 def transform_objects_m(text: str) -> str:
-    # Default IOSurface upload (nvmtlSurfaceIn) and readback (nvmtlSurfaceOutDirtied:) on Intel Arc UMA
+    # 1. Isolate constructor nvmtl_conf_knobs() so ArcMTLDriver reads /Library/GPUBundles/arcmtl/arcmtl.conf
+    #    for ARCMTL_* keys only and NEVER calls unsetenv() on NullMoth's NVMTL_*/NVK_*/NAK_*/NVRM_* variables
+    #    in Dual-GPU processes where both ArcMTLDriver.bundle and NVMTLDriver.bundle are loaded!
+    text, n0 = re.subn(
+        r"__attribute__\(\(constructor\)\)\s*static\s+void\s+nvmtl_conf_knobs\s*\(\s*void\s*\)\s*\{.*?\n\}\n(?=static\s+int\s+nvmtl_dontcare_clears)",
+        lambda _m: (
+            "__attribute__((constructor)) static void nvmtl_conf_knobs(void)\n"
+            "{\n"
+            '    FILE *f = fopen("/Library/GPUBundles/arcmtl/arcmtl.conf", "r");\n'
+            "    if (!f) return;\n"
+            "    char line[512];\n"
+            "    while (fgets(line, sizeof line, f)) {\n"
+            "        char *p = line;\n"
+            "        while (*p == ' ' || *p == '\\t') p++;\n"
+            "        if (*p == '#' || *p == '\\n' || *p == '\\r' || !*p) continue;\n"
+            "        char *eq = strchr(p, '=');\n"
+            "        if (!eq) continue;\n"
+            "        *eq = 0;\n"
+            "        char *key = p, *val = eq + 1;\n"
+            "        char *end = key + strlen(key);\n"
+            "        while (end > key && (end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
+            "        end = val + strlen(val);\n"
+            "        while (end > val && (end[-1] == '\\n' || end[-1] == '\\r' || end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
+            '        if (strncmp(key, "ARCMTL_", 7) != 0) continue;\n'
+            "        if (!getenv(key)) setenv(key, val, 1);\n"
+            "    }\n"
+            "    fclose(f);\n"
+            "}\n"
+        ),
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if n0 == 0:
+        raise RuntimeError("Failed to patch nvmtl_conf_knobs in ArcMTLObjects.m")
+
+    # 2. Default IOSurface upload (nvmtlSurfaceIn) and readback (nvmtlSurfaceOutDirtied:) on Intel Arc UMA
     # to the 100%-coherent kIOMemoryKernelUserShared staging buffer path (nvmtl_vk_image_write /
     # nvmtl_vk_image_read) unless ARCMTL_SURFIN_UPLOAD=gpu / ARCMTL_SURFOUT_READBACK=gpu is explicitly
     # requested. XNU IOSurface mappings use Write-Combining CPU PTEs and unwire across IOSurfaceUnlock,
@@ -262,9 +511,22 @@ def transform_vk_c(text: str) -> str:
         'if (_av) CFRelease(_av); }',
     )
 
-    # 5. Isolate accelerator surface-wait query from NVAccel -> ArcAccel
+    # 5. Isolate accelerator surface-wait query & Mesa disk cache folder from NVAccel/nvmtl -> ArcAccel/arcmtl
     text = text.replace('IOServiceMatching("NVAccel")', 'IOServiceMatching("ArcAccel")')
     text = text.replace('"NVAccelSurfaceWait"', '"ArcAccelSurfaceWait"')
+    text = text.replace('"%snvmtl-mesa"', '"%sarcmtl-mesa"')
+
+    # 6. CRITICAL UMA FIX: Disable discrete-GPU soft VRAM spill gate on Intel Arc UMA (0x8086).
+    # On Intel Arc ANV, all memory types on the 12 GiB UMA heap carry VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    # (there is no separate non-DEVICE_LOCAL spill heap), so gate == 1 would skip vkAllocateMemory and fail!
+    vram_wall_anchor = "    if (freev_out) *freev_out = freev;"
+    if vram_wall_anchor not in text:
+        raise RuntimeError("Failed to locate nvmtl_vk_vram_wall0 anchor in nvmtl_vk.c")
+    text = text.replace(
+        vram_wall_anchor,
+        "    if (nvmtl_vk_vendor() == 0x8086) gate = 0;\n    if (freev_out) *freev_out = freev;",
+        1,
+    )
 
     return text
 
@@ -324,7 +586,7 @@ def adapt_plugin_tree(src_dir: Path, dst_dir: Path) -> None:
 
 def run_self_test() -> None:
     sample_dev = (
-        '@interface NVMTLDevice : MTLIOAccelDevice\n@end\n'
+        '@interface NVMTLDevice : MTLIOAccelDevice <MTLDevice, MTLDeviceSPI>\n@end\n'
         '#import "NVMTLObjects.h"\n'
         'static bool nvmtl_accel_armed(void)\n'
         '{\n'
@@ -332,6 +594,7 @@ def run_self_test() -> None:
         '    if (sysctlbyname("debug.nvaccelfb", &v, &n, NULL, 0) != 0) return false;\n'
         '    return v != 0;\n'
         '}\n'
+        '__attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)\n{\n    int x = 1; (void)x;\n}\n'
         'if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de || '
         '(sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) return false;\n'
         'if (getenv("NVMTL_ENABLE")) return true;\n'
@@ -341,10 +604,12 @@ def run_self_test() -> None:
         'void *fn = dlsym(h, "nvmtl_translate");\n'
     )
     out_dev = transform_device_m(transform_common(sample_dev))
-    assert "@interface ArcMTLDevice" in out_dev
+    assert '__attribute__((visibility("default")))\n@interface ArcMTLDevice' in out_dev
+    assert "arcmtl_self_test_metallib" in out_dev
     assert '#import "ArcMTLObjects.h"' in out_dev
     assert 'CFSTR("ArcAccelArmed")' in out_dev
     assert 'CFSTR("ArcAccelHeadless")' in out_dev
+    assert "if (nvmtl_vk_vendor() != 0x10de) return;" in out_dev
     assert "nvmtl_vk_vendor() != 0x8086" in out_dev
     assert '"debug.arcaccel_headless"' in out_dev
     assert '"/Library/GPUBundles/arcmtl-allow.txt"' in out_dev
@@ -360,6 +625,8 @@ def run_self_test() -> None:
         'if (nvmtl_vk_vendor() == 0x10de) { int rb = nvmtl_rebind_import(p, "_open", f); }\n'
         'if (h < 0 && nvmtl_vk_vendor() != 0x10de) { h = 1; }\n'
         'h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;\n'
+        'snprintf(dir, sizeof dir, "%snvmtl-mesa", ucd);\n'
+        '    if (freev_out) *freev_out = freev;\n'
     )
     out_vk = transform_vk_c(transform_common(sample_vk))
     assert "return 0x8086;" in out_vk
@@ -368,8 +635,12 @@ def run_self_test() -> None:
     assert "if (nvmtl_vk_vendor() == 0x8086) { int rb = nvmtl_rebind_import" in out_vk
     assert "nvmtl_vk_vendor() != 0x8086" in out_vk
     assert 'CFSTR("ArcAccelHeadless")' in out_vk
+    assert '"%sarcmtl-mesa"' in out_vk
+    assert "if (nvmtl_vk_vendor() == 0x8086) gate = 0;" in out_vk
 
     sample_obj = (
+        '__attribute__((constructor)) static void nvmtl_conf_knobs(void)\n{\n    unsetenv("NVMTL_X");\n}\n'
+        'static int nvmtl_dontcare_clears(void) { return 0; }\n'
         'static bool nvmtl_surfin_import(void) {\n'
         '    static int on = -1;\n'
         '    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }\n'
@@ -382,9 +653,30 @@ def run_self_test() -> None:
         '}\n'
     )
     out_obj = transform_objects_m(transform_common(sample_obj))
+    assert "arcmtl.conf" in out_obj
+    assert "unsetenv" not in out_obj
     assert 'getenv("ARCMTL_SURFIN_UPLOAD")' in out_obj
     assert 'getenv("ARCMTL_SURFOUT_READBACK")' in out_obj
     assert '!strcmp(u, "gpu")' in out_obj
+
+    sample_lib = (
+        'bundled = [x stringByAppendingPathComponent:@"libnvmtl_translate.dylib"];\n'
+        'const char *e = getenv("NVMTL_AIRCACHE");\n'
+        'dir = [base stringByAppendingPathComponent:@"nvmtl/aircache"];\n'
+        'tmp = [base stringByAppendingPathComponent:@"nvmtl/spvcache"];\n'
+        'gCacheIoQueue = dispatch_queue_create("nvmtl.cache-io", 0);\n'
+        '        NSString *path = [[@(info.dli_fname) stringByDeletingLastPathComponent]\n'
+        '                         stringByAppendingPathComponent:@"air-runtime/libLLVM.dylib"];\n'
+        '        void *library = dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);\n'
+        '        if (!library) { nvlog("library: in-memory bitcode reader unavailable: %s", dlerror()); return; }\n'
+    )
+    out_lib = transform_library_load_m(transform_common(sample_lib))
+    assert '@"libarcmtl_translate.dylib"' in out_lib
+    assert '@"arcmtl/aircache"' in out_lib
+    assert '@"arcmtl/spvcache"' in out_lib
+    assert '"arcmtl.cache-io"' in out_lib
+    assert 'getenv("ARCMTL_AIRCACHE")' in out_lib
+    assert 'getenv("ARCMTL_LLVM_LIB")' in out_lib
     print("[adapt_arc_plugin] Self-test PASSED.")
 
 

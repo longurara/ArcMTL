@@ -49,6 +49,7 @@ MESON_ARGS=(
     -Dintel-elk=false
     -Dintel-rt=disabled
     -Ddisplay-info=disabled
+    -Dspirv-tools=disabled
     -Dzlib=enabled
     -Dzstd=disabled
     -Dxmlconfig=disabled
