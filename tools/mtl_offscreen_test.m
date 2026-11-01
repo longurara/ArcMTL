@@ -60,7 +60,7 @@ static int run_verify_bundle(const char *bundleArg, int withVk, const char *meta
             return rc;
         }
         printf("\n[PASS] ArcMTLDriver.bundle CoreDisplay toolchain%s PASSED!\n",
-               withVk ? " + Xe-LPG VkPipeline build" : "");
+               withVk ? " + 2560x1600 Xe-LPG 3D GPUPass & Submit-Ahead" : "");
         return 0;
     }
 }

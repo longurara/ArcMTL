@@ -41,6 +41,7 @@ struct ArcBo {
     IOBufferMemoryDescriptor   *ownedBuf;       /* Non-null if allocated by kernel */
     IOMemoryMap                *kernMap;        /* Optional kernel virtual mapping */
     bool                        prepared;
+    bool                        readOnly;       /* True when pinned from VM_PROT_READ userptr/IOSurface */
     uint64_t                    size;
     uint32_t                    flags;
     uint16_t                    patIndex;
@@ -83,6 +84,7 @@ struct ArcExecQueue {
     uint32_t                    pphwspGgttAddr;
     uint32_t                    ctxImgGgttAddr;
     uint32_t                    ringSize;
+    uint32_t                    initRingTail;
     uint32_t                    ringTail;
     volatile uint32_t          *ringCpu;
     volatile uint32_t          *ctxRegsCpu;

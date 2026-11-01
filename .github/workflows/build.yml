@@ -136,6 +136,25 @@ jobs:
 
       - name: Verify ArcMTLDriver.bundle Translates macOS 26 Tahoe CoreDisplay default.metallib
         run: |
+          python3 - <<'PY'
+          import re, struct, subprocess, tempfile, pathlib
+          targets = [
+              ("plugin/adapt_arc_plugin.py", "kArcSelfTestFullTriVsSpv"),
+              ("plugin/adapt_arc_plugin.py", "kArcSelfTestSolidFsSpv"),
+              ("tools/vk_offscreen_test.c", "k_b4_vs_spv"),
+              ("tools/vk_offscreen_test.c", "k_b4_fs_spv"),
+          ]
+          for fp, name in targets:
+              src = pathlib.Path(fp).read_text(encoding="utf-8")
+              m = re.search(rf"{name}\[\d+\]\s*=\s*\{{([^}}]+)\}}", src)
+              assert m, f"missing {name} in {fp}"
+              words = [int(x, 16) for x in re.findall(r"0x[0-9a-fA-F]+", m.group(1))]
+              with tempfile.NamedTemporaryFile(suffix=".spv", delete=False) as tf:
+                  tf.write(struct.pack(f"<{len(words)}I", *words))
+                  spv_path = tf.name
+              subprocess.run(["spirv-val", "--target-env", "vulkan1.3", spv_path], check=True)
+              print(f"[OK] spirv-val validated {name} ({len(words)} words)")
+          PY
           TMP_CACHE="$(mktemp -d /var/tmp/arcmtl_ci_cache.XXXXXX)"
           ARCMTL_AIRCACHE="$TMP_CACHE/aircache" \
           ARCMTL_XLATE_LIB="$PWD/out/arcmtl/libarcmtl_translate.dylib" \

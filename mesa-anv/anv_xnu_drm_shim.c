@@ -36,6 +36,21 @@
 #include "arc_uapi.h"
 #include "arc_regs_mtl.h"
 
+__attribute__((constructor))
+static void arc_xnu_shim_init_env(void)
+{
+    /*
+     * Default Mesa ANV's TBIMR (Tile-Based Immediate Mode Renderer, driconf 'intel_tbimr') off on
+     * Direct Execlist unless ARCMTL_TBIMR=1 is explicitly exported. On >=2560x1600 framebuffers
+     * (unlike <=256x256 offscreen tests), Mesa ANV enables 3DSTATE_TBIMR_TILE_PASS_INFO + TBIMREnable;
+     * immediate-mode 3D rasterization avoids multi-tile TBIMR scoreboard stalls without GuC.
+     */
+    const char *tbimr = getenv("ARCMTL_TBIMR");
+    if (!tbimr || strcmp(tbimr, "1") != 0) {
+        setenv("intel_tbimr", "false", 0);
+    }
+}
+
 /* ============================================================================
  * 1. Session, Mmap, VM_BIND Tracking & Timeline Tables
  * ============================================================================ */
@@ -451,9 +466,9 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
         return 0;
     }
 
-    /* D. DRM_XE_DEVICE_QUERY_ENGINES (RCS0 Render + Compute on 128-EU Xe-LPG) */
+    /* D. DRM_XE_DEVICE_QUERY_ENGINES (Unified RCS0 Render + Compute + Copy on 128-EU Xe-LPG) */
     case DRM_XE_DEVICE_QUERY_ENGINES: {
-        const uint32_t num_eng = 2;
+        const uint32_t num_eng = 1;
         const uint32_t need = (uint32_t)(sizeof(struct drm_xe_query_engines) + num_eng * sizeof(struct drm_xe_engine));
         if (q->size == 0) {
             q->size = need;
@@ -469,10 +484,6 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
         qe->engines[0].instance.engine_class    = DRM_XE_ENGINE_CLASS_RENDER;
         qe->engines[0].instance.engine_instance = 0;
         qe->engines[0].instance.gt_id           = 0;
-
-        qe->engines[1].instance.engine_class    = DRM_XE_ENGINE_CLASS_COMPUTE;
-        qe->engines[1].instance.engine_instance = 0;
-        qe->engines[1].instance.gt_id           = 0;
         return 0;
     }
 

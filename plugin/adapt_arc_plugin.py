@@ -151,8 +151,41 @@ def transform_device_m(text: str) -> str:
     text = text.replace('@"%@ (NVMTL over %@)"', '@"%@ (ArcMTL over %@)"')
     text = text.replace('[NSMutableString stringWithString:@"nvk_"]', '[NSMutableString stringWithString:@"anv_"]')
 
-    # 9. Export end-to-end CoreDisplay / metallib toolchain & Vulkan pipeline self-test entrypoint
+    # 9. Export end-to-end CoreDisplay / metallib toolchain, 2560x1600 3D GPUPass & async submit-ahead self-test
     self_test_fn = """
+#import <IOSurface/IOSurface.h>
+
+static const uint32_t kArcSelfTestFullTriVsSpv[128] = {
+    0x07230203u, 0x00010000u, 0x00000000u, 0x00000019u, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu,
+    0x00000000u, 0x00000001u, 0x0007000fu, 0x00000000u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00000009u,
+    0x0000000bu, 0x00040047u, 0x00000009u, 0x0000000bu, 0x0000002au, 0x00040047u, 0x0000000bu, 0x0000000bu,
+    0x00000000u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00020014u, 0x00000004u,
+    0x00040015u, 0x00000005u, 0x00000020u, 0x00000000u, 0x00030016u, 0x00000006u, 0x00000020u, 0x00040017u,
+    0x00000007u, 0x00000006u, 0x00000004u, 0x00040020u, 0x00000008u, 0x00000001u, 0x00000005u, 0x0004003bu,
+    0x00000008u, 0x00000009u, 0x00000001u, 0x00040020u, 0x0000000au, 0x00000003u, 0x00000007u, 0x0004003bu,
+    0x0000000au, 0x0000000bu, 0x00000003u, 0x0004002bu, 0x00000005u, 0x0000000cu, 0x00000001u, 0x0004002bu,
+    0x00000005u, 0x0000000du, 0x00000002u, 0x0004002bu, 0x00000006u, 0x0000000eu, 0xbf800000u, 0x0004002bu,
+    0x00000006u, 0x0000000fu, 0x40400000u, 0x0004002bu, 0x00000006u, 0x00000010u, 0x00000000u, 0x0004002bu,
+    0x00000006u, 0x00000011u, 0x3f800000u, 0x00050036u, 0x00000002u, 0x00000001u, 0x00000000u, 0x00000003u,
+    0x000200f8u, 0x00000012u, 0x0004003du, 0x00000005u, 0x00000013u, 0x00000009u, 0x000500aau, 0x00000004u,
+    0x00000014u, 0x00000013u, 0x0000000cu, 0x000500aau, 0x00000004u, 0x00000015u, 0x00000013u, 0x0000000du,
+    0x000600a9u, 0x00000006u, 0x00000016u, 0x00000014u, 0x0000000fu, 0x0000000eu, 0x000600a9u, 0x00000006u,
+    0x00000017u, 0x00000015u, 0x0000000fu, 0x0000000eu, 0x00070050u, 0x00000007u, 0x00000018u, 0x00000016u,
+    0x00000017u, 0x00000010u, 0x00000011u, 0x0003003eu, 0x0000000bu, 0x00000018u, 0x000100fdu, 0x00010038u,
+};
+
+static const uint32_t kArcSelfTestSolidFsSpv[78] = {
+    0x07230203u, 0x00010000u, 0x00000000u, 0x0000000eu, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu,
+    0x00000000u, 0x00000001u, 0x0006000fu, 0x00000004u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00000007u,
+    0x00030010u, 0x00000001u, 0x00000007u, 0x00040047u, 0x00000007u, 0x0000001eu, 0x00000000u, 0x00020013u,
+    0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u, 0x00030016u, 0x00000004u, 0x00000020u, 0x00040017u,
+    0x00000005u, 0x00000004u, 0x00000004u, 0x00040020u, 0x00000006u, 0x00000003u, 0x00000005u, 0x0004003bu,
+    0x00000006u, 0x00000007u, 0x00000003u, 0x0004002bu, 0x00000004u, 0x00000008u, 0x3e000000u, 0x0004002bu,
+    0x00000004u, 0x00000009u, 0x3f200000u, 0x0004002bu, 0x00000004u, 0x0000000au, 0x3f600000u, 0x0004002bu,
+    0x00000004u, 0x0000000bu, 0x3f800000u, 0x0007002cu, 0x00000005u, 0x0000000cu, 0x00000008u, 0x00000009u,
+    0x0000000au, 0x0000000bu, 0x00050036u, 0x00000002u, 0x00000001u, 0x00000000u, 0x00000003u, 0x000200f8u,
+    0x0000000du, 0x0003003eu, 0x00000007u, 0x0000000cu, 0x000100fdu, 0x00010038u,
+};
 
 __attribute__((visibility("default")))
 int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
@@ -251,23 +284,33 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
             }
             printf("  [OK] ArcMTLDriver Vulkan backend UP on \\"%s\\"\\n", nvmtl_vk_device_name());
 
-            nvk_buffer tb;
-            memset(&tb, 0, sizeof(tb));
-            if (nvmtl_vk_buffer_create(65536, 2, &tb) != 0) {
+            nvk_buffer vbuf;
+            memset(&vbuf, 0, sizeof(vbuf));
+            if (nvmtl_vk_buffer_create(65536, 2, &vbuf) != 0 || !vbuf.map) {
                 fprintf(stderr, "  [FAIL] nvmtl_vk_buffer_create(64 KiB shared) failed on UMA!\\n");
                 return 7;
             }
-            nvmtl_vk_buffer_destroy(&tb);
+            memset(vbuf.map, 0, 4096);
+            float *vf = (float *)vbuf.map;
+            /* Populate plausible viewport / quad floats for CoreDisplay ViewportToNDC buffer slots */
+            vf[0] = 2560.0f; vf[1] = 1600.0f; vf[2] = 1.0f; vf[3] = 1.0f;
+            vf[4] = 0.0f;    vf[5] = 0.0f;    vf[6] = 0.0f; vf[7] = 0.0f;
+            vf[8] = 2560.0f; vf[9] = 0.0f;    vf[10]= 1.0f; vf[11]= 0.0f;
+            vf[12]= 0.0f;    vf[13]= 1600.0f; vf[14]= 0.0f; vf[15]= 1.0f;
+            vf[16]= 2560.0f; vf[17]= 1600.0f; vf[18]= 1.0f; vf[19]= 1.0f;
 
-            nvk_image ti;
-            memset(&ti, 0, sizeof(ti));
-            if (nvmtl_vk_image_create_fmt(256, 256, 1, &ti) != 0) {
+            nvk_image srcImg;
+            memset(&srcImg, 0, sizeof(srcImg));
+            if (nvmtl_vk_image_create_fmt(256, 256, 1, &srcImg) != 0) {
+                nvmtl_vk_buffer_destroy(&vbuf);
                 fprintf(stderr, "  [FAIL] nvmtl_vk_image_create_fmt(256x256 BGRA8) failed on UMA!\\n");
                 return 8;
             }
-            nvmtl_vk_image_destroy(&ti);
             printf("  [OK] UMA buffer + 256x256 BGRA8 optimal image allocation verified\\n");
 
+            nvk_pipeline gpPipe;
+            memset(&gpPipe, 0, sizeof(gpPipe));
+            int haveGpPipe = 0;
             NSData *vsSpv = spvMap[@"ViewportToNDC"];
             if (vsSpv) {
                 for (NSString *fsName in @[@"GPUPass", @"ColorFill", @"TextureCopy"]) {
@@ -278,15 +321,213 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
                     int rc = nvmtl_vk_pipeline_create_depth(
                         vsSpv.bytes, vsSpv.length, fsSpv.bytes, fsSpv.length, 1, 0, &pipe);
                     if (rc != 0) {
+                        nvmtl_vk_image_destroy(&srcImg);
+                        nvmtl_vk_buffer_destroy(&vbuf);
                         fprintf(stderr, "  [FAIL] vkCreateGraphicsPipelines(ViewportToNDC + %s) FAILED (rc=%d)!\\n",
                                 fsName.UTF8String, rc);
                         return 9;
                     }
                     printf("  [OK] Built Xe-LPG VkPipeline: ViewportToNDC + %-12s (%lu + %lu B SPIR-V)\\n",
                            fsName.UTF8String, (unsigned long)vsSpv.length, (unsigned long)fsSpv.length);
-                    nvmtl_vk_pipeline_destroy(&pipe);
+                    if ([fsName isEqualToString:@"GPUPass"] && !haveGpPipe) {
+                        gpPipe = pipe;
+                        haveGpPipe = 1;
+                    } else {
+                        nvmtl_vk_pipeline_destroy(&pipe);
+                    }
                 }
             }
+
+            /*
+             * Live WindowServer Compositor Simulation (2560x1600 BGRA8 IOSurface + CoreDisplay GPUPass
+             * 3D draw + back-to-back async submit-ahead seqno=3->4 + 2560x1600 fullscreen 3D draw + readback).
+             */
+            nvk_pipeline triPipe;
+            memset(&triPipe, 0, sizeof(triPipe));
+            if (nvmtl_vk_pipeline_create_depth(kArcSelfTestFullTriVsSpv, sizeof(kArcSelfTestFullTriVsSpv),
+                                               kArcSelfTestSolidFsSpv, sizeof(kArcSelfTestSolidFsSpv),
+                                               1, 0, &triPipe) != 0) {
+                if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
+                nvmtl_vk_image_destroy(&srcImg);
+                nvmtl_vk_buffer_destroy(&vbuf);
+                fprintf(stderr, "  [FAIL] vkCreateGraphicsPipelines(2560x1600 FullscreenTri) FAILED!\\n");
+                return 10;
+            }
+
+            nvk_queue vq;
+            memset(&vq, 0, sizeof(vq));
+            if (nvmtl_vk_queue_create(&vq) != 0) {
+                nvmtl_vk_pipeline_destroy(&triPipe);
+                if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
+                nvmtl_vk_image_destroy(&srcImg);
+                nvmtl_vk_buffer_destroy(&vbuf);
+                fprintf(stderr, "  [FAIL] nvmtl_vk_queue_create() failed!\\n");
+                return 11;
+            }
+
+            const uint32_t sw = 256, sh = 256, sbpr = 256 * 4;
+            IOSurfaceRef srcSurf = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+                (id)kIOSurfaceWidth : @(sw),
+                (id)kIOSurfaceHeight : @(sh),
+                (id)kIOSurfaceBytesPerElement : @(4),
+                (id)kIOSurfaceBytesPerRow : @(sbpr),
+                (id)kIOSurfaceAllocSize : @(sbpr * sh),
+                (id)kIOSurfacePixelFormat : @(0x42475241)
+            });
+            const uint32_t dw = 2560, dh = 1600, dbpr = 2560 * 4;
+            IOSurfaceRef dstSurf = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+                (id)kIOSurfaceWidth : @(dw),
+                (id)kIOSurfaceHeight : @(dh),
+                (id)kIOSurfaceBytesPerElement : @(4),
+                (id)kIOSurfaceBytesPerRow : @(dbpr),
+                (id)kIOSurfaceAllocSize : @(dbpr * dh),
+                (id)kIOSurfacePixelFormat : @(0x42475241)
+            });
+            nvk_image dstImg;
+            memset(&dstImg, 0, sizeof(dstImg));
+            if (!srcSurf || !dstSurf || nvmtl_vk_image_create_fmt(dw, dh, 1, &dstImg) != 0) {
+                if (srcSurf) CFRelease(srcSurf);
+                if (dstSurf) CFRelease(dstSurf);
+                nvmtl_vk_queue_destroy(&vq);
+                nvmtl_vk_pipeline_destroy(&triPipe);
+                if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
+                nvmtl_vk_image_destroy(&srcImg);
+                nvmtl_vk_buffer_destroy(&vbuf);
+                fprintf(stderr, "  [FAIL] Failed to allocate 2560x1600 IOSurface / VkImage render target!\\n");
+                return 12;
+            }
+
+            IOSurfaceLock(srcSurf, 0, NULL);
+            uint32_t *spx = (uint32_t *)IOSurfaceGetBaseAddress(srcSurf);
+            for (uint32_t i = 0; i < sw * sh; i++) spx[i] = 0xFF4488CCu;
+            IOSurfaceUnlock(srcSurf, 0, NULL);
+
+            nvk_buffer srcHostCache, dstHostCache;
+            memset(&srcHostCache, 0, sizeof(srcHostCache));
+            memset(&dstHostCache, 0, sizeof(dstHostCache));
+
+            IOSurfaceLock(srcSurf, kIOSurfaceLockReadOnly, NULL);
+            void *roBase = IOSurfaceGetBaseAddress(srcSurf);
+            int upRc = nvmtl_vk_image_write_host(&vq, &srcImg, roBase, sbpr, IOSurfaceGetAllocSize(srcSurf), &srcHostCache);
+            if (upRc != 0) upRc = nvmtl_vk_image_write(&vq, &srcImg, roBase, sbpr);
+            if (upRc != 0) {
+                IOSurfaceUnlock(srcSurf, kIOSurfaceLockReadOnly, NULL);
+                nvmtl_vk_host_pages_drop(&srcHostCache);
+                CFRelease(srcSurf);
+                CFRelease(dstSurf);
+                nvmtl_vk_image_destroy(&dstImg);
+                nvmtl_vk_queue_destroy(&vq);
+                nvmtl_vk_pipeline_destroy(&triPipe);
+                if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
+                nvmtl_vk_image_destroy(&srcImg);
+                nvmtl_vk_buffer_destroy(&vbuf);
+                fprintf(stderr, "  [FAIL] nvmtl_vk_image_write_host(256x256 IOSurface -> VkImage) failed!\\n");
+                return 13;
+            }
+            IOSurfaceUnlock(srcSurf, kIOSurfaceLockReadOnly, NULL);
+
+            nvk_sampler samp;
+            memset(&samp, 0, sizeof(samp));
+            (void)nvmtl_vk_sampler_create(1, 0, &samp);
+
+            nvmtl_inflight *inf1 = nvmtl_vk_inflight_new();
+            nvmtl_inflight *inf2 = nvmtl_vk_inflight_new();
+            nvk_cmdbuf cb1, cb2;
+            memset(&cb1, 0, sizeof(cb1));
+            memset(&cb2, 0, sizeof(cb2));
+
+            const float clear1[4] = { 0.25f, 0.50f, 0.75f, 1.0f };
+            nvk_pipeline *pass1Pipe = haveGpPipe ? &gpPipe : &triPipe;
+            if (!inf1 || !inf2 ||
+                nvmtl_vk_cmd_begin(&vq, &cb1) != 0 ||
+                nvmtl_vk_cmd_begin_render(&cb1, &dstImg, pass1Pipe, clear1) != 0) {
+                fprintf(stderr, "  [FAIL] Failed to begin 2560x1600 async RenderPass #1!\\n");
+                return 14;
+            }
+            nvmtl_vk_cmd_set_viewport(&cb1, 0.0f, 0.0f, (float)dw, (float)dh, 0.0f, 1.0f);
+            nvmtl_vk_cmd_set_scissor(&cb1, 0, 0, dw, dh);
+            nvmtl_vk_cmd_set_cull(&cb1, 0);
+            for (uint32_t bi = 0; bi < 4; bi++) {
+                (void)nvmtl_vk_bind_buffer(&cb1, 0, bi, &vbuf, 0);
+                (void)nvmtl_vk_bind_buffer(&cb1, 1, bi, &vbuf, 0);
+            }
+            (void)nvmtl_vk_bind_texture(&cb1, 1, 0, &srcImg);
+            if (samp.s) (void)nvmtl_vk_bind_sampler(&cb1, 1, 0, &samp);
+            nvmtl_vk_cmd_bind_set(&cb1, pass1Pipe);
+            nvmtl_vk_cmd_draw(&cb1, 0, haveGpPipe ? 4u : 3u, 1u, 0u);
+            nvmtl_vk_cmd_end_render(&cb1);
+
+            printf("  [Test B2-Live] Submitting back-to-back async 2560x1600 3D GPUPass + FullscreenTri batches on RCS0...\\n");
+            if (nvmtl_vk_submit_begin(&cb1, inf1) != 0) {
+                fprintf(stderr, "  [FAIL] nvmtl_vk_submit_begin(cb1 2560x1600 GPUPass) FAILED!\\n");
+                return 15;
+            }
+
+            if (nvmtl_vk_cmd_begin(&vq, &cb2) != 0 ||
+                nvmtl_vk_cmd_begin_render_ex(&cb2, &dstImg, &triPipe, clear1, NVMTL_LOAD_COLOUR(0)) != 0) {
+                (void)nvmtl_vk_submit_finish(inf1);
+                fprintf(stderr, "  [FAIL] Failed to begin 2560x1600 async RenderPass #2!\\n");
+                return 16;
+            }
+            nvmtl_vk_cmd_set_viewport(&cb2, 0.0f, 0.0f, (float)dw, (float)dh, 0.0f, 1.0f);
+            nvmtl_vk_cmd_set_scissor(&cb2, 0, 0, dw, dh);
+            nvmtl_vk_cmd_set_cull(&cb2, 0);
+            nvmtl_vk_cmd_bind_set(&cb2, &triPipe);
+            nvmtl_vk_cmd_draw(&cb2, 0, 3u, 1u, 0u);
+            nvmtl_vk_cmd_end_render(&cb2);
+
+            if (nvmtl_vk_submit_begin(&cb2, inf2) != 0) {
+                (void)nvmtl_vk_submit_finish(inf1);
+                fprintf(stderr, "  [FAIL] nvmtl_vk_submit_begin(cb2 2560x1600 submit-ahead) FAILED!\\n");
+                return 17;
+            }
+
+            int fin1 = nvmtl_vk_submit_finish(inf1);
+            int fin2 = nvmtl_vk_submit_finish(inf2);
+            nvmtl_vk_inflight_free(inf1);
+            nvmtl_vk_inflight_free(inf2);
+            if (fin1 != 0 || fin2 != 0) {
+                fprintf(stderr, "  [FAIL] 2560x1600 async 3D batches timed out or faulted (fin1=%d fin2=%d)!\\n", fin1, fin2);
+                return 18;
+            }
+
+            IOSurfaceLock(dstSurf, 0, NULL);
+            uint8_t *dstBytes = (uint8_t *)IOSurfaceGetBaseAddress(dstSurf);
+            memset(dstBytes, 0x11, (size_t)dbpr * dh);
+            int rdRc = nvmtl_vk_image_read_host(&vq, &dstImg, dstBytes, dbpr, IOSurfaceGetAllocSize(dstSurf), &dstHostCache);
+            if (rdRc != 0) {
+                fprintf(stderr, "  [WARN] nvmtl_vk_image_read_host returned %d, testing nvmtl_vk_image_read fallback\\n", rdRc);
+                rdRc = nvmtl_vk_image_read(&vq, &dstImg, dstBytes, dbpr);
+            }
+            const size_t coords[3][2] = { { 0, 0 }, { 1280, 800 }, { 2559, 1599 } };
+            int pxBad = (rdRc != 0) ? 1 : 0;
+            for (int ci = 0; ci < 3 && !pxBad; ci++) {
+                const uint8_t *p = dstBytes + coords[ci][1] * dbpr + coords[ci][0] * 4;
+                int b = p[0], g = p[1], r = p[2], a = p[3];
+                if (abs(b - 223) > 3 || abs(g - 159) > 3 || abs(r - 32) > 3 || abs(a - 255) > 2) {
+                    fprintf(stderr, "  [FAIL] 2560x1600 pixel(%zu,%zu) BGRA=(%d,%d,%d,%d), expected ~(223,159,32,255)!\\n",
+                            coords[ci][0], coords[ci][1], b, g, r, a);
+                    pxBad = 1;
+                }
+            }
+            const uint8_t *mid = dstBytes + 800 * dbpr + 1280 * 4;
+            printf("  [OK] 2560x1600 IOSurface 3D GPUPass + Submit-Ahead + HostReadback pixel(1280,800) BGRA=(%u,%u,%u,%u)\\n",
+                   mid[0], mid[1], mid[2], mid[3]);
+            IOSurfaceUnlock(dstSurf, 0, NULL);
+
+            nvmtl_vk_host_pages_drop(&srcHostCache);
+            nvmtl_vk_host_pages_drop(&dstHostCache);
+            if (samp.s) nvmtl_vk_sampler_destroy(&samp);
+            CFRelease(srcSurf);
+            CFRelease(dstSurf);
+            nvmtl_vk_image_destroy(&dstImg);
+            nvmtl_vk_queue_destroy(&vq);
+            nvmtl_vk_pipeline_destroy(&triPipe);
+            if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
+            nvmtl_vk_image_destroy(&srcImg);
+            nvmtl_vk_buffer_destroy(&vbuf);
+
+            if (pxBad) return 19;
         }
         return 0;
     }
@@ -381,24 +622,27 @@ def transform_objects_m(text: str) -> str:
             "__attribute__((constructor)) static void nvmtl_conf_knobs(void)\n"
             "{\n"
             '    FILE *f = fopen("/Library/GPUBundles/arcmtl/arcmtl.conf", "r");\n'
-            "    if (!f) return;\n"
-            "    char line[512];\n"
-            "    while (fgets(line, sizeof line, f)) {\n"
-            "        char *p = line;\n"
-            "        while (*p == ' ' || *p == '\\t') p++;\n"
-            "        if (*p == '#' || *p == '\\n' || *p == '\\r' || !*p) continue;\n"
-            "        char *eq = strchr(p, '=');\n"
-            "        if (!eq) continue;\n"
-            "        *eq = 0;\n"
-            "        char *key = p, *val = eq + 1;\n"
-            "        char *end = key + strlen(key);\n"
-            "        while (end > key && (end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
-            "        end = val + strlen(val);\n"
-            "        while (end > val && (end[-1] == '\\n' || end[-1] == '\\r' || end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
-            '        if (strncmp(key, "ARCMTL_", 7) != 0) continue;\n'
-            "        if (!getenv(key)) setenv(key, val, 1);\n"
+            "    if (f) {\n"
+            "        char line[512];\n"
+            "        while (fgets(line, sizeof line, f)) {\n"
+            "            char *p = line;\n"
+            "            while (*p == ' ' || *p == '\\t') p++;\n"
+            "            if (*p == '#' || *p == '\\n' || *p == '\\r' || !*p) continue;\n"
+            "            char *eq = strchr(p, '=');\n"
+            "            if (!eq) continue;\n"
+            "            *eq = 0;\n"
+            "            char *key = p, *val = eq + 1;\n"
+            "            char *end = key + strlen(key);\n"
+            "            while (end > key && (end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
+            "            end = val + strlen(val);\n"
+            "            while (end > val && (end[-1] == '\\n' || end[-1] == '\\r' || end[-1] == ' ' || end[-1] == '\\t')) *--end = 0;\n"
+            '            if (strncmp(key, "ARCMTL_", 7) != 0) continue;\n'
+            "            if (!getenv(key)) setenv(key, val, 1);\n"
+            "        }\n"
+            "        fclose(f);\n"
             "    }\n"
-            "    fclose(f);\n"
+            '    const char *tbimr = getenv("ARCMTL_TBIMR");\n'
+            '    if (!tbimr || strcmp(tbimr, "1") != 0) setenv("intel_tbimr", "false", 0);\n'
             "}\n"
         ),
         text,

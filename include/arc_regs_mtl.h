@@ -272,8 +272,10 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_RESET_CTL_CAT_ERROR           (1u << 2)
 #define   ARC_RESET_CTL_READY_TO_RESET      (1u << 1)
 #define   ARC_RESET_CTL_REQUEST_RESET       (1u << 0)
-#define ARC_RING_CS_DEBUG_MODE2(base)       ((base) + 0x0D8u) /* Masked: Wa_18022495364 */
+#define ARC_RING_CS_DEBUG_MODE2(base)       ((base) + 0x0D8u) /* Masked: CONSTANT_BUFFERAddressOffsetDisable + Wa_18022495364 */
+#define   ARC_CONSTANT_BUFFER_OFFSET_DISABLE (1u << 4)        /* 3DSTATE_CONSTANT_* uses 48-bit PPGTT VA (ANV gfx125_init_device_state) */
 #define   ARC_INSTRUCTION_STATE_CACHE_INV   (1u << 6)
+#define   ARC_CS_DEBUG_MODE2_RCS_DEFAULT    (ARC_CONSTANT_BUFFER_OFFSET_DISABLE | ARC_INSTRUCTION_STATE_CACHE_INV)
 #define ARC_RING_BLIT_CCTL(base)            ((base) + 0x204u) /* Non-masked: [14:9]=dst MOCS, [6:1]=src MOCS */
 #define ARC_RING_EXECLIST_STATUS_LO(base)   ((base) + 0x234u)
 #define ARC_RING_EXECLIST_STATUS_HI(base)   ((base) + 0x238u)
@@ -369,12 +371,22 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_PC_STALL_AT_SCOREBOARD        (1u << 1)
 #define   ARC_PC_DEPTH_CACHE_FLUSH          (1u << 0)
 
-/* Xe-LPG 12.70..12.74 Hardware Workaround & Render Tuning Registers (Linux xe_wa.c / xe_tuning.c / xe_hw_engine.c) */
+/* Xe-LPG 12.70..12.74 Hardware Workaround & Render Tuning Registers (Linux xe_wa.c / xe_tuning.c / xe_hw_engine.c / Mesa ANV genX_init_state.c) */
 #define ARC_GFXPIPE_3D_CMD(op, sub)         ((0x3u << 29) | (0x3u << 27) | ((uint32_t)(op) << 24) | ((uint32_t)(sub) << 16))
+#define ARC_REG_CS_CHICKEN1                 0x002580u /* Masked RCS0 (xe_engine_regs.h:212 / ANV genX_init_state.c:525) */
+#define   ARC_CS_PREEMPT_3D_OBJECT_LEVEL    (1u << 0) /* Disable BIT(0) -> MidcmdbufferPreemption */
+#define ARC_REG_CHICKEN_RASTER_1            0x006204u /* Masked MCR (xe_gt_regs.h:126) */
+#define   ARC_DIS_SF_ROUND_NEAREST_EVEN     (1u << 8)
+#define ARC_REG_CHICKEN_RASTER_2            0x006208u /* Masked MCR (xe_gt_regs.h:130 / ANV genX_init_state.c:627) */
+#define   ARC_TBIMR_FAST_CLIP               (1u << 5)
+#define ARC_REG_FF_MODE2                    0x006604u /* Non-masked MCR (xe_gt_regs.h:147 / ANV: GS=224, TDS=4, HS=224) */
+#define   ARC_FF_MODE2_ANV_TIMERS           0xE004E000u
+#define ARC_REG_XEHPG_INSTDONE_GEOM_SVG     0x00666Cu /* Read-only MCR 3D Geometry/SVG INSTDONE */
 #define ARC_REG_CACHE_MODE_1                0x007004u /* Masked MCR */
 #define   ARC_MSAA_OPTIMIZATION_REDUC_DIS   (1u << 11)/* Wa_18019271663 */
 #define ARC_REG_XEHP_PSS_CHICKEN            0x007044u /* Masked MCR */
 #define   ARC_FD_END_COLLECT                (1u << 5) /* Wa_14019877138 */
+#define ARC_REG_XEHPG_SC_INSTDONE           0x007100u /* Read-only Subslice INSTDONE */
 #define ARC_REG_COMMON_SLICE_CHICKEN3       0x007304u /* Masked MCR (xe_lrc.c / anv_queue.c) */
 #define   ARC_DISABLE_STATE_CACHE_PERF_FIX  (1u << 13)
 #define ARC_REG_SQCNT1                      0x008718u /* Non-masked MCR */
@@ -386,6 +398,8 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_L3_PWM_TIMER_INIT_7F          0x0000007Fu
 #define ARC_REG_COMP_MOD_CTRL               0x00CF30u /* Non-masked GAM MCR */
 #define   ARC_FORCE_MISS_FTLB               (1u << 3) /* Wa_14018575942 */
+#define ARC_REG_SAMPLER_INSTDONE            0x00E160u /* Read-only MCR Sampler INSTDONE */
+#define ARC_REG_ROW_INSTDONE                0x00E164u /* Read-only MCR EU Row INSTDONE */
 #define ARC_REG_SAMPLER_MODE                0x00E18Cu /* Masked MCR */
 #define   ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE (1u << 0) /* Xe-LPG Render Tuning (xe_tuning.c:91-95) */
 #define ARC_REG_ROW_CHICKEN3                0x00E49Cu /* Masked MCR */

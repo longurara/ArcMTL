@@ -311,13 +311,25 @@ ArcBo *ArcXeService::importTaskMemoryBo(task_t task, uint64_t userAddr, uint64_t
     if (!task || !userAddr || !size || (userAddr & 0xFFFULL)) return nullptr;
     const uint64_t alignedSize = (size + 0xFFFULL) & ~0xFFFULL;
 
+    bool readOnly = false;
     IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(
         (mach_vm_address_t)userAddr, (mach_vm_size_t)alignedSize,
         kIODirectionInOut, task);
-    if (!md) return nullptr;
-    if (md->prepare() != kIOReturnSuccess) {
-        md->release();
-        return nullptr;
+    if (!md || md->prepare() != kIOReturnSuccess) {
+        if (md) {
+            md->release();
+            md = nullptr;
+        }
+        /* Retry read-only (VM_PROT_READ) for kIOSurfaceLockReadOnly / const host-pointer uploads */
+        md = IOMemoryDescriptor::withAddressRange(
+            (mach_vm_address_t)userAddr, (mach_vm_size_t)alignedSize,
+            kIODirectionOut, task);
+        if (!md) return nullptr;
+        if (md->prepare() != kIOReturnSuccess) {
+            md->release();
+            return nullptr;
+        }
+        readOnly = true;
     }
 
     ArcBo *bo = IONewZero(ArcBo, 1);
@@ -330,6 +342,7 @@ ArcBo *ArcXeService::importTaskMemoryBo(task_t task, uint64_t userAddr, uint64_t
     bo->ownedBuf = nullptr;
     bo->memDesc  = md;
     bo->prepared = true;
+    bo->readOnly = readOnly;
     bo->size     = alignedSize;
     bo->flags    = flags;
     bo->patIndex = (patIndex < ARC_MTL_PAT_NUM_ENTRIES) ? patIndex : ARC_MTL_PAT_IDX_WB_2WAY_COH;
@@ -586,7 +599,8 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
 
             /* Xe-LPG 12.71 (< Xe2 IP 20) does NOT have hardware PTE BIT(9) NULL; map null binds to zeroed fNullPageBo */
             const uint64_t targetPhys = isNull ? nullPhys : (physPage + sub);
-            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, /*readWrite=*/true, /*nullPage=*/false);
+            const bool rwPte = isNull ? true : (!bo || !bo->readOnly);
+            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, rwPte, /*nullPage=*/false);
             arcClflushEntry(&pt->entries[idx0]);
         }
 

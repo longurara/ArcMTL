@@ -60,8 +60,15 @@ void ArcXeService::armEngineHw(uint32_t base, ArcBo *hwsp)
         wr32(ARC_RING_BLIT_CCTL(base),
              (curBlitCctl & ~0x7E7Eu) | (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1));
     } else if (base == ARC_RENDER_RING_BASE) {
-        /* Wa_18022495364: Global instruction/state cache invalidate on RCS0 (matches ANV genX_init_state.c) */
-        wr32(ARC_RING_CS_DEBUG_MODE2(base), ARC_MASKED_ENABLE(ARC_INSTRUCTION_STATE_CACHE_INV));
+        /*
+         * Program privileged RCS0 registers required by Mesa ANV genX_init_state.c (which Intel CS
+         * drops as NO-OPs when ANV emits them inside non-privileged PPGTT user batches):
+         *   - CS_DEBUG_MODE2 BIT(4) (CONSTANT_BUFFERAddressOffsetDisable): 3DSTATE_CONSTANT_* takes 48-bit PPGTT VAs!
+         *   - CS_DEBUG_MODE2 BIT(6) (Wa_18022495364: Global instruction/state cache invalidate)
+         */
+        wr32(ARC_REG_CS_CHICKEN1, ARC_MASKED_DISABLE(ARC_CS_PREEMPT_3D_OBJECT_LEVEL));
+        wr32(ARC_REG_FF_MODE2,    ARC_FF_MODE2_ANV_TIMERS);
+        wr32(ARC_RING_CS_DEBUG_MODE2(base), ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT));
     }
     /* Masked write: enable Execlist mode (disable legacy ringbuffer mode) */
     wr32(ARC_RING_GFX_MODE(base), ARC_MASKED_ENABLE(ARC_GFX_DISABLE_LEGACY_MODE));
@@ -84,13 +91,13 @@ bool ArcXeService::resetEngineHw(uint32_t base, ArcBo *hwsp)
     else
         fLastRcsQueue = nullptr;
     if (idleQ && idleQ->ctxRegsCpu) {
-        idleQ->ringTail        = 0u;
+        idleQ->ringTail        = idleQ->initRingTail;
         idleQ->hasSavedHwState = false;
         idleQ->isLoadedOnHw    = false;
         idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
             ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
         idleQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = 0u;
-        idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = 0u;
+        idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->initRingTail;
     }
 
     wr32(ARC_RING_MI_MODE(base), ARC_MASKED_ENABLE(ARC_MI_STOP_RING));
@@ -479,16 +486,55 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         { ARC_GFXPIPE_3D_CMD(0x1, 0x00),  4 }, /* 3DSTATE_DRAWING_RECTANGLE */
     };
 
+    q->holdsForceWake = forceWakeGet();
+
+    uint32_t l3sqcreg5Val = 0x00200000u | ARC_L3_PWM_TIMER_INIT_7F;
+    uint32_t blitCctlVal  = (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1);
+    if (q->holdsForceWake) {
+        if (isRcs) {
+            wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
+            (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+            l3sqcreg5Val = (rd32(ARC_REG_XEHP_L3SQCREG5) & ~ARC_L3_PWM_TIMER_INIT_VAL_MASK) | ARC_L3_PWM_TIMER_INIT_7F;
+            wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+            (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+        } else if (base == ARC_BLT_RING_BASE) {
+            blitCctlVal = (rd32(ARC_RING_BLIT_CCTL(base)) & ~0x7E7Eu) |
+                          (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1);
+        }
+    }
+
     uint32_t initDw = 0;
     q->ringCpu[initDw++] = ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE;
     if (isRcs) {
-        q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u);
+        /*
+         * Emit all Xe-LPG LRC context-saved workarounds & tunings (Linux xe_wa.c:lrc_was,
+         * xe_tuning.c:lrc_tunings, xe_gt.c:emit_wa_job) plus privileged registers expected by
+         * Mesa ANV genX_init_state.c in the privileged GGTT ring buffer so every LRC context image
+         * (both user queues and fRcsIdleQueue) bakes in:
+         *   - Wa_18019271663 (CACHE_MODE_1.MSAA_OPTIMIZATION_REDUC_DIS)
+         *   - Wa_14019877138 (XEHP_PSS_CHICKEN.FD_END_COLLECT — Pixel Scoreboard Fragment-Done!)
+         *   - Tuning: L3 cache (XEHP_L3SQCREG5 = 0x7F)
+         *   - CONSTANT_BUFFERAddressOffsetDisable (CS_DEBUG_MODE2 BIT(4)) + Wa_18022495364 (BIT(6))
+         */
+        q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(7u);
         q->ringCpu[initDw++] = ARC_REG_COMMON_SLICE_CHICKEN3;
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_DISABLE_STATE_CACHE_PERF_FIX);
+        q->ringCpu[initDw++] = ARC_REG_CACHE_MODE_1;
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_MSAA_OPTIMIZATION_REDUC_DIS);
+        q->ringCpu[initDw++] = ARC_REG_XEHP_PSS_CHICKEN;
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_FD_END_COLLECT);
+        q->ringCpu[initDw++] = ARC_REG_XEHP_L3SQCREG5;
+        q->ringCpu[initDw++] = l3sqcreg5Val;
+        q->ringCpu[initDw++] = ARC_REG_CHICKEN_RASTER_2;
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_TBIMR_FAST_CLIP);
+        q->ringCpu[initDw++] = ARC_REG_FF_MODE2;
+        q->ringCpu[initDw++] = ARC_FF_MODE2_ANV_TIMERS;
+        q->ringCpu[initDw++] = ARC_REG_CS_CHICKEN1;
+        q->ringCpu[initDw++] = ARC_MASKED_DISABLE(ARC_CS_PREEMPT_3D_OBJECT_LEVEL);
 
         q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
-        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(0) */
-        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_INSTRUCTION_STATE_CACHE_INV);
+        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(RCS0): BIT(4) CONSTANT_BUFFERAddressOffsetDisable | BIT(6) */
+        q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT);
 
         for (const auto &st : kXeHpgSvgState) {
             q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
@@ -497,17 +543,20 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
             }
         }
     } else {
-        q->ringCpu[initDw++] = ARC_MI_NOOP;
+        /* BCS0 context-saved BLIT_CCTL default UC MOCS (Linux xe_hw_engine.c:352-360) */
+        q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
+        q->ringCpu[initDw++] = 0x204u; /* BLIT_CCTL(0) */
+        q->ringCpu[initDw++] = blitCctlVal;
     }
     if (initDw & 1u)
         q->ringCpu[initDw++] = ARC_MI_NOOP;
-    q->ringTail = initDw * 4u;
+    q->initRingTail = initDw * 4u;
+    q->ringTail     = q->initRingTail;
     reg[ARC_CTX_RING_HEAD_VAL] = 0u;
     reg[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
     /* Flush all 76 KiB of lrcBo + 4 KiB fenceBo so zeroed WB cachelines never collide with HW Context-Save */
     clflushRange(cpuBase, totalSize);
     clflushRange(fenceCpuBase, 4096);
-    q->holdsForceWake = forceWakeGet();
 
     return q;
 }
@@ -667,6 +716,29 @@ static inline void readEngineDiagMmio(const ArcXeService *svc, uint32_t b, ArcXe
     d->mi_mode          = svc->rd32(ARC_RING_MI_MODE(b));
 }
 
+static inline void readRcsSubunitDiag(const ArcXeService *svc, uint32_t b,
+                                      uint32_t &outDbg2, uint32_t &outGeom,
+                                      uint32_t &outSc, uint32_t &outSamp, uint32_t &outRow)
+{
+    outDbg2 = svc->rd32(ARC_RING_CS_DEBUG_MODE2(b));
+    if (b != ARC_RENDER_RING_BASE) {
+        outGeom = outSc = outSamp = outRow = 0u;
+        return;
+    }
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
+    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  0u);
+    svc->wr32(ARC_REG_MCR_SELECTOR,     0u);
+    (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+    outGeom = svc->rd32(ARC_REG_XEHPG_INSTDONE_GEOM_SVG);
+    outSc   = svc->rd32(ARC_REG_XEHPG_SC_INSTDONE);
+    outSamp = svc->rd32(ARC_REG_SAMPLER_INSTDONE);
+    outRow  = svc->rd32(ARC_REG_ROW_INSTDONE);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
+    (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+}
+
 IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno)
 {
     if (!q || !q->lrcBo || !q->fenceBo || fStopping) return kIOReturnBadArgument;
@@ -694,22 +766,26 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     if (lastQ && lastQ->seqnoCpu) {
         ArcExecQueue *prevQ = lastQ;
         const uint64_t prevTarget = prevQ->lastSubmittedSeqno;
-        for (uint32_t us = 0; us < 500000u && *prevQ->seqnoCpu < prevTarget; us += 5u) {
+        for (uint32_t us = 0; us < 5000000u && *prevQ->seqnoCpu < prevTarget; us += 5u) {
             IODelay(5);
         }
         const bool prevDone = (*prevQ->seqnoCpu >= prevTarget);
         const bool parked   = prevDone ? parkEngineOnIdleContextLocked(q->mmioBase, prevQ) : false;
         if (!prevDone || !parked) {
             ArcXeWaitQueueOut snap = {};
+            uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
             readEngineDiagMmio(this, q->mmioBase, &snap);
+            readRcsSubunitDiag(this, q->mmioBase, dbg2, geomId, scId, sampId, rowId);
             AXELOG("submitBatch predecessor stall (prevQ=%u target=%llu cur=%llu parked=%d): "
                    "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
-                   "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
+                   "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x DBG2=0x%08x "
+                   "GEOM=0x%08x SC=0x%08x SAMP=0x%08x ROW=0x%08x MI_MODE=0x%08x -> resetting engine",
                    prevQ->queueId, (unsigned long long)prevTarget, (unsigned long long)(*prevQ->seqnoCpu),
                    parked ? 1 : 0,
                    snap.engine_status_hi, snap.engine_status, snap.current_lrca,
                    snap.ring_head, snap.ring_tail, snap.ring_start, snap.ring_ctl,
-                   snap.acthd_hi, snap.acthd_lo, snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
+                   snap.acthd_hi, snap.acthd_lo, snap.ipehr, snap.esr, snap.instdone, dbg2,
+                   geomId, scId, sampId, rowId, snap.mi_mode);
 
             ArcBo *hwsp = nullptr;
             (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
@@ -732,29 +808,21 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     const uint64_t seqno = ++q->lastSubmittedSeqno;
     const uint32_t invalScratchGgtt = q->invalScratchGgtt;
 
-    /*
-     * Invalidate GAM Aux-Table TLB while engine is idle between batches (Linux xe_ring_ops.c:52-70)
-     * using a bounded MMIO poll so CS never stalls on MI_SEMAPHORE_WAIT when AuxCCS is disabled.
-     */
-    if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
-        wr32(ARC_REG_CCS_AUX_INV, ARC_AUX_INV);
-        for (uint32_t us = 0; us < 200u; us += 2u) {
-            if ((rd32(ARC_REG_CCS_AUX_INV) & ARC_AUX_INV) == 0u)
-                break;
-            IODelay(2);
-        }
-    }
-
     /* Never allow a multi-dword CS instruction packet to straddle the end of the ring buffer */
-    if ((q->ringSize - q->ringTail) < 224u) {
+    if ((q->ringSize - q->ringTail) < 256u) {
         while (q->ringTail != 0u) {
             ringEmitDword(q, ARC_MI_NOOP);
         }
     }
 
-    /* 1. Pre-batch CS Preparser Disable + Cache & TLB Invalidate (Linux xe_ring_ops.c:469-481) */
+    /* 1. Pre-batch CS Preparser Disable + Privileged CS_DEBUG_MODE2 Guard + Cache & TLB Invalidate */
     ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(true));
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
+        /* Guarantee CONSTANT_BUFFERAddressOffsetDisable (BIT(4)) + Wa_18022495364 (BIT(6)) before every 3D/Compute PPGTT batch */
+        ringEmitDword(q, ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO);
+        ringEmitDword(q, 0x0D8u);
+        ringEmitDword(q, ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT));
+
         uint32_t pcFlags0 = ARC_PC0_L3_RO_CACHE_INVALIDATE;
         uint32_t pcFlags1 = ARC_PC_CS_STALL | ARC_PC_TLB_INVALIDATE |
                             ARC_PC_CMD_CACHE_INVALIDATE | ARC_PC_INST_CACHE_INVALIDATE |
@@ -946,18 +1014,22 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
             IOLockLock(fEngineLock);
             if (forceWakeGet()) {
                 const uint32_t b = q->mmioBase;
+                uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
                 readEngineDiagMmio(this, b, &snap);
+                readRcsSubunitDiag(this, b, dbg2, geomId, scId, sampId, rowId);
                 if (resetOnTimeout) {
                     AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
                            "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
-                           "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x MI_MODE=0x%08x -> resetting engine",
+                           "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x DBG2=0x%08x "
+                           "GEOM=0x%08x SC=0x%08x SAMP=0x%08x ROW=0x%08x MI_MODE=0x%08x -> resetting engine",
                            q->queueId, (unsigned long long)targetSeqno, (unsigned long long)cur,
                            snap.engine_status_hi, snap.engine_status,
                            snap.current_lrca,
                            snap.ring_head, snap.ring_tail,
                            snap.ring_start, snap.ring_ctl,
                            snap.acthd_hi, snap.acthd_lo,
-                           snap.ipehr, snap.esr, snap.instdone, snap.mi_mode);
+                           snap.ipehr, snap.esr, snap.instdone, dbg2,
+                           geomId, scId, sampId, rowId, snap.mi_mode);
 
                     ArcBo *hwsp = nullptr;
                     (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);

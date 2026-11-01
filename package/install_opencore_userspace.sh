@@ -183,11 +183,12 @@ if [ -x /usr/local/bin/vk_offscreen_test ]; then
     fi
 fi
 if [ -x /usr/local/bin/mtl_offscreen_test ]; then
-    echo "--- [Test B2] mtl_offscreen_test --verify-bundle (CoreDisplay default.metallib -> AIR -> SPIR-V -> Xe-LPG VkPipeline) ---"
+    echo "--- [Test B2] mtl_offscreen_test --verify-bundle (CoreDisplay default.metallib + Live 2560x1600 3D GPUPass & Submit-Ahead) ---"
     if /usr/local/bin/mtl_offscreen_test --verify-bundle "$GB/ArcMTLDriver.bundle" --with-vk; then
         BUNDLE_OK=1
     else
-        echo "[WARN] ArcMTLDriver.bundle CoreDisplay verification returned non-zero"
+        echo "[WARN] ArcMTLDriver.bundle CoreDisplay / 2560x1600 3D verification returned non-zero"
+        log show --last 2m --style compact --predicate 'eventMessage CONTAINS "ArcXe:" OR eventMessage CONTAINS "ArcMTL:"' 2>/dev/null | tail -n 30 || true
     fi
     if id _windowserver >/dev/null 2>&1; then
         chown -R _windowserver:wheel "$GB/arcmtl/aircache" "$GB/arcmtl/spvcache" 2>/dev/null || true
