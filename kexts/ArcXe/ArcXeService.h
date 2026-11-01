@@ -63,7 +63,7 @@ struct ArcVm {
     ArcPtPage                  *pml4;           /* Level 3 root page table */
 };
 
-/* Hardware Execution Context (LRC + Ring + PPHWSP in GGTT) */
+/* Hardware Execution Context (LRC + Ring + PPHWSP + Dedicated Fence Page in GGTT) */
 struct ArcExecQueue {
     uint32_t                    queueId;
     uint32_t                    vmId;
@@ -71,7 +71,11 @@ struct ArcExecQueue {
     uint16_t                    engineInstance;
     uint32_t                    mmioBase;
     uint32_t                    swCtxId;
+    bool                        isIdleKernelCtx;
+    bool                        hasSavedHwState;
+    bool                        isLoadedOnHw;
     ArcBo                      *lrcBo;          /* [0..16K): Ring | [16K..20K): PPHWSP | [20K..+56K): Context Image */
+    ArcBo                      *fenceBo;        /* Dedicated 4K GGTT page isolated from HW PPHWSP CSB/status writes */
     uint32_t                    ringGgttAddr;
     uint32_t                    pphwspGgttAddr;
     uint32_t                    ctxImgGgttAddr;
@@ -79,8 +83,9 @@ struct ArcExecQueue {
     uint32_t                    ringTail;
     volatile uint32_t          *ringCpu;
     volatile uint32_t          *ctxRegsCpu;
-    volatile uint64_t          *seqnoCpu;       /* Offset 0x80 inside PPHWSP */
+    volatile uint64_t          *seqnoCpu;       /* Offset 0x00 inside dedicated fenceBo */
     uint32_t                    seqnoGgttAddr;
+    uint32_t                    invalScratchGgtt;
     uint64_t                    lastSubmittedSeqno;
     uint64_t                    pml4Phys;
     IOLock                     *submitLock;
@@ -138,11 +143,14 @@ public:
     uint32_t                    fGgttWriteCount     = 0;
     ArcBo                      *fScratchPageBo      = nullptr;
 
-    /* Per-Engine Global Hardware Status Pages (HWSP) & Submission Locks */
+    /* Per-Engine Global Hardware Status Pages (HWSP), Idle Contexts & Submission Locks */
     IOLock                     *fEngineLock         = nullptr;
     ArcBo                      *fRcsHwspBo          = nullptr;
     ArcBo                      *fCcsHwspBo          = nullptr;
     ArcBo                      *fBcsHwspBo          = nullptr;
+    ArcVm                      *fKernelIdleVm       = nullptr;
+    ArcExecQueue               *fRcsIdleQueue       = nullptr;
+    ArcExecQueue               *fBcsIdleQueue       = nullptr;
     ArcExecQueue               *fLastRcsQueue       = nullptr;
     ArcExecQueue               *fLastBcsQueue       = nullptr;
     uint32_t                    fNextSwCtxId        = 1;
@@ -213,8 +221,11 @@ public:
     void armEngineHw(uint32_t base, ArcBo *hwsp);
     bool resetEngineHw(uint32_t base, ArcBo *hwsp);
     uint32_t engineMmioBase(uint16_t engineClass, uint16_t engineInstance, ArcBo **outHwsp) const;
-    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance, uint32_t ringSize);
+    void     switchToIdleContextLocked(uint32_t base);
+    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance,
+                                  uint32_t ringSize, bool isIdleQueue = false);
     void          destroyExecQueue(ArcExecQueue *q);
+    bool          parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *prevQueue);
     IOReturn      submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno);
     IOReturn      waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                  uint64_t *outCompleted, bool *outTimedOut,

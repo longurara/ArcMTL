@@ -230,6 +230,7 @@ void ArcXeService::programMtlMocsTable()
     /* Steer GT0 MCR selectors to group 0 / instance 0 with multicast write broadcast enabled */
     wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
     wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
     wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
 
@@ -248,26 +249,41 @@ void ArcXeService::programMtlMocsTable()
 void ArcXeService::applyXeLpgWorkarounds()
 {
     /*
-     * Meteor Lake Xe-LPG (Graphics IP 12.70..12.74) GT, Engine & LRC Hardware Workarounds
-     * (Linux drivers/gpu/drm/xe/xe_wa.c: gt_was / engine_was / lrc_was).
+     * Meteor Lake Xe-LPG (Graphics IP 12.70..12.74) GT, Engine & LRC Hardware Workarounds + Render Tunings
+     * (Linux drivers/gpu/drm/xe/xe_wa.c, xe_tuning.c & xe_hw_engine.c).
      * Must be applied with forcewake held and re-applied after any GRDOM_RENDER reset.
      */
+    wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
+    wr32(ARC_REG_SF_MCR_SELECTOR,  0u);
+    wr32(ARC_REG_MCR_SELECTOR,     0u);
+    wr32(ARC_REG_GAM_MCR_SELECTOR, 0u);
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+
+    const uint32_t compMod   = rd32(ARC_REG_COMP_MOD_CTRL);
+    const uint32_t sqcnt1    = rd32(ARC_REG_SQCNT1);
+    const uint32_t l3sqcreg5 = rd32(ARC_REG_XEHP_L3SQCREG5);
+
     wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
     wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
     wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
 
-    /* GT MCR workarounds (non-masked RMW on group 0/instance 0 -> multicast broadcast) */
-    wr32(ARC_REG_COMP_MOD_CTRL, rd32(ARC_REG_COMP_MOD_CTRL) | ARC_FORCE_MISS_FTLB);       /* Wa_14018575942 */
-    wr32(ARC_REG_SQCNT1,        rd32(ARC_REG_SQCNT1)        | ARC_SQCNT1_ENFORCE_RAR);    /* Wa_22016670082 */
+    /* GT & MCR workarounds + L3 PWM tuning + RCU CCS mode */
+    wr32(ARC_REG_MISCCPCTL,      rd32(ARC_REG_MISCCPCTL) & ~ARC_DOP_CLOCK_GATE_RENDER_ENABLE); /* Wa_14015795083 */
+    wr32(ARC_REG_COMP_MOD_CTRL,  compMod | ARC_FORCE_MISS_FTLB);                               /* Wa_14018575942 */
+    wr32(ARC_REG_SQCNT1,         sqcnt1  | ARC_SQCNT1_ENFORCE_RAR);                            /* Wa_22016670082 */
+    wr32(ARC_REG_XEHP_L3SQCREG5, (l3sqcreg5 & ~ARC_L3_PWM_TIMER_INIT_VAL_MASK) | ARC_L3_PWM_TIMER_INIT_7F);
+    wr32(ARC_REG_RCU_MODE,       ARC_MASKED_ENABLE(ARC_RCU_MODE_CCS_ENABLE));
 
-    /* Engine & LRC masked MCR chicken workarounds for RCS0/CCS0 */
-    wr32(ARC_REG_ROW_CHICKEN3,      ARC_MASKED_ENABLE(ARC_DIS_FIX_EOT1_FLUSH));           /* Wa_14017856879 */
-    wr32(ARC_REG_XEHP_HDC_CHICKEN0, ARC_MASKED_ENABLE(ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES));/* Wa_14015150844 */
-    wr32(ARC_REG_ROW_CHICKEN2,      ARC_MASKED_ENABLE(ARC_DISABLE_TDL_SVHS_GATING));      /* Wa_14020495402 */
-    wr32(ARC_REG_XEHP_PSS_CHICKEN,  ARC_MASKED_ENABLE(ARC_FD_END_COLLECT));               /* Wa_14019877138 */
-    wr32(ARC_REG_CACHE_MODE_1,      ARC_MASKED_ENABLE(ARC_MSAA_OPTIMIZATION_REDUC_DIS));  /* Wa_18019271663 */
-    (void)rd32(ARC_REG_ROW_CHICKEN3);
+    /* Engine & LRC masked MCR chicken workarounds + Render Indirect State Base Address Override (ANV/BLORP) */
+    wr32(ARC_REG_SAMPLER_MODE,      ARC_MASKED_ENABLE(ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE)); /* xe_tuning.c:91-95 */
+    wr32(ARC_REG_ROW_CHICKEN3,      ARC_MASKED_ENABLE(ARC_DIS_FIX_EOT1_FLUSH));                /* Wa_14017856879 */
+    wr32(ARC_REG_XEHP_HDC_CHICKEN0, ARC_MASKED_ENABLE(ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES));     /* Wa_14015150844 */
+    wr32(ARC_REG_ROW_CHICKEN2,      ARC_MASKED_ENABLE(ARC_DISABLE_TDL_SVHS_GATING));           /* Wa_14020495402 */
+    wr32(ARC_REG_XEHP_PSS_CHICKEN,  ARC_MASKED_ENABLE(ARC_FD_END_COLLECT));                    /* Wa_14019877138 */
+    wr32(ARC_REG_CACHE_MODE_1,      ARC_MASKED_ENABLE(ARC_MSAA_OPTIMIZATION_REDUC_DIS));       /* Wa_18019271663 */
+    (void)rd32(ARC_REG_SAMPLER_MODE);
 }
 
 void ArcXeService::invalidateGlobalTlb()

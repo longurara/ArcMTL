@@ -138,6 +138,7 @@ static inline bool arcIsSupportedXeLpgDevice(uint16_t vendor, uint16_t device)
  * ============================================================================ */
 #define ARC_REG_MTL_MCR_SELECTOR            0x000FD4u
 #define ARC_REG_SF_MCR_SELECTOR             0x000FD8u
+#define ARC_REG_MCR_SELECTOR                0x000FDCu
 #define ARC_REG_GAM_MCR_SELECTOR            0x000FE0u
 #define   ARC_MCR_MULTICAST                 (1u << 31)
 
@@ -266,6 +267,8 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_RESET_CTL_CAT_ERROR           (1u << 2)
 #define   ARC_RESET_CTL_READY_TO_RESET      (1u << 1)
 #define   ARC_RESET_CTL_REQUEST_RESET       (1u << 0)
+#define ARC_RING_CS_DEBUG_MODE2(base)       ((base) + 0x0D8u) /* Masked: Wa_18022495364 */
+#define   ARC_INSTRUCTION_STATE_CACHE_INV   (1u << 6)
 #define ARC_RING_BLIT_CCTL(base)            ((base) + 0x204u) /* Non-masked: [14:9]=dst MOCS, [6:1]=src MOCS */
 #define ARC_RING_EXECLIST_STATUS_LO(base)   ((base) + 0x234u)
 #define ARC_RING_EXECLIST_STATUS_HI(base)   ((base) + 0x238u)
@@ -361,21 +364,30 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_PC_STALL_AT_SCOREBOARD        (1u << 1)
 #define   ARC_PC_DEPTH_CACHE_FLUSH          (1u << 0)
 
-/* Xe-LPG 12.70..12.74 Hardware Workaround Registers (Linux drivers/gpu/drm/xe/xe_wa.c) */
+/* Xe-LPG 12.70..12.74 Hardware Workaround & Render Tuning Registers (Linux xe_wa.c / xe_tuning.c / xe_hw_engine.c) */
 #define ARC_REG_CACHE_MODE_1                0x007004u /* Masked MCR */
 #define   ARC_MSAA_OPTIMIZATION_REDUC_DIS   (1u << 11)/* Wa_18019271663 */
 #define ARC_REG_XEHP_PSS_CHICKEN            0x007044u /* Masked MCR */
 #define   ARC_FD_END_COLLECT                (1u << 5) /* Wa_14019877138 */
 #define ARC_REG_SQCNT1                      0x008718u /* Non-masked MCR */
 #define   ARC_SQCNT1_ENFORCE_RAR            (1u << 23)/* Wa_22016670082 */
+#define ARC_REG_MISCCPCTL                   0x009424u /* Non-masked GT */
+#define   ARC_DOP_CLOCK_GATE_RENDER_ENABLE  (1u << 1) /* Wa_14015795083 */
+#define ARC_REG_XEHP_L3SQCREG5              0x00B158u /* Non-masked MCR */
+#define   ARC_L3_PWM_TIMER_INIT_VAL_MASK    0x000003FFu
+#define   ARC_L3_PWM_TIMER_INIT_7F          0x0000007Fu
 #define ARC_REG_COMP_MOD_CTRL               0x00CF30u /* Non-masked GAM MCR */
 #define   ARC_FORCE_MISS_FTLB               (1u << 3) /* Wa_14018575942 */
+#define ARC_REG_SAMPLER_MODE                0x00E18Cu /* Masked MCR */
+#define   ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE (1u << 0) /* Xe-LPG Render Tuning (xe_tuning.c:91-95) */
 #define ARC_REG_ROW_CHICKEN3                0x00E49Cu /* Masked MCR */
 #define   ARC_DIS_FIX_EOT1_FLUSH            (1u << 9) /* Wa_14017856879 */
 #define ARC_REG_ROW_CHICKEN2                0x00E4F4u /* Masked MCR */
 #define   ARC_DISABLE_TDL_SVHS_GATING       (1u << 1) /* Wa_14020495402 */
 #define ARC_REG_XEHP_HDC_CHICKEN0           0x00E5F0u /* Masked MCR */
 #define   ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES (1u << 3) /* Wa_14015150844 */
+#define ARC_REG_RCU_MODE                    0x014800u /* Masked GT */
+#define   ARC_RCU_MODE_CCS_ENABLE           (1u << 0) /* xe_hw_engine.c:457 */
 
 /* ============================================================================
  * 6. GuC v70 Firmware Loader, Engine Domain Reset & CTB Registers (mtl_guc_70.bin)
