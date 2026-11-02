@@ -229,11 +229,18 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
      *      (avoiding macOS 15/26 kernel_map protection failures on IOConnectMapMemory64). Note that
      *      getBytesNoCopy() returns NULL when kIOMemoryKernelUserShared is set, so we zero via map().
      *      For kernel-only BOs (mapInKernel == true), omit kIOMemoryKernelUserShared.
-     *   2. Never pass kIOMapWriteCombineCache (0x400) in creation options, because 0x400 in
-     *      IOMemoryDescriptor creation IOOptionBits is kIOMemoryPageable, which conflicts
-     *      with physicalMask! Pass cache flags ONLY to buf->map(mapOpts) / clientMemoryForType.
+     *   2. IOBufferMemoryDescriptor accepts kIOMapCacheMask at allocation time.
+     *      XNU initWithPhysicalMask transfers it into the backing memory entry's
+     *      cache mode. kIOMemoryPageable is 0x20, NOT kIOMapWriteCombineCache.
+     *      Set WC here as well as in clientMemoryForType, so the original kernel
+     *      mapping and later user mappings agree before any CPU stores occur.
      */
     IOOptionBits allocOpts = kIODirectionInOut;
+    const IOOptionBits mapOpts = (flags & ARCXE_GEM_FLAG_CPU_WC)
+                              ? kIOMapWriteCombineCache : kIOMapDefaultCache;
+    static_assert((kIOMapWriteCombineCache & kIOMemoryPageable) == 0,
+                  "IOBuffer cache mode must not request pageable memory");
+    allocOpts |= mapOpts;
     if (!mapInKernel)
         allocOpts |= kIOMemoryKernelUserShared;
     if (alignedSize == 4096)
@@ -266,7 +273,6 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
 
     const bool flushNonCoh = ((flags & ARCXE_GEM_FLAG_CPU_WC) != 0) ||
                              (bo->patIndex <= ARC_MTL_PAT_IDX_UC_NONCOH);
-    const IOOptionBits mapOpts = (flags & ARCXE_GEM_FLAG_CPU_WC) ? kIOMapWriteCombineCache : kIOMapDefaultCache;
     if (mapInKernel) {
         bo->kernMap = buf->map(mapOpts);
         if (!bo->kernMap || !bo->kernMap->getVirtualAddress()) {
@@ -278,17 +284,18 @@ ArcBo *ArcXeService::createKernelBo(uint64_t size, uint32_t flags, uint16_t patI
         bzero(kva, (size_t)alignedSize);
         if (flushNonCoh)
             arcClflushRange(kva, (size_t)alignedSize);
-    } else if (void *kva = buf->getBytesNoCopy()) {
-        bzero(kva, (size_t)alignedSize);
-        if (flushNonCoh)
-            arcClflushRange(kva, (size_t)alignedSize);
-    } else if (IOMemoryMap *tmpMap = buf->map(kIOMapDefaultCache)) {
-        if (tmpMap->getVirtualAddress()) {
-            void *tkva = reinterpret_cast<void *>(tmpMap->getVirtualAddress());
-            bzero(tkva, (size_t)alignedSize);
-            if (flushNonCoh)
-                arcClflushRange(tkva, (size_t)alignedSize);
+    } else {
+        IOMemoryMap *tmpMap = buf->map(mapOpts);
+        if (!tmpMap || !tmpMap->getVirtualAddress()) {
+            if (tmpMap) tmpMap->release();
+            AXELOG("createKernelBo: initialization map failed for %llu bytes", (unsigned long long)alignedSize);
+            releaseBo(bo);
+            return nullptr;
         }
+        void *tkva = reinterpret_cast<void *>(tmpMap->getVirtualAddress());
+        bzero(tkva, (size_t)alignedSize);
+        if (flushNonCoh)
+            arcClflushRange(tkva, (size_t)alignedSize);
         tmpMap->release();
     }
 
