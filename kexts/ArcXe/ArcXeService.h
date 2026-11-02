@@ -98,6 +98,7 @@ struct ArcExecQueue {
     uint32_t                    submitBatchStart;
     uint32_t                    submitBatchEnd;
     uint32_t                    submitFlushEnd;
+    uint32_t                    idleParkCount;
     uint64_t                    pml4Phys;
     IOLock                     *submitLock;
 };
@@ -253,7 +254,8 @@ public:
                                  ArcXeWaitQueueOut *outDiag = nullptr,
                                  bool resetOnTimeout = true,
                                  uint32_t *outSubunitDiag5 = nullptr,
-                                 uint32_t *outProgress = nullptr);
+                                 uint32_t *outProgress = nullptr,
+                                 ArcXeTimeoutDetail *outDetail = nullptr);
     bool          tryLoadGucFirmwareFromDisk(const char *fwPath);
     static void   gucLoaderThreadEntry(void *arg, wait_result_t);
 

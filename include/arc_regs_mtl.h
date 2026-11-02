@@ -239,6 +239,9 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define ARC_REG_BCS_AUX_TABLE_BASE_LO       0x004210u
 #define   ARC_AUX_INV                       (1u << 0)
 #define ARC_REG_GFX_TLB_INV_CR              0x00CED8u    /* XeHP/MTL RCS, MCR, unmasked */
+#define ARC_REG_XEHP_RING_FAULT             0x00CEC4u    /* MCR, primary GAM aggregates faults */
+#define ARC_REG_XEHP_FAULT_TLB_DATA0         0x00CEB8u
+#define ARC_REG_XEHP_FAULT_TLB_DATA1         0x00CEBCu
 #define ARC_REG_BLT_TLB_INV_CR              0x00CEE4u    /* XeHP/MTL BCS, MCR, unmasked */
 #define   ARC_TLB_INVALIDATE                (1u << 0)
 

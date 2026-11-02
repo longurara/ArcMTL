@@ -18,11 +18,14 @@ queue = header[start:header.index("\n};", start) + 3]
 
 STUBS = r'''
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <cstdio>
 #include "arc_uapi.h"
 #include "arc_regs_mtl.h"
 static_assert(sizeof(ArcXeSyncobjWaitOut) == 96, "syncobj diagnostic ABI must stay compatible");
+static_assert(sizeof(ArcXeSyncobjWaitOutExtended) == 200, "extended ABI");
+static_assert(offsetof(ArcXeSyncobjWaitOutExtended, detail) == 96, "legacy prefix");
 #define bzero(p, n) std::memset(p, 0, n)
 #define AXELOG(...) ((void)0)
 #define ARC_MASKED_ENABLE(x) (((x) << 16) | (x))
@@ -54,11 +57,16 @@ struct ArcXeService {
     }
     bool resetEngineHw(uint32_t, ArcBo *) { ++resets; return true; }
     IOReturn waitQueueSeqno(ArcExecQueue *, uint64_t, uint64_t, uint64_t *, bool *,
-                           ArcXeWaitQueueOut * = nullptr, bool = true, uint32_t * = nullptr, uint32_t * = nullptr);
+                           ArcXeWaitQueueOut * = nullptr, bool = true, uint32_t * = nullptr, uint32_t * = nullptr, ArcXeTimeoutDetail * = nullptr);
 };
 static void readEngineDiagMmio(const ArcXeService *, uint32_t, ArcXeWaitQueueOut *d) { d->ipehr=0x7a000404; }
 static void readRcsSubunitDiag(const ArcXeService *, uint32_t,
                              uint32_t &, uint32_t &, uint32_t &, uint32_t &, uint32_t &) {}
+static int capturedBeforeReset = -1;
+static void captureTimeoutDetail(const ArcXeService *, const ArcExecQueue *,
+                                 const ArcXeWaitQueueOut &, ArcXeTimeoutDetail *d) {
+    if (d) { d->valid=1; capturedBeforeReset=resets; }
+}
 '''
 
 CASES = r'''
@@ -77,9 +85,10 @@ int main() {
     // A real timeout discards the queue; it must not manufacture completion.
     // Only the begin marker reached this submission; the others are from #4.
     fencePage[16]=5; fencePage[17]=4; fencePage[18]=4; fencePage[8]=4;
-    uint32_t progress=0;
-    assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag, true, nullptr, &progress) == kIOReturnSuccess);
+    uint32_t progress=0; ArcXeTimeoutDetail detail={};
+    assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag, true, nullptr, &progress, &detail) == kIOReturnSuccess);
     assert(progress == (ARCXE_PROGRESS_VALID | ARCXE_PROGRESS_BEGIN));
+    assert(detail.valid && capturedBeforeReset == 0);
     assert(timedOut && diag.timed_out && diag.completed_seqno == 4);
     assert(completed == 4 && q.faulted && resets == 1);
     assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut) == kIOReturnNotResponding);

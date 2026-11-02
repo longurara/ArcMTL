@@ -306,6 +306,26 @@ struct ArcXeSyncobjWaitOut {
     uint32_t progress_flags;          /* Former pad0: same ABI size/offset. Zero on older kernels. */
 };
 
+/* Optional tail of SyncobjWait output. The original 96-byte prefix is stable;
+ * old callers request just that prefix, old kernels return just that prefix. */
+struct ArcXeTimeoutDetail {
+    uint32_t valid;
+    uint32_t fault_reg;
+    uint32_t fault_data0;
+    uint32_t fault_data1;
+    uint32_t ring_offset;
+    uint32_t ring_count;
+    uint32_t ring_dw[16];
+    uint32_t context_control;
+    uint32_t context_head;
+    uint32_t context_tail;
+    uint32_t idle_park_count;
+};
+struct ArcXeSyncobjWaitOutExtended {
+    struct ArcXeSyncobjWaitOut base;
+    struct ArcXeTimeoutDetail detail;
+};
+
 struct ArcXeSyncobjSignalResetIn {
     uint32_t count_handles;
     uint32_t is_reset;                  /* 1 = reset to 0, 0 = signal */

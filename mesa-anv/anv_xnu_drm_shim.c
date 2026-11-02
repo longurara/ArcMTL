@@ -66,6 +66,13 @@ static void arc_xnu_shim_init_env(void)
 #define ARC_MAX_SYNCOBJ_TRACK   2048
 #define ARC_VIRTUAL_BIND_Q_BIT  0x80000000u
 
+#define ARC_TRACE_EVENTS 128u
+struct ArcTraceEvent {
+    uint64_t index, call, time_ns;
+    uint32_t method, finished, status, bytes;
+    uint8_t data[sizeof(struct ArcXeVmBindIn)];
+};
+
 struct ArcFdSession {
     bool                 in_use;
     int                  fd;
@@ -74,6 +81,9 @@ struct ArcFdSession {
     struct ArcXeQueryDeviceOut dev_query;
     uint32_t             next_virtual_bind_q;
     uint64_t             sync_points[ARC_MAX_SYNCOBJ_TRACK];
+    uint64_t             trace_next;
+    bool                 diagnostics_dumped;
+    struct ArcTraceEvent trace[ARC_TRACE_EVENTS];
 };
 
 struct ArcMmapRecord {
@@ -111,6 +121,51 @@ static struct ArcFdSession *lookup_session_locked(int fd)
     }
     return NULL;
 }
+
+/* Keep a bounded flight recorder in memory. No logging or MMIO on the hot path.
+ * The begin event survives a call that fails or never returns. */
+static uint64_t record_call(io_connect_t conn, uint32_t method, uint64_t call,
+                            bool finished, kern_return_t status, const void *data, size_t bytes)
+{
+    if (method < kArcXeMethodGemCreate || method > kArcXeMethodExec)
+        return 0; /* Polling waits would evict the submissions we need. */
+    struct timespec now = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t index = 0;
+    pthread_mutex_lock(&g_arc_lock);
+    for (int i = 0; i < ARC_MAX_FDS; ++i) {
+        struct ArcFdSession *s = &g_sessions[i];
+        if (!s->in_use || s->connect != conn) continue;
+        index = ++s->trace_next;
+        struct ArcTraceEvent *e = &s->trace[(index - 1u) % ARC_TRACE_EVENTS];
+        memset(e, 0, sizeof(*e));
+        e->index = index; e->call = finished ? call : index;
+        e->time_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+        e->method = method; e->finished = finished; e->status = (uint32_t)status;
+        if (data) {
+            e->bytes = bytes < sizeof(e->data) ? (uint32_t)bytes : (uint32_t)sizeof(e->data);
+            memcpy(e->data, data, e->bytes);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&g_arc_lock);
+    return index;
+}
+
+static kern_return_t traced_struct_call(io_connect_t conn, uint32_t method,
+                                         const void *input, size_t input_size,
+                                         void *output, size_t *output_size)
+{
+    const uint64_t call = record_call(conn, method, 0, false, 0, input, input_size);
+    const size_t capacity = output_size ? *output_size : 0;
+    const kern_return_t kr = IOConnectCallStructMethod(conn, method, input, input_size, output, output_size);
+    const size_t returned = output_size && *output_size < capacity ? *output_size : capacity;
+    record_call(conn, method, call, true, kr, kr == KERN_SUCCESS ? output : NULL, returned);
+    return kr;
+}
+
+/* All subsequent shim calls use the recorder, including failed binds/submits. */
+#define IOConnectCallStructMethod traced_struct_call
 
 /*
  * Open an IOKit connection to ArcXeUserClient / IOAccelArcXeBridge:
@@ -695,6 +750,89 @@ static unsigned snapshot_batch_locked(int fd, uint64_t acthd, uint32_t words[48]
     return 0;
 }
 
+static void dump_trace_syncs(const struct ArcXeSyncEntry *syncs, uint32_t count)
+{
+    for (uint32_t i = 0; i < count && i < ARCXE_MAX_SYNCS_PER_OP; ++i)
+        fprintf(stderr, "      sync handle=%u flags=0x%x point=%llu\n", syncs[i].syncobj_handle,
+                syncs[i].flags, (unsigned long long)syncs[i].timeline_value);
+}
+
+static void dump_trace_event(const struct ArcTraceEvent *e)
+{
+    static const char *names[] = {"QUERY", "GEM_CREATE", "IMPORT_SURFACE", "IMPORT_USERPTR",
+        "GEM_CLOSE", "MMAP_INFO", "VM_CREATE", "VM_DESTROY", "VM_BIND", "QUEUE_CREATE", "QUEUE_DESTROY", "EXEC"};
+    const char *name = e->method <= kArcXeMethodExec ? names[e->method] : "UNKNOWN";
+    fprintf(stderr, "    #%llu call=%llu t_ns=%llu %s %s kr=0x%08x bytes=%u\n",
+            (unsigned long long)e->index, (unsigned long long)e->call, (unsigned long long)e->time_ns,
+            name, e->finished ? "end" : "begin", e->status, e->bytes);
+    if (!e->finished && e->method == kArcXeMethodExec && e->bytes >= sizeof(struct ArcXeExecIn)) {
+        struct ArcXeExecIn in; memcpy(&in, e->data, sizeof(in));
+        fprintf(stderr, "      queue=%u batch=0x%012llx buffers=%u flags=0x%x\n",
+                in.exec_queue_id, (unsigned long long)in.batch_gpu_va, in.num_batch_buffer, in.flags);
+        dump_trace_syncs(in.syncs, in.num_syncs);
+    } else if (!e->finished && e->method == kArcXeMethodVmBind && e->bytes >= sizeof(struct ArcXeVmBindIn)) {
+        struct ArcXeVmBindIn in; memcpy(&in, e->data, sizeof(in));
+        fprintf(stderr, "      vm=%u op=%u gem=%u va=0x%012llx size=0x%llx offset=0x%llx pat=%u flags=0x%x\n",
+                in.vm_id, in.op, in.gem_handle, (unsigned long long)in.gpu_va,
+                (unsigned long long)in.range_size, (unsigned long long)in.bo_offset, in.pat_index, in.flags);
+        dump_trace_syncs(in.syncs, in.num_syncs);
+    } else {
+        /* Exact UAPI payload for allocation, queue/VM lifecycle and returned seqno. */
+        for (uint32_t i = 0; i + 4u <= e->bytes; i += 4u) {
+            uint32_t word; memcpy(&word, e->data + i, sizeof(word));
+            if (!(i & 31u)) fprintf(stderr, "      +%02x:", i);
+            fprintf(stderr, " %08x", word);
+            if ((i & 31u) == 28u || i + 4u == e->bytes) fputc('\n', stderr);
+        }
+    }
+}
+
+static void dump_timeout_history(int fd)
+{
+    struct Snapshot {
+        uint64_t next;
+        uint32_t bind_count, map_count;
+        struct ArcTraceEvent trace[ARC_TRACE_EVENTS];
+        struct ArcVmBindRecord binds[ARC_MAX_BIND_RECORDS];
+        struct ArcMmapRecord maps[ARC_MAX_MMAPS];
+    };
+    struct Snapshot *snap = (struct Snapshot *)calloc(1, sizeof(*snap));
+    if (!snap) { fprintf(stderr, "  [ArcXe HISTORY] snapshot allocation failed\n"); return; }
+    pthread_mutex_lock(&g_arc_lock);
+    struct ArcFdSession *s = lookup_session_locked(fd);
+    if (!s || s->diagnostics_dumped) {
+        pthread_mutex_unlock(&g_arc_lock); free(snap); return;
+    }
+    s->diagnostics_dumped = true;
+    snap->next = s->trace_next;
+    memcpy(snap->trace, s->trace, sizeof(snap->trace));
+    for (int i = 0; i < ARC_MAX_BIND_RECORDS; ++i)
+        if (g_binds[i].in_use && g_binds[i].fd == fd) snap->binds[snap->bind_count++] = g_binds[i];
+    for (int i = 0; i < ARC_MAX_MMAPS; ++i)
+        if (g_mmaps[i].in_use && g_mmaps[i].fd == fd) snap->maps[snap->map_count++] = g_mmaps[i];
+    pthread_mutex_unlock(&g_arc_lock);
+    fprintf(stderr, "  [ArcXe HISTORY] fd=%d latest=%llu capacity=%u (begin/end records; monotonic time)\n",
+            fd, (unsigned long long)snap->next, ARC_TRACE_EVENTS);
+    const uint64_t first = snap->next > ARC_TRACE_EVENTS ? snap->next - ARC_TRACE_EVENTS + 1u : 1u;
+    for (uint64_t i = first; i <= snap->next; ++i)
+        dump_trace_event(&snap->trace[(i - 1u) % ARC_TRACE_EVENTS]);
+    fprintf(stderr, "  [ArcXe GPU MAPS] tracked BO ranges=%u capacity=%u (valid=0 means stale/partly unmapped)\n",
+            snap->bind_count, ARC_MAX_BIND_RECORDS);
+    for (uint32_t i = 0; i < snap->bind_count; ++i) {
+        const struct ArcVmBindRecord *b = &snap->binds[i];
+        fprintf(stderr, "    vm=%u gem=%u va=0x%012llx size=0x%llx offset=0x%llx valid=%u\n",
+                b->vm_id, b->gem_handle, (unsigned long long)b->gpu_va, (unsigned long long)b->range_size,
+                (unsigned long long)b->bo_offset, b->dump_valid);
+    }
+    fprintf(stderr, "  [ArcXe CPU MAPS] count=%u capacity=%u\n", snap->map_count, ARC_MAX_MMAPS);
+    for (uint32_t i = 0; i < snap->map_count; ++i) {
+        const struct ArcMmapRecord *m = &snap->maps[i];
+        fprintf(stderr, "    gem=%u base=0x%llx ptr=%p size=0x%llx\n", m->gem_handle,
+                (unsigned long long)m->base_addr, m->user_ptr, (unsigned long long)m->mapped_len);
+    }
+    free(snap);
+}
+
 static void dump_timeout_batch(int fd, uint64_t acthd)
 {
     uint32_t words[48];
@@ -869,6 +1007,7 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
                     pthread_mutex_unlock(&g_arc_lock);
                     if (IOConnectCallStructMethod(s->connect, kArcXeMethodVmBind,
                                                   &uin, sizeof(uin), NULL, NULL) != KERN_SUCCESS) {
+                        dump_timeout_history(fd);
                         errno = EIO;
                         return -1; /* Never signal successful bind completion on failure. */
                     }
@@ -926,6 +1065,7 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
             kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodVmBind,
                                                          &in, sizeof(in), NULL, NULL);
             if (kr != KERN_SUCCESS) {
+                dump_timeout_history(fd);
                 errno = ENOMEM;
                 return -1;
             }
@@ -992,6 +1132,7 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
         kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodExecQueueCreate,
                                                      &in, sizeof(in), &out, &out_sz);
         if (kr != KERN_SUCCESS || out.exec_queue_id == 0) {
+            dump_timeout_history(fd);
             errno = ENOMEM;
             return -1;
         }
@@ -1044,6 +1185,9 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
         kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodExec,
                                                      &in, sizeof(in), &out, &out_sz);
         if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "  [ArcXe EXEC ERROR] queue=%u batch=0x%012llx kr=0x%08x\n",
+                    in.exec_queue_id, (unsigned long long)in.batch_gpu_va, (unsigned)kr);
+            dump_timeout_history(fd);
             errno = EIO;
             return -1;
         }
@@ -1257,7 +1401,7 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
         rel_ns = timeout_nsec - now_ns;
 
     struct ArcXeSyncobjWaitIn in = {0};
-    struct ArcXeSyncobjWaitOut out = {0};
+    struct ArcXeSyncobjWaitOutExtended response = {0};
     in.count_handles = num_handles < ARCXE_MAX_SYNCS_PER_OP ? num_handles : ARCXE_MAX_SYNCS_PER_OP;
     in.flags         = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? ARCXE_SYNCOBJ_WAIT_ALL : 0u;
     in.timeout_nsec  = rel_ns;
@@ -1266,9 +1410,14 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
         in.points[i]  = points ? points[i] : 0ULL;
     }
 
-    size_t out_sz = sizeof(out);
-    if (IOConnectCallStructMethod(conn, kArcXeMethodSyncobjWait, &in, sizeof(in), &out, &out_sz) != KERN_SUCCESS)
+    size_t out_sz = sizeof(response);
+    if (IOConnectCallStructMethod(conn, kArcXeMethodSyncobjWait, &in, sizeof(in), &response, &out_sz) != KERN_SUCCESS)
+    {
+        dump_timeout_history(ap->fd);
         return -EIO;
+    }
+    if (out_sz < sizeof(response.base)) return -EIO;
+    const struct ArcXeSyncobjWaitOut out = response.base;
     if (out.timed_out) {
         if (out.diag.timed_out) {
             fprintf(stderr,
@@ -1291,7 +1440,29 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                         !!(out.progress_flags & ARCXE_PROGRESS_INVALIDATED),
                         !!(out.progress_flags & ARCXE_PROGRESS_BEFORE_BB),
                         !!(out.progress_flags & ARCXE_PROGRESS_RETURNED));
+            if (out_sz >= sizeof(response) && response.detail.valid) {
+                const struct ArcXeTimeoutDetail *d = &response.detail;
+                fprintf(stderr, "  [ArcXe GPU FAULT] reg=0x%08x data0=0x%08x data1=0x%08x\n",
+                        d->fault_reg, d->fault_data0, d->fault_data1);
+                if (d->fault_reg != UINT32_MAX && (d->fault_reg & 1u)) {
+                    const uint64_t address = ((uint64_t)(d->fault_data1 & 15u) << 44) |
+                                             ((uint64_t)d->fault_data0 << 12);
+                    fprintf(stderr, "  [ArcXe GPU FAULT] address=0x%012llx space=%s\n",
+                            (unsigned long long)address, (d->fault_data1 & 16u) ? "GGTT" : "PPGTT");
+                }
+                fprintf(stderr, "  [ArcXe CONTEXT] idle_parks=%u control=0x%08x head=0x%x tail=0x%x\n",
+                        d->idle_park_count, d->context_control, d->context_head, d->context_tail);
+                const uint32_t count = d->ring_count <= 16u ? d->ring_count : 16u;
+                fprintf(stderr, "  [ArcXe RING DWORDS] start=0x%x count=%u (wraps at ring end)\n",
+                        d->ring_offset, count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (!(i & 3u)) fprintf(stderr, "    +%02x:", i * 4u);
+                    fprintf(stderr, " %08x", d->ring_dw[i]);
+                    if ((i & 3u) == 3u || i + 1u == count) fputc('\n', stderr);
+                }
+            }
             dump_timeout_batch(ap->fd, ((uint64_t)out.diag.acthd_hi << 32) | out.diag.acthd_lo);
+            dump_timeout_history(ap->fd);
         }
         errno = ETIME;
         return -ETIME;

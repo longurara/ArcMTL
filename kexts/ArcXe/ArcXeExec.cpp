@@ -646,15 +646,23 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
     ArcExecQueue *idleQ  = (base == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
     ArcExecQueue *&lastQ = (base == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
     if (!idleQ || !idleQ->lrcBo || !idleQ->fenceBo || !idleQ->seqnoCpu) {
-        lastQ = nullptr;
         return false;
     }
 
     /* Ensure the previous context's trailing ring dwords retired to HEAD == TAIL before switching out */
+    bool drained = false;
     for (uint32_t us = 0; us < 10000u; us += 5u) {
-        if (rd32(ARC_RING_HEAD(base)) == rd32(ARC_RING_TAIL(base)))
+        /* HEAD also carries a wrap counter; compare address bits only. */
+        if ((rd32(ARC_RING_HEAD(base)) & 0x001FFFFCu) ==
+            (rd32(ARC_RING_TAIL(base)) & 0x001FFFF8u)) {
+            drained = true;
             break;
+        }
         IODelay(5);
+    }
+    if (!drained) {
+        AXELOG("idle park: predecessor ring did not drain base=0x%x", base);
+        return false;
     }
 
     /* Evict any CPU cachelines of prevQueue's LRC before hardware Context-Saves prevQueue */
@@ -707,14 +715,18 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         }
         IODelay(5);
     }
-    for (uint32_t us = 0; us < 10000u; us += 5u) {
+    bool idleDrained = false;
+    for (uint32_t us = 0; parkedOk && us < 10000u; us += 5u) {
         if ((rd32(ARC_RING_CURRENT_LRCA(base)) & ~0xFFFu) == (idleQ->pphwspGgttAddr & ~0xFFFu) &&
-            rd32(ARC_RING_HEAD(base)) == rd32(ARC_RING_TAIL(base))) {
+            (rd32(ARC_RING_HEAD(base)) & 0x001FFFFCu) ==
+            (rd32(ARC_RING_TAIL(base)) & 0x001FFFF8u)) {
+            idleDrained = true;
             break;
         }
         IODelay(5);
     }
 
+    parkedOk = parkedOk && idleDrained;
     if (parkedOk) {
         if (prevQueue) {
             if (prevQueue->lrcBo && prevQueue->ringCpu) {
@@ -722,10 +734,14 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
             }
             prevQueue->isLoadedOnHw    = false;
             prevQueue->hasSavedHwState = true;
+            ++prevQueue->idleParkCount;
         }
         idleQ->isLoadedOnHw = true;
         lastQ = nullptr;
     }
+    if (!parkedOk)
+        AXELOG("idle park incomplete base=0x%x fence=%llu target=%llu", base,
+               (unsigned long long)*idleQ->seqnoCpu, (unsigned long long)idleSeq);
     return parkedOk;
 }
 
@@ -794,9 +810,10 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
      * 1. Wait for any in-flight batch on this physical engine (including prior async batches on the
      *    same queue, such as Mesa ANV's init_render_queue_state) to complete in dedicated fenceBo,
      *    and wait for trailing ring instructions (MI_USER_INTERRUPT / MI_ARB_CHECK) to retire to HEAD == TAIL.
-     * 2. If the same queue `q` is already active on the engine (`lastQ == q && q->isLoadedOnHw`),
-     *    keep `q->swCtxId` unchanged and submit an Execlist Lite Restore (`RING_TAIL` update without
-     *    52 KiB 3D Context Save/Restore, preserving live 3D/Compute pipeline state across batches).
+     * 2. RCS transitions through the permanent idle context once drained, like
+     *    xe_execlist_port_idle. This polling backend has no completion IRQ worker
+     *    to do it earlier. Require proof of idle execution before marking the
+     *    user context saved. BCS retains its existing lite-restore path.
      * 3. If switching between two different user queues (`lastQ != q`), allocate a fresh `swCtxId`
      *    and submit `q` directly so hardware Context-Saves `lastQ` into `lastQ->lrcBo` and Context-Restores `q`.
      */
@@ -809,13 +826,22 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
             IODelay(5);
         }
         const bool prevDone = (*prevQ->seqnoCpu >= prevTarget);
+        bool ready = false;
         if (prevDone) {
-            /* Ensure trailing MI_USER_INTERRUPT / MI_ARB_ENABLE / MI_ARB_CHECK retired to HEAD == TAIL */
-            for (uint32_t us = 0; us < 10000u; us += 5u) {
-                if (rd32(ARC_RING_HEAD(q->mmioBase)) == rd32(ARC_RING_TAIL(q->mmioBase)))
-                    break;
-                IODelay(5);
+            if (q->mmioBase == ARC_RENDER_RING_BASE) {
+                ready = parkEngineOnIdleContextLocked(q->mmioBase, prevQ);
+            } else {
+                for (uint32_t us = 0; us < 10000u; us += 5u) {
+                    if ((rd32(ARC_RING_HEAD(q->mmioBase)) & 0x001FFFFCu) ==
+                        (rd32(ARC_RING_TAIL(q->mmioBase)) & 0x001FFFF8u)) {
+                        ready = true;
+                        break;
+                    }
+                    IODelay(5);
+                }
             }
+        }
+        if (ready) {
             /* If switching to a different queue, evict prevQ's LRC cachelines before HW Context-Saves prevQ */
             if (prevQ != q && prevQ->lrcBo && prevQ->ringCpu) {
                 clflushRange(prevQ->ringCpu, prevQ->lrcBo->size);
@@ -1086,11 +1112,41 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     return kIOReturnSuccess;
 }
 
+/* Called under fEngineLock and forcewake, before resetting the engine. */
+static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
+                                 const ArcXeWaitQueueOut &snap, ArcXeTimeoutDetail *d)
+{
+    if (!d) return;
+    bzero(d, sizeof(*d));
+    const uint32_t selector = svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, 0u); /* primary GAM aggregates faults */
+    (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+    d->fault_reg = svc->rd32(ARC_REG_XEHP_RING_FAULT);
+    d->fault_data0 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA0);
+    d->fault_data1 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA1);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, selector);
+    (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+    if (q->ringCpu && q->ringSize >= 64u) {
+        d->ring_offset = (snap.ring_head - 32u) & (q->ringSize - 1u) & ~3u;
+        d->ring_count = 16;
+        for (uint32_t i = 0; i < d->ring_count; ++i)
+            d->ring_dw[i] = q->ringCpu[((d->ring_offset + i * 4u) & (q->ringSize - 1u)) / 4u];
+    }
+    if (q->ctxRegsCpu) {
+        d->context_control = q->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL];
+        d->context_head = q->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL];
+        d->context_tail = q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL];
+    }
+    d->idle_park_count = q->idleParkCount;
+    d->valid = 1;
+}
+
 IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                       uint64_t *outCompleted, bool *outTimedOut,
                                       ArcXeWaitQueueOut *outDiag,
                                       bool resetOnTimeout,
-                                      uint32_t *outSubunitDiag5, uint32_t *outProgress)
+                                      uint32_t *outSubunitDiag5, uint32_t *outProgress,
+                                      ArcXeTimeoutDetail *outDetail)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
     if (q->faulted) return kIOReturnNotResponding;
@@ -1161,6 +1217,7 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                 uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
                 readEngineDiagMmio(this, b, &snap);
                 readRcsSubunitDiag(this, b, dbg2, geomId, scId, sampId, rowId);
+                captureTimeoutDetail(this, q, snap, outDetail);
                 if (outProgress) {
                     *outProgress = ARCXE_PROGRESS_VALID |
                         (q->seqnoCpu[16] == targetSeqno ? ARCXE_PROGRESS_BEGIN : 0u) |

@@ -8,7 +8,7 @@ source = (ROOT / 'mesa-anv/anv_xnu_drm_shim.c').read_text(encoding='utf-8')
 a = source.index('struct ArcMmapRecord {')
 structs = source[a:source.index('static pthread_mutex_t', a)]
 a = source.index('static void invalidate_bind_dump_locked(')
-body = source[a:source.index('static void dump_timeout_batch(', a)]
+body = source[a:source.index('static void dump_trace_syncs(', a)]
 HARNESS = r'''
 #include <cassert>
 #include <cstdint>

@@ -784,6 +784,13 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         const auto *in = static_cast<const ArcXeSyncobjWaitIn *>(args->structureInput);
         auto *out      = static_cast<ArcXeSyncobjWaitOut *>(args->structureOutput);
         bzero(out, sizeof(*out));
+        ArcXeTimeoutDetail *detail = nullptr;
+        if (args->structureOutputSize >= sizeof(ArcXeSyncobjWaitOutExtended)) {
+            detail = &static_cast<ArcXeSyncobjWaitOutExtended *>(args->structureOutput)->detail;
+            bzero(detail, sizeof(*detail));
+        }
+        const size_t outputSize = detail ? sizeof(ArcXeSyncobjWaitOutExtended) : sizeof(*out);
+        args->structureOutputSize = outputSize;
 
         const uint32_t count = (in->count_handles <= ARCXE_MAX_SYNCS_PER_OP)
                              ? in->count_handles : ARCXE_MAX_SYNCS_PER_OP;
@@ -846,7 +853,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             if ((waitAll && allReady) || (!waitAll && anyReady)) {
                 out->first_signaled = firstIdx;
                 out->timed_out      = 0;
-                args->structureOutputSize = sizeof(*out);
+                args->structureOutputSize = outputSize;
                 return kIOReturnSuccess;
             }
 
@@ -859,7 +866,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
                     bool to = false;
                     uint32_t subDiag[5] = {};
                     fOwner->waitQueueSeqno(pendingQ, pendingSeq, 0ULL, &done, &to,
-                                           &out->diag, /*resetOnTimeout=*/true, subDiag, &out->progress_flags);
+                                           &out->diag, /*resetOnTimeout=*/true, subDiag, &out->progress_flags, detail);
                     out->dbg2             = subDiag[0];
                     out->geom_instdone    = subDiag[1];
                     out->sc_instdone      = subDiag[2];
@@ -867,7 +874,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
                     out->row_instdone     = subDiag[4];
                 }
                 out->timed_out = 1;
-                args->structureOutputSize = sizeof(*out);
+                args->structureOutputSize = outputSize;
                 return kIOReturnSuccess;
             }
 
