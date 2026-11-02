@@ -31,6 +31,8 @@ jobs:
         run: |
           bash -n package/install_opencore_userspace.sh
           python3 tests/test_installer_logging.py
+          python3 tests/test_arcxe_wait.py
+          python3 plugin/adapt_arc_plugin.py --self-test
 
       - name: Build Kernel Extensions (ArcXe, ArcFB + ArcAccel for macOS 26 & macOS 15)
         run: |

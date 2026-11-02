@@ -91,12 +91,13 @@ class InstallerLoggingTest(unittest.TestCase):
 
     def test_acceleration_requires_all_three_tests_even_with_force(self):
         start = SCRIPT.index('if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then')
-        gate = SCRIPT[start:].split('\necho ""\necho "====', 1)[0]
+        gate = SCRIPT[start:]
         for mode in ("--enable-dual-metal", "--enable-arc-desktop"):
             for results in itertools.product((0, 1), repeat=3):
                 with self.subTest(mode=mode, results=results):
                     prelude = (
                         'MODE="$1"\n'
+                        'SCRIPT_DIR=/test\n'
                         f"PROBE_OK={results[0]} VK_OK={results[1]} BUNDLE_OK={results[2]}\n"
                         'install_auxkc_arcfb_arcaccel() { :; }\n'
                         'update_oc_config() { echo "CONFIG=$1"; }\n'
@@ -106,7 +107,7 @@ class InstallerLoggingTest(unittest.TestCase):
                         capture_output=True, text=True, timeout=10,
                     )
                     expected = mode.removeprefix("--enable-") if all(results) else "safe-stage1"
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.returncode, 0 if all(results) else 1, result.stderr)
                     self.assertIn(f"CONFIG={expected}", result.stdout)
 
 

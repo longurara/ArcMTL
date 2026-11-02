@@ -579,7 +579,7 @@ fi
 
 echo ""
 echo "=================================================================="
-echo " ArcMTL Setup COMPLETE!"
+echo " ArcMTL installation finished; hardware verification results:"
 if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
     echo " -> Reset OpenCore boot-args to safe Stage 1 (ArcXe only)."
 elif [ "$MODE" = "--enable-dual-metal" ]; then
@@ -601,3 +601,12 @@ else
     echo " -> To reset to Stage 1 safe mode anytime:               sudo bash $0 --disable-arc-accel && sudo reboot"
 fi
 echo "=================================================================="
+
+# Keep recovery/disable commands usable even when hardware tests fail. Enable
+# and verification runs must return failure to callers as well as log it.
+if [ "$MODE" != "--disable-arc-accel" ] && [ "$MODE" != "--safe-stage1" ]; then
+    if [ "$PROBE_OK" != "1" ] || [ "$VK_OK" != "1" ] || [ "$BUNDLE_OK" != "1" ]; then
+        echo "[ERROR] Hardware verification failed: A=$PROBE_OK B1=$VK_OK B2=$BUNDLE_OK"
+        exit 1
+    fi
+fi

@@ -79,6 +79,9 @@ void ArcXeService::armEngineHw(uint32_t base, ArcBo *hwsp)
 
 bool ArcXeService::resetEngineHw(uint32_t base, ArcBo *hwsp)
 {
+    ArcExecQueue *active = (base == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
+    if (active && !active->isIdleKernelCtx)
+        active->faulted = true;
     /*
      * Hardware Engine Domain Reset (Linux i915/gt/intel_reset.c: gen8_engine_reset_prepare +
      * gen6_hw_domain_reset + gen8_engine_reset_cancel). Caller MUST hold forceWakeGet().
@@ -575,7 +578,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
 void ArcXeService::destroyExecQueue(ArcExecQueue *q)
 {
     if (!q) return;
-    if (q->seqnoCpu && q->lastSubmittedSeqno > *q->seqnoCpu) {
+    if (!q->faulted && q->seqnoCpu && q->lastSubmittedSeqno > *q->seqnoCpu) {
         uint64_t done = 0; bool to = false;
         (void)waitQueueSeqno(q, q->lastSubmittedSeqno, 500000000ULL, &done, &to);
     }
@@ -757,6 +760,12 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     IOLockLock(q->submitLock);
     IOLockLock(fEngineLock);
 
+    if (q->faulted) {
+        IOLockUnlock(fEngineLock);
+        IOLockUnlock(q->submitLock);
+        return kIOReturnNotResponding;
+    }
+
     if (!forceWakeGet()) {
         IOLockUnlock(fEngineLock);
         IOLockUnlock(q->submitLock);
@@ -811,13 +820,9 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
 
             ArcBo *hwsp = nullptr;
             (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
-            if (hwsp) {
-                (void)resetEngineHw(q->mmioBase, hwsp);
-            }
-            if (prevQ->seqnoCpu) {
-                *prevQ->seqnoCpu = prevQ->lastSubmittedSeqno;
-                clflushRange(prevQ->seqnoCpu, 64);
-            }
+            prevQ->faulted = true;
+            const bool resetOk = hwsp && resetEngineHw(q->mmioBase, hwsp);
+            /* Discarded work is not completed work. Keep the GPU fence value. */
             prevQ->isLoadedOnHw    = false;
             prevQ->hasSavedHwState = false;
             if (prevQ->ctxRegsCpu) {
@@ -840,6 +845,12 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
                 }
             }
             lastQ = nullptr;
+            if (!resetOk || q->faulted) {
+                forceWakePut();
+                IOLockUnlock(fEngineLock);
+                IOLockUnlock(q->submitLock);
+                return kIOReturnNotResponding;
+            }
         }
     }
 
@@ -891,20 +902,20 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     ringEmitDword(q, ARC_MI_ARB_ON_OFF | ARC_MI_ARB_DISABLE);
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
         /*
-         * 3a. Wa_14016712196 + Wa_1409600907 (Xe-LPG 12.70..12.74):
-         * Depth Cache Flush MUST always be paired with Depth Stall + CS Stall so Scan Converter
-         * (XEHPG_SC_INSTDONE bit 0) drains cleanly before the main render-target/tile flush.
+         * 3a. Wa_14016712196: separate depth-only flush, matching xe_ring_ops.c.
+         * The following main flush carries Wa_1409600907's depth stall.
+         * Do not add a post-sync write to this preliminary packet.
          */
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
-        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL |
-                         ARC_PC_CS_STALL | ARC_PC_GLOBAL_GTT | ARC_PC_QW_WRITE);
-        ringEmitDword(q, invalScratchGgtt);
+        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH);
+        ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
-        /* 3b. Quiesce & flush 3D/Compute caches (HDC + Tile + RT + Depth + DC + Scoreboard) */
-        const uint32_t flush1 = ARC_PC_CS_STALL | ARC_PC_STALL_AT_SCOREBOARD |
+        /* 3b. Match Xe's HDC + Tile + RT + Depth + DC flush with CS/Depth stall.
+         * Pixel-scoreboard stall belongs to BTI changes, not this fence flush. */
+        const uint32_t flush1 = ARC_PC_CS_STALL |
                                 ARC_PC_FLUSH_ENABLE | ARC_PC_DC_FLUSH_ENABLE |
                                 ARC_PC_TILE_CACHE_FLUSH | ARC_PC_RT_CACHE_FLUSH |
                                 ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL;
@@ -1040,6 +1051,7 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                                       uint32_t *outSubunitDiag5)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
+    if (q->faulted) return kIOReturnNotResponding;
     if (targetSeqno == 0) targetSeqno = q->lastSubmittedSeqno;
 
     if (*q->seqnoCpu >= targetSeqno) {
@@ -1062,6 +1074,7 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
     uint32_t spins = 0;
 
     for (;;) {
+        if (q->faulted) return kIOReturnNotResponding;
         const uint64_t cur = *q->seqnoCpu;
         if (cur >= targetSeqno) {
             if (outCompleted) *outCompleted = cur;
@@ -1093,6 +1106,14 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
             snap.timed_out       = 1u;
 
             IOLockLock(fEngineLock);
+            /* A concurrent submit may have finished this fence or reset the
+             * engine while we acquired the lock. Never reset a newer batch. */
+            if (q->faulted || *q->seqnoCpu >= targetSeqno) {
+                const bool failed = q->faulted;
+                IOLockUnlock(fEngineLock);
+                if (failed) return kIOReturnNotResponding;
+                continue;
+            }
             if (forceWakeGet()) {
                 const uint32_t b = q->mmioBase;
                 uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
@@ -1121,13 +1142,11 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
 
                     ArcBo *hwsp = nullptr;
                     (void)engineMmioBase(q->engineClass, q->engineInstance, &hwsp);
+                    q->faulted = true;
                     if (hwsp) {
                         (void)resetEngineHw(b, hwsp);
                     }
-                    if (q->seqnoCpu) {
-                        *q->seqnoCpu = q->lastSubmittedSeqno;
-                        clflushRange(q->seqnoCpu, 64);
-                    }
+                    /* Leave seqnoCpu at the last genuinely completed batch. */
                     q->isLoadedOnHw    = false;
                     q->hasSavedHwState = false;
                     if (q->ctxRegsCpu) {

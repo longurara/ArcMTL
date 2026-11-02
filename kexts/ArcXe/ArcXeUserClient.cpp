@@ -661,7 +661,9 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         for (uint32_t i = 0; i < depCount; i++) {
             uint64_t done = 0;
             bool to = false;
-            fOwner->waitQueueSeqno(deps[i].wq, deps[i].seq, 2000000000ULL, &done, &to);
+            IOReturn rc = fOwner->waitQueueSeqno(deps[i].wq, deps[i].seq, 2000000000ULL, &done, &to);
+            if (rc != kIOReturnSuccess) return rc;
+            if (to) return kIOReturnTimeout;
         }
 
         uint64_t seqno = 0;
@@ -670,6 +672,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             if (rc != kIOReturnSuccess)
                 return rc;
         } else {
+            if (q->faulted) return kIOReturnNotResponding;
             seqno = q->lastSubmittedSeqno;
         }
 
@@ -718,7 +721,8 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         uint64_t completed = 0;
         bool timedOut = false;
         bzero(out, sizeof(*out));
-        fOwner->waitQueueSeqno(q, in->target_seqno, in->timeout_ns, &completed, &timedOut, out);
+        IOReturn rc = fOwner->waitQueueSeqno(q, in->target_seqno, in->timeout_ns, &completed, &timedOut, out);
+        if (rc != kIOReturnSuccess) return rc;
         out->completed_seqno = completed;
         out->timed_out       = timedOut ? 1u : 0u;
         args->structureOutputSize = sizeof(*out);
@@ -813,6 +817,10 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
                     ready = true;
                 } else {
                     if (!fSyncobjs[h].signaled && fSyncobjs[h].boundQueue) {
+                        if (fSyncobjs[h].boundQueue->faulted) {
+                            IOLockUnlock(fClientLock);
+                            return kIOReturnNotResponding;
+                        }
                         if (*fSyncobjs[h].boundQueue->seqnoCpu >= fSyncobjs[h].waitSeqno) {
                             fSyncobjs[h].signaled   = true;
                             fSyncobjs[h].boundQueue = nullptr;
@@ -868,8 +876,9 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             if (pendingQ) {
                 uint64_t done = 0;
                 bool to = false;
-                fOwner->waitQueueSeqno(pendingQ, pendingSeq, sliceNs, &done, &to,
-                                       nullptr, /*resetOnTimeout=*/false);
+                IOReturn rc = fOwner->waitQueueSeqno(pendingQ, pendingSeq, sliceNs, &done, &to,
+                                                     nullptr, /*resetOnTimeout=*/false);
+                if (rc != kIOReturnSuccess) return rc;
             } else {
                 IOSleep(1);
             }

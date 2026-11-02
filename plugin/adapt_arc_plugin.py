@@ -549,8 +549,8 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
                 }
             }
             const uint8_t *mid = dstBytes + 800 * dbpr + 1280 * 4;
-            printf("  [OK] 2560x1600 IOSurface 3D GPUPass + Submit-Ahead + HostReadback pixel(1280,800) BGRA=(%u,%u,%u,%u)\\n",
-                   mid[0], mid[1], mid[2], mid[3]);
+            printf("  [%s] 2560x1600 IOSurface 3D GPUPass + Submit-Ahead + HostReadback rc=%d pixel(1280,800) BGRA=(%u,%u,%u,%u)\\n",
+                   pxBad ? "FAIL" : "OK", rdRc, mid[0], mid[1], mid[2], mid[3]);
             IOSurfaceUnlock(dstSurf, 0, NULL);
 
             nvmtl_vk_host_pages_drop(&srcHostCache);

@@ -525,6 +525,86 @@ def main() -> None:
         "ARCXE_MTL_LINEAR_TILE4_NATIVE_BPB",
     )
 
+    # 11. Native-bpb render uploads still hang on the 4x4 regression test.
+    # Use BLORP's existing compute implementation on the same RCS queue for
+    # supported color uploads. Do not advertise another hardware queue or
+    # force compute on unsupported depth/stencil/compressed/MSAA transfers.
+    anv_blorp = anv_dir / "anv_blorp.c"
+    replace_once(
+        anv_blorp,
+        '#include "genxml/gen80_pack.h"',
+        '#include "genxml/gen80_pack.h"\n'
+        '#ifdef __APPLE__\n'
+        '#include <stdio.h> /* ARCXE_COMPUTE_UPLOAD_INCLUDES */\n'
+        '#include "util/u_debug.h"\n'
+        '#endif',
+        "ARCXE_COMPUTE_UPLOAD_INCLUDES",
+    )
+    upload_loop = "   for (unsigned z = 0; z < extent.depth; z++) {\n      blorp_copy(batch, &src->surf"
+    replace_once(
+        anv_blorp,
+        upload_loop,
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_MTL_COMPUTE_UPLOAD: keep raster/RT writes out of uploads.\n"
+        "    * ARCMTL_RENDER_UPLOAD=1 permits comparison in a fresh process.\n"
+        "    */\n"
+        "   const enum blorp_batch_flags arc_saved_flags = batch->flags;\n"
+        "   const bool arc_compute_upload = memory_to_image &&\n"
+        "      intel_device_info_is_mtl(cmd_buffer->device->info) &&\n"
+        "      (cmd_buffer->queue_family->queueFlags & VK_QUEUE_COMPUTE_BIT) &&\n"
+        "      !(batch->flags & (BLORP_BATCH_USE_BLITTER | BLORP_BATCH_USE_COMPUTE)) &&\n"
+        "      sub_resource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&\n"
+        "      src->isl_surf->tiling == ISL_TILING_LINEAR &&\n"
+        "      dst->isl_surf->tiling == ISL_TILING_4 &&\n"
+        "      src->surf.aux_usage == ISL_AUX_USAGE_NONE &&\n"
+        "      dst->surf.aux_usage == ISL_AUX_USAGE_NONE &&\n"
+        "      src->isl_surf->samples == 1 && dst->isl_surf->samples == 1 &&\n"
+        "      isl_format_get_layout(src->isl_surf->format)->bw == 1 &&\n"
+        "      isl_format_get_layout(src->isl_surf->format)->bh == 1 &&\n"
+        "      isl_format_get_layout(dst->isl_surf->format)->bw == 1 &&\n"
+        "      isl_format_get_layout(dst->isl_surf->format)->bh == 1 &&\n"
+        "      isl_format_get_layout(src->isl_surf->format)->bpb == 32 &&\n"
+        "      isl_format_get_layout(dst->isl_surf->format)->bpb == 32 &&\n"
+        "      blorp_copy_supports_compute(batch->blorp, src->isl_surf,\n"
+        "                                  dst->isl_surf, dst->surf.aux_usage) &&\n"
+        "      !debug_get_bool_option(\"ARCMTL_RENDER_UPLOAD\", false);\n"
+        "   if (arc_compute_upload) {\n"
+        "      batch->flags |= BLORP_BATCH_USE_COMPUTE;\n"
+        "      if (INTEL_DEBUG(DEBUG_BLORP))\n"
+        "         fprintf(stderr, \"[ArcXe BLORP] LINEAR->TILE4 %ux%u: compute upload on RCS\\n\",\n"
+        "                 extent.width, extent.height);\n"
+        "   }\n"
+        "#endif\n\n" + upload_loop,
+        "ARCXE_MTL_COMPUTE_UPLOAD",
+    )
+    upload_end = (
+        "      memory.surf.addr.offset += mem_layout->image_stride_B;\n"
+        "   }\n\n"
+        "   /* The next copy parameters"
+    )
+    replace_once(
+        anv_blorp,
+        upload_end,
+        "      memory.surf.addr.offset += mem_layout->image_stride_B;\n"
+        "   }\n\n"
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_MTL_COMPUTE_UPLOAD_FLUSH: the public transfer operation\n"
+        "    * ran as compute, so publish HDC writes before another consumer.\n"
+        "    */\n"
+        "   if (arc_compute_upload) {\n"
+        "      anv_add_pending_pipe_bits(cmd_buffer,\n"
+        "         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,\n"
+        "         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,\n"
+        "         ANV_PIPE_HDC_PIPELINE_FLUSH_BIT | ANV_PIPE_CS_STALL_BIT |\n"
+        "         ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT,\n"
+        "         \"ArcXe compute upload visibility\");\n"
+        "   }\n"
+        "   batch->flags = arc_saved_flags;\n"
+        "#endif\n\n"
+        "   /* The next copy parameters",
+        "ARCXE_MTL_COMPUTE_UPLOAD_FLUSH",
+    )
+
     print("Mesa 26.2 ANV Darwin/XNU patch applied successfully.")
 
 

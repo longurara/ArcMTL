@@ -78,6 +78,7 @@ struct ArcExecQueue {
     bool                        hasSavedHwState;
     bool                        isLoadedOnHw;
     bool                        holdsForceWake;
+    volatile bool               faulted;        /* Reset discarded work; never signal its fences. */
     ArcBo                      *lrcBo;          /* [0..16K): Ring | [16K..20K): PPHWSP | [20K..+56K): Context Image */
     ArcBo                      *fenceBo;        /* Dedicated 4K GGTT page isolated from HW PPHWSP CSB/status writes */
     uint32_t                    ringGgttAddr;
