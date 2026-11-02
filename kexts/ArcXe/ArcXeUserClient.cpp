@@ -859,7 +859,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
                     bool to = false;
                     uint32_t subDiag[5] = {};
                     fOwner->waitQueueSeqno(pendingQ, pendingSeq, 0ULL, &done, &to,
-                                           &out->diag, /*resetOnTimeout=*/true, subDiag);
+                                           &out->diag, /*resetOnTimeout=*/true, subDiag, &out->progress_flags);
                     out->dbg2             = subDiag[0];
                     out->geom_instdone    = subDiag[1];
                     out->sc_instdone      = subDiag[2];

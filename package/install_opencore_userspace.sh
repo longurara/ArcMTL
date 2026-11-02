@@ -63,7 +63,7 @@ cleanup() {
     echo ""
     echo "--- ArcMTL kernel log (last 5 minutes, last 60 lines) ---"
     /usr/bin/log show --last 5m --style compact --predicate \
-        'eventMessage CONTAINS "ArcXe" OR eventMessage CONTAINS "ArcFB" OR eventMessage CONTAINS "ArcAccel" OR eventMessage CONTAINS "ArcMTL"' \
+        'eventMessage CONTAINS "ArcXe:" OR eventMessage CONTAINS "ArcFB:" OR eventMessage CONTAINS "ArcAccel:" OR eventMessage CONTAINS "ArcMTL:"' \
         2>&1 | tail -n 60
     [ -z "$TMP_EXTRACT" ] || rm -rf "$TMP_EXTRACT"
     echo "[diag] Installer exit status: $status"

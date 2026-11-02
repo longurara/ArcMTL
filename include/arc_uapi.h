@@ -288,6 +288,12 @@ struct ArcXeSyncobjWaitIn {
     uint32_t handles[ARCXE_MAX_SYNCS_PER_OP];
     uint64_t points[ARCXE_MAX_SYNCS_PER_OP]; /* 0 for binary syncobj */
 };
+/* Timeout parser breadcrumbs; these do not certify batch completion. */
+#define ARCXE_PROGRESS_VALID       (1u << 31)
+#define ARCXE_PROGRESS_BEGIN       (1u << 0)
+#define ARCXE_PROGRESS_BEFORE_BB   (1u << 1)
+#define ARCXE_PROGRESS_RETURNED    (1u << 2)
+#define ARCXE_PROGRESS_INVALIDATED (1u << 3)
 struct ArcXeSyncobjWaitOut {
     uint32_t first_signaled;
     uint32_t timed_out;
@@ -297,7 +303,7 @@ struct ArcXeSyncobjWaitOut {
     uint32_t sc_instdone;
     uint32_t sampler_instdone;
     uint32_t row_instdone;
-    uint32_t pad0;
+    uint32_t progress_flags;          /* Former pad0: same ABI size/offset. Zero on older kernels. */
 };
 
 struct ArcXeSyncobjSignalResetIn {

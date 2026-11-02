@@ -22,6 +22,7 @@ STUBS = r'''
 #include <cstdio>
 #include "arc_uapi.h"
 #include "arc_regs_mtl.h"
+static_assert(sizeof(ArcXeSyncobjWaitOut) == 96, "syncobj diagnostic ABI must stay compatible");
 #define bzero(p, n) std::memset(p, 0, n)
 #define AXELOG(...) ((void)0)
 #define ARC_MASKED_ENABLE(x) (((x) << 16) | (x))
@@ -53,7 +54,7 @@ struct ArcXeService {
     }
     bool resetEngineHw(uint32_t, ArcBo *) { ++resets; return true; }
     IOReturn waitQueueSeqno(ArcExecQueue *, uint64_t, uint64_t, uint64_t *, bool *,
-                           ArcXeWaitQueueOut * = nullptr, bool = true, uint32_t * = nullptr);
+                           ArcXeWaitQueueOut * = nullptr, bool = true, uint32_t * = nullptr, uint32_t * = nullptr);
 };
 static void readEngineDiagMmio(const ArcXeService *, uint32_t, ArcXeWaitQueueOut *d) { d->ipehr=0x7a000404; }
 static void readRcsSubunitDiag(const ArcXeService *, uint32_t,
@@ -61,7 +62,8 @@ static void readRcsSubunitDiag(const ArcXeService *, uint32_t,
 '''
 
 CASES = r'''
-static uint64_t completed = 4;
+static uint64_t fencePage[512] = {4};
+static uint64_t &completed = fencePage[0];
 static ArcExecQueue q = {};
 static void completeOnLock() { completed = 5; }
 static void faultOnLock() { q.faulted = true; }
@@ -73,7 +75,11 @@ int main() {
     assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, nullptr, false) == kIOReturnSuccess);
     assert(timedOut && done == 4 && completed == 4 && !q.faulted && resets == 0);
     // A real timeout discards the queue; it must not manufacture completion.
-    assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag) == kIOReturnSuccess);
+    // Only the begin marker reached this submission; the others are from #4.
+    fencePage[16]=5; fencePage[17]=4; fencePage[18]=4; fencePage[8]=4;
+    uint32_t progress=0;
+    assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag, true, nullptr, &progress) == kIOReturnSuccess);
+    assert(progress == (ARCXE_PROGRESS_VALID | ARCXE_PROGRESS_BEGIN));
     assert(timedOut && diag.timed_out && diag.completed_seqno == 4);
     assert(completed == 4 && q.faulted && resets == 1);
     assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut) == kIOReturnNotResponding);
@@ -86,6 +92,14 @@ int main() {
     completed=4; onLock=faultOnLock;
     assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag) == kIOReturnNotResponding);
     assert(resets == 1 && completed == 4);
+    assert(locks == 0 && wakes == 0);
+    // All parser markers can pass while the real completion fence stays #4.
+    q.faulted=false;
+    fencePage[17]=5; fencePage[18]=5; fencePage[8]=5;
+    assert(svc.waitQueueSeqno(&q, 5, 0, &done, &timedOut, &diag, true, nullptr, &progress) == kIOReturnSuccess);
+    assert(progress == (ARCXE_PROGRESS_VALID | ARCXE_PROGRESS_BEGIN | ARCXE_PROGRESS_BEFORE_BB |
+                        ARCXE_PROGRESS_RETURNED | ARCXE_PROGRESS_INVALIDATED));
+    assert(timedOut && done == 4 && completed == 4 && q.faulted && resets == 2);
     assert(locks == 0 && wakes == 0);
     std::puts("PASS: production fence wait, timeout, terminal fault, and reset races");
 }

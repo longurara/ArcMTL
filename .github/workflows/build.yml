@@ -27,11 +27,12 @@ jobs:
           xcodebuild -version
           xcrun --show-sdk-path
 
-      - name: Validate installer logging and acceleration safety guard
+      - name: Validate installer safety, fence waits and ring command packets
         run: |
           bash -n package/install_opencore_userspace.sh
           python3 tests/test_installer_logging.py
           python3 tests/test_arcxe_wait.py
+          python3 tests/test_arcxe_ring.py
           python3 plugin/adapt_arc_plugin.py --self-test
 
       - name: Build Kernel Extensions (ArcXe, ArcFB + ArcAccel for macOS 26 & macOS 15)

@@ -624,6 +624,17 @@ static inline void ringEmitDword(ArcExecQueue *q, uint32_t dw)
     q->ringTail = (q->ringTail + 4u) & (q->ringSize - 1u);
 }
 
+/* Parser progress only, never a completion fence. Keep these stores on a
+ * separate cache line from the fence (0x00) and invalidate scratch (0x40). */
+static inline void ringEmitProgress(ArcExecQueue *q, uint32_t slot, uint64_t seqno)
+{
+    ringEmitDword(q, ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_USE_GGTT | ARC_MI_SDI_QWORD_LEN);
+    ringEmitDword(q, q->seqnoGgttAddr + 0x80u + slot * 8u);
+    ringEmitDword(q, 0u);
+    ringEmitDword(q, (uint32_t)seqno);
+    ringEmitDword(q, (uint32_t)(seqno >> 32));
+}
+
 bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *prevQueue)
 {
     ArcExecQueue *idleQ  = (base == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
@@ -864,6 +875,23 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         }
     }
 
+    q->lastBatchGpuVa = batchGpuVa;
+    q->submitRingStart = q->ringTail;
+    ringEmitProgress(q, 0u, seqno);
+
+    /* Wa_14016712196 also precedes INVALIDATE on Meteor Lake, not only the
+     * end-of-batch flush. See i915 gen8_engine_cs.c: gen12_emit_flush_rcs /
+     * mtl_dummy_pipe_control. Emit before disabling the preparser, with no
+     * post-sync operation or extra stall bits on this depth-only packet. */
+    if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
+        ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
+        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH);
+        ringEmitDword(q, 0u);
+        ringEmitDword(q, 0u);
+        ringEmitDword(q, 0u);
+        ringEmitDword(q, 0u);
+    }
+
     /* 1. Pre-batch CS Preparser Disable + Privileged CS_DEBUG_MODE2 Guard + Cache & TLB Invalidate */
     ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(true));
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
@@ -882,8 +910,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, pcFlags1);
         ringEmitDword(q, invalScratchGgtt);
         ringEmitDword(q, 0u);
-        ringEmitDword(q, 0u);
-        ringEmitDword(q, 0u);
+        ringEmitDword(q, (uint32_t)seqno);
+        ringEmitDword(q, (uint32_t)(seqno >> 32));
     } else {
         ringEmitDword(q, ARC_MI_FLUSH_DW | ARC_MI_FLUSH_DW_INV_TLB |
                          ARC_MI_FLUSH_DW_OP_STOREDW | ARC_MI_FLUSH_DW_IMM_LEN);
@@ -892,11 +920,15 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
     }
     ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(false));
+    ringEmitProgress(q, 1u, seqno);
 
     /* 2. Jump to Userspace 48-bit PPGTT Batch Buffer */
+    q->submitBatchStart = q->ringTail;
     ringEmitDword(q, ARC_MI_BATCH_BUFFER_START_PPGTT);
     ringEmitDword(q, (uint32_t)(batchGpuVa & 0xFFFFFFFFULL));
     ringEmitDword(q, (uint32_t)(batchGpuVa >> 32));
+    q->submitBatchEnd = q->ringTail;
+    ringEmitProgress(q, 2u, seqno);
 
     /* 3. Post-batch Non-Preemptible Cache Flush + Fence Seqno Write to GGTT fenceBo (xe_ring_ops.c:489-500) */
     ringEmitDword(q, ARC_MI_ARB_ON_OFF | ARC_MI_ARB_DISABLE);
@@ -927,6 +959,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
 
         /* 3c. Post-sync 64-bit seqno write into GGTT fenceBo (PIPE_CONTROL_GLOBAL_GTT_IVB in dw1!) */
+        q->submitFlushEnd = q->ringTail;
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
         ringEmitDword(q, ARC_PC_GLOBAL_GTT | ARC_PC_QW_WRITE | ARC_PC_FLUSH_ENABLE | ARC_PC_CS_STALL);
         ringEmitDword(q, q->seqnoGgttAddr);
@@ -947,6 +980,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
+        q->submitFlushEnd = q->ringTail;
         ringEmitDword(q, ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_USE_GGTT | ARC_MI_SDI_QWORD_LEN);
         ringEmitDword(q, q->seqnoGgttAddr);
         ringEmitDword(q, 0u);
@@ -1048,7 +1082,7 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                                       uint64_t *outCompleted, bool *outTimedOut,
                                       ArcXeWaitQueueOut *outDiag,
                                       bool resetOnTimeout,
-                                      uint32_t *outSubunitDiag5)
+                                      uint32_t *outSubunitDiag5, uint32_t *outProgress)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
     if (q->faulted) return kIOReturnNotResponding;
@@ -1119,6 +1153,13 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                 uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
                 readEngineDiagMmio(this, b, &snap);
                 readRcsSubunitDiag(this, b, dbg2, geomId, scId, sampId, rowId);
+                if (outProgress) {
+                    *outProgress = ARCXE_PROGRESS_VALID |
+                        (q->seqnoCpu[16] == targetSeqno ? ARCXE_PROGRESS_BEGIN : 0u) |
+                        (q->seqnoCpu[17] == targetSeqno ? ARCXE_PROGRESS_BEFORE_BB : 0u) |
+                        (q->seqnoCpu[18] == targetSeqno ? ARCXE_PROGRESS_RETURNED : 0u) |
+                        (q->seqnoCpu[8] == targetSeqno ? ARCXE_PROGRESS_INVALIDATED : 0u);
+                }
                 if (outSubunitDiag5) {
                     outSubunitDiag5[0] = dbg2;
                     outSubunitDiag5[1] = geomId;
@@ -1127,6 +1168,18 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                     outSubunitDiag5[4] = rowId;
                 }
                 if (resetOnTimeout) {
+                    AXELOG("ring progress q=%u submitted=%llu batch=0x%llx "
+                           "offsets start=0x%x bb=0x%x return=0x%x flushed=0x%x tail=0x%x "
+                           "GPU parser begin=%llu beforeBB=%llu returned=%llu invalidate=%llu fence=%llu",
+                           q->queueId, (unsigned long long)q->lastSubmittedSeqno,
+                           (unsigned long long)q->lastBatchGpuVa,
+                           q->submitRingStart, q->submitBatchStart, q->submitBatchEnd,
+                           q->submitFlushEnd, q->ringTail,
+                           (unsigned long long)q->seqnoCpu[16],
+                           (unsigned long long)q->seqnoCpu[17],
+                           (unsigned long long)q->seqnoCpu[18],
+                           (unsigned long long)q->seqnoCpu[8],
+                           (unsigned long long)*q->seqnoCpu);
                     AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
                            "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
                            "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x DBG2=0x%08x "

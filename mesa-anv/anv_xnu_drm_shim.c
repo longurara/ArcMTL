@@ -1189,6 +1189,13 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                     out.diag.ipehr, out.diag.esr, out.diag.instdone,
                     out.dbg2, out.geom_instdone, out.sc_instdone,
                     out.sampler_instdone, out.row_instdone, out.diag.mi_mode);
+            if (out.progress_flags & ARCXE_PROGRESS_VALID)
+                fprintf(stderr, "  [ArcXe GPU PROGRESS] begin=%u invalidate=%u beforeBB=%u returned=%u "
+                                "(parser markers, not completion fences)\n",
+                        !!(out.progress_flags & ARCXE_PROGRESS_BEGIN),
+                        !!(out.progress_flags & ARCXE_PROGRESS_INVALIDATED),
+                        !!(out.progress_flags & ARCXE_PROGRESS_BEFORE_BB),
+                        !!(out.progress_flags & ARCXE_PROGRESS_RETURNED));
         }
         errno = ETIME;
         return -ETIME;
