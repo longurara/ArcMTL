@@ -307,7 +307,7 @@ struct ArcXeSyncobjWaitOut {
 };
 
 /* Optional tails of SyncobjWait output. Both the original 96-byte prefix and
- * the extended 200/280-byte replies remain stable. New callers request 520
+ * the extended 200/280/520-byte replies remain stable. New callers request 528
  * bytes; kernels negotiate the largest complete version that fits. */
 struct ArcXeTimeoutHwState {
     uint32_t version;                 /* 1: primary MCR instance, before reset */
@@ -326,6 +326,10 @@ struct ArcXeTimeoutMcrState {
     uint32_t version, selector, enabled_dss, count;
     struct ArcXeTimeoutDssSample samples[8];
 };
+struct ArcXeTimeoutRcuState {
+    uint32_t version, mode;            /* 1: RCU_MODE read before engine reset */
+};
+#define ARCXE_SYNCOBJ_WAIT_V3_SIZE 520u
 #define ARCXE_SYNCOBJ_WAIT_V2_SIZE 280u
 #define ARCXE_SYNCOBJ_WAIT_V1_SIZE 200u /* original extended reply */
 struct ArcXeTimeoutDetail {
@@ -342,6 +346,7 @@ struct ArcXeTimeoutDetail {
     uint32_t idle_park_count;
     struct ArcXeTimeoutHwState hw;
     struct ArcXeTimeoutMcrState mcr;
+    struct ArcXeTimeoutRcuState rcu;
 };
 struct ArcXeSyncobjWaitOutExtended {
     struct ArcXeSyncobjWaitOut base;

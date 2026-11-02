@@ -21,10 +21,9 @@ uint32_t ArcXeService::engineMmioBase(uint16_t engineClass, uint16_t engineInsta
     case kArcXeEngineClassRender:
     case kArcXeEngineClassCompute:
         /*
-         * On Meteor Lake Xe-LPG (12.70/12.71), standalone CCS0 (0x1A000) is clock/power-gated
-         * off at reset unless RCU_MODE_CCS_ENABLE / CCS_MODE slice partitioning is enabled,
-         * while RCS0 (0x02000) natively executes both 3D and GPGPU COMPUTE_WALKER pipelines
-         * with full undivided access to all 8 Xe-cores (128 Vector Engines).
+         * RCS0 executes both 3D and GPGPU COMPUTE_WALKER pipelines. Keep
+         * compute on this initialized engine; the GT RCU mode is configured
+         * independently and does not imply that we submit work to CCS0.
          */
         if (outHwsp) *outHwsp = fRcsHwspBo;
         return ARC_RENDER_RING_BASE;
@@ -1132,6 +1131,8 @@ static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
     d->fault_data0 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA0);
     d->fault_data1 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA1);
     if (q->mmioBase == ARC_RENDER_RING_BASE) {
+        d->rcu.version = 1;
+        d->rcu.mode = svc->rd32(ARC_REG_RCU_MODE);
         auto &h = d->hw;
         h.cmd_cctl = svc->rd32(ARC_RING_CMD_CCTL(q->mmioBase));
         h.gfx_mode = svc->rd32(ARC_RING_GFX_MODE(q->mmioBase));

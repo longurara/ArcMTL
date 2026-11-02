@@ -1472,7 +1472,7 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                             h->mocs1, h->mocs9, h->lncf0, h->lncf4);
                 }
             }
-            if (out_sz >= sizeof(response) && response.detail.mcr.version == 1) {
+            if (out_sz >= ARCXE_SYNCOBJ_WAIT_V3_SIZE && response.detail.mcr.version == 1) {
                 const struct ArcXeTimeoutMcrState *m = &response.detail.mcr;
                 fprintf(stderr, "  [ArcXe MCR] selector=%08x enabled_dss=%08x count=%u\n",
                         m->selector, m->enabled_dss, m->count);
@@ -1483,6 +1483,9 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                             v->hdc_chicken0, v->sampler_instdone, v->row_instdone);
                 }
             }
+            if (out_sz >= sizeof(response) && response.detail.rcu.version == 1)
+                fprintf(stderr, "  [ArcXe RCU] MODE=%08x CCS_ENABLE=%u (compute submits on RCS)\n",
+                        response.detail.rcu.mode, response.detail.rcu.mode & 1u);
             dump_timeout_batch(ap->fd, ((uint64_t)out.diag.acthd_hi << 32) | out.diag.acthd_lo);
             dump_timeout_history(ap->fd);
         }

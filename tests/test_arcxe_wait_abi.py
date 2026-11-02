@@ -54,7 +54,7 @@ static void fake_clock_gettime(int, timespec *t) { t->tv_sec=1; t->tv_nsec=0; }
 static int IOConnectCallStructMethod(io_connect_t, int method, const void *input, size_t insize,
                                      void *output, size_t *size) {
     assert(method==kArcXeMethodSyncobjWait && insize==sizeof(ArcXeSyncobjWaitIn));
-    assert(*size==520);
+    assert(*size==528);
     const auto *in=static_cast<const ArcXeSyncobjWaitIn *>(input);
     assert(in->count_handles==1 && in->handles[0]==7 && in->points[0]==9);
     assert(in->flags==ARCXE_SYNCOBJ_WAIT_ALL && in->timeout_nsec==5000000000LL);
@@ -72,6 +72,8 @@ static int IOConnectCallStructMethod(io_connect_t, int method, const void *input
     response.detail.mcr.count=UINT32_MAX; // bounded to eight even if corrupted
     response.detail.hw.version=1;
     response.detail.hw.l3_alloc=0x200;
+    response.detail.rcu.version=1;
+    response.detail.rcu.mode=1;
     std::memcpy(output,&response,replySize); *size=replySize;
     return replyError;
 }
@@ -80,13 +82,14 @@ CASES = r'''
 int main() {
     static_assert(sizeof(ArcXeSyncobjWaitOut)==96);
     static_assert(offsetof(ArcXeSyncobjWaitOutExtended,detail)+offsetof(ArcXeTimeoutDetail,hw)==200);
-    static_assert(sizeof(ArcXeSyncobjWaitOutExtended)==520);
+    static_assert(sizeof(ArcXeSyncobjWaitOutExtended)==528);
+    static_assert(offsetof(ArcXeSyncobjWaitOutExtended,detail)+offsetof(ArcXeTimeoutDetail,rcu)==520);
     static_assert(offsetof(ArcXeSyncobjWaitOutExtended,detail)+offsetof(ArcXeTimeoutDetail,mcr)==280);
-    alignas(8) unsigned char buffer[528];
-    for (size_t size : {96u, 104u, 199u, 200u, 208u, 279u, 280u, 288u, 519u, 520u, 528u}) {
+    alignas(8) unsigned char buffer[536];
+    for (size_t size : {96u, 104u, 199u, 200u, 208u, 279u, 280u, 288u, 519u, 520u, 524u, 527u, 528u, 536u}) {
         std::memset(buffer,0xa5,sizeof(buffer));
         Args args={buffer,size}; negotiate(&args, false);
-        size_t expected=size>=520 ? 520 : size>=280 ? 280 : size>=200 ? 200 : 96;
+        size_t expected=size>=528 ? 528 : size>=520 ? 520 : size>=280 ? 280 : size>=200 ? 200 : 96;
         assert(args.structureOutputSize==expected);
         for (size_t i=0; i<sizeof(buffer); ++i) assert(buffer[i]==(i<expected ? 0 : 0xa5));
         negotiate(&args, true);
@@ -95,19 +98,19 @@ int main() {
     }
     ArcSyncProvider provider={}; provider.fd=1;
     uint32_t handle=7, first=99; uint64_t point=9;
-    for (size_t size : {96u, 200u, 280u, 520u}) {
+    for (size_t size : {96u, 200u, 280u, 520u, 528u}) {
         replySize=size; timeout=false;
         assert(arc_sync_timeline_wait(&provider.base,&handle,&point,1,INT64_MAX,1,&first)==0);
         assert(first==3);
         timeout=true;
         assert(arc_sync_timeline_wait(&provider.base,&handle,&point,1,INT64_MAX,1,&first)==-ETIME);
     }
-    assert(dumps==4);
+    assert(dumps==5);
     replySize=95;
     assert(arc_sync_timeline_wait(&provider.base,&handle,&point,1,INT64_MAX,1,&first)==-EIO);
     replySize=200; replyError=1;
     assert(arc_sync_timeline_wait(&provider.base,&handle,&point,1,INT64_MAX,1,&first)==-EIO);
-    assert(dumps==4);
+    assert(dumps==5);
     connected=false;
     assert(arc_sync_timeline_wait(&provider.base,&handle,&point,1,INT64_MAX,1,&first)==-EBADF);
     std::puts("PASS: production kernel/shim wait ABI, legacy replies, bounded diagnostics and errors");
@@ -127,10 +130,12 @@ with tempfile.TemporaryDirectory(prefix='arcxe-wait-abi-') as directory:
         args = [compiler, '-std=c++17', '-I', str(ROOT / 'include'), str(cpp), '-o', str(binary)]
     subprocess.run(args, check=True, cwd=path)
     result = subprocess.run([str(binary)], check=True, timeout=10, capture_output=True, text=True)
-    assert result.stderr.count('[ArcXe CONTEXT]') == 3
-    assert result.stderr.count('[ArcXe HW STATE]') == 2
-    assert result.stderr.count('[ArcXe MCR]') == 1
-    assert result.stderr.count('[ArcXe DSS]') == 8
+    assert result.stderr.count('[ArcXe CONTEXT]') == 4
+    assert result.stderr.count('[ArcXe HW STATE]') == 3
+    assert result.stderr.count('[ArcXe MCR]') == 2
+    assert result.stderr.count('[ArcXe DSS]') == 16
+    assert result.stderr.count('[ArcXe RCU]') == 1
+    assert 'MODE=00000001 CCS_ENABLE=1' in result.stderr
     assert 'L3ALLOC=00000200' in result.stderr
     assert 'address=0xa12345678000 space=GGTT' in result.stderr
     assert 'count=16' in result.stderr and '+30:' in result.stderr

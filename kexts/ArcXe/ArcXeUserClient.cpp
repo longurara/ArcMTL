@@ -786,6 +786,8 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         auto *out      = static_cast<ArcXeSyncobjWaitOut *>(args->structureOutput);
         const size_t outputSize = args->structureOutputSize >= sizeof(ArcXeSyncobjWaitOutExtended)
             ? sizeof(ArcXeSyncobjWaitOutExtended)
+            : args->structureOutputSize >= ARCXE_SYNCOBJ_WAIT_V3_SIZE
+            ? ARCXE_SYNCOBJ_WAIT_V3_SIZE
             : args->structureOutputSize >= ARCXE_SYNCOBJ_WAIT_V2_SIZE
             ? ARCXE_SYNCOBJ_WAIT_V2_SIZE
             : (args->structureOutputSize >= ARCXE_SYNCOBJ_WAIT_V1_SIZE

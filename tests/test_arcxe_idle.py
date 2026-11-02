@@ -224,6 +224,7 @@ int main() {
     f.svc.regs[ARC_REG_XEHP_FAULT_TLB_DATA0]=0x456;
     f.svc.regs[ARC_REG_XEHP_FAULT_TLB_DATA1]=0x789;
     f.svc.regs[ARC_REG_L3ALLOC]=0x200;
+    f.svc.regs[ARC_REG_RCU_MODE]=3;
     f.svc.regs[ARC_REG_XEHP_L3SQCREG5]=0xe0007f;
     for (unsigned i=0; i<5; ++i) f.svc.regs[ARC_REG_PAT_INDEX(i)]=i+10;
     for (unsigned i=0; i<64; ++i) f.prevRing[i]=i;
@@ -244,6 +245,7 @@ int main() {
     for (unsigned i=0; i<16; ++i) assert(d.ring_dw[i]==((58+i)%64));
     assert(d.context_control==0x111 && d.context_head==0x222 && d.context_tail==0x333 && d.idle_park_count==9);
     assert(d.hw.version==1 && d.hw.l3_alloc==0x200 && d.hw.l3_sqcreg5==0xe0007f);
+    assert(d.rcu.version==1 && d.rcu.mode==3);
     for (unsigned i=0; i<5; ++i) assert(d.hw.pat[i]==i+10);
     // A timeout during a context switch must dump the active idle ring.
     for (unsigned i=0; i<64; ++i) f.ring[i]=0x1000+i;

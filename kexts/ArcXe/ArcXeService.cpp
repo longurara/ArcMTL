@@ -271,12 +271,18 @@ void ArcXeService::applyXeLpgWorkarounds()
     wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
 
-    /* GT & MCR workarounds + L3 PWM tuning; keep standalone CCS0 disabled so RCS0 owns all 8 Xe-cores */
+    /* GT & MCR workarounds + L3 PWM tuning. */
     wr32(ARC_REG_MISCCPCTL,      rd32(ARC_REG_MISCCPCTL) & ~ARC_DOP_CLOCK_GATE_RENDER_ENABLE); /* Wa_14015795083 */
     wr32(ARC_REG_COMP_MOD_CTRL,  compMod | ARC_FORCE_MISS_FTLB);                               /* Wa_14018575942 */
     wr32(ARC_REG_SQCNT1,         sqcnt1  | ARC_SQCNT1_ENFORCE_RAR);                            /* Wa_22016670082 */
     wr32(ARC_REG_XEHP_L3SQCREG5, (l3sqcreg5 & ~ARC_L3_PWM_TIMER_INIT_VAL_MASK) | ARC_L3_PWM_TIMER_INIT_7F);
-    wr32(ARC_REG_RCU_MODE,       ARC_MASKED_DISABLE(ARC_RCU_MODE_CCS_ENABLE));
+    /* xe_hw_engine.c enables this on the first render OR compute engine for
+     * graphics >= 12.55, including MTL. Queue routing is independent of this
+     * GT mode: disabling it does not allocate more EUs to RCS. Keep the
+     * upstream mode even though our scheduler submits compute through RCS.
+     * Use a masked write to preserve the other RCU settings after reset. */
+    wr32(ARC_REG_RCU_MODE,       ARC_MASKED_ENABLE(ARC_RCU_MODE_CCS_ENABLE));
+    (void)rd32(ARC_REG_RCU_MODE);
 
     /* Engine & LRC masked MCR chicken workarounds + Render Indirect State Base Address Override (ANV/BLORP) */
     wr32(ARC_REG_SAMPLER_MODE,          ARC_MASKED_ENABLE(ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE)); /* xe_tuning.c:91-95 */

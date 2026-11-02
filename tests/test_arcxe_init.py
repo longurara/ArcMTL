@@ -52,7 +52,10 @@ struct ArcXeService {
     }
     void wr32(uint32_t r, uint32_t v) {
         if (checkingSteering && r == ARC_REG_MTL_MCR_SELECTOR) assert(locks == 1);
-        regs[r]=v; writes.emplace_back(r,v);
+        if (r == ARC_REG_RCU_MODE)
+            regs[r]=(regs[r] & ~(v>>16)) | (v & (v>>16));
+        else regs[r]=v;
+        writes.emplace_back(r,v);
         if (r==ARC_REG_SAMPLER_MODE || r==ARC_REG_ROW_CHICKEN2 ||
             r==ARC_REG_ROW_CHICKEN3 || r==ARC_REG_XEHP_HDC_CHICKEN0 ||
             r==ARC_REG_XEHP_PSS_CHICKEN || r==ARC_REG_COMMON_SLICE_CHICKEN3) {
@@ -124,6 +127,14 @@ int main() {
     checkDebugWrites(s,1);
     s.applyXeLpgWorkarounds();
     checkDebugWrites(s,2);
+    assert(s.regs[ARC_REG_RCU_MODE] & ARC_RCU_MODE_CCS_ENABLE);
+    // Reset loses the mode bit. Reapplication must restore it without
+    // clobbering unrelated RCU bits (including the fixed-slice mode bit).
+    for (uint32_t initial : {0u, 2u, 0xa5a4u, 0xa5a5u}) {
+        s.regs[ARC_REG_RCU_MODE]=initial;
+        s.applyXeLpgWorkarounds();
+        assert(s.regs[ARC_REG_RCU_MODE] == (initial | ARC_RCU_MODE_CCS_ENABLE));
+    }
     // Previously only instance0 received these mandatory workarounds.
     for (unsigned i=0; i<8; ++i) {
         assert(s.dss[i][ARC_REG_SAMPLER_MODE] & ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE);
