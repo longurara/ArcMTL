@@ -272,6 +272,28 @@ def main() -> None:
 
     # 7. Hook open/close, placed mmap feature flags, and syncobj provider in anv_physical_device.c
     anv_pdev = anv_dir / "anv_physical_device.c"
+    # ArcXe has a fixed RCC policy: every render LRC sets COMMON_SLICE_CHICKEN3
+    # bit13 before user batches, also after resets. Its Xe ioctl facade does not
+    # expose Linux's configurable per-queue property. ANV must use this known
+    # backend policy instead of inferring BTI-only keying from the absent flag.
+    replace_once(
+        anv_pdev,
+        "   device->rt_change_needs_flush =\n"
+        "      !instance->drirc.perf.state_cache_perf_fix ||\n"
+        "      !platform_supports_btp_bit_rcc;",
+        "   device->rt_change_needs_flush =\n"
+        "      !instance->drirc.perf.state_cache_perf_fix ||\n"
+        "      !platform_supports_btp_bit_rcc;\n"
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_FIXED_BTP_BTI_RCC: kernel always enables BTP+BTI keying.\n"
+        "    * Keep the drirc opt-out for comparing legacy flushes.\n"
+        "    */\n"
+        "   device->rt_change_needs_flush = !instance->drirc.perf.state_cache_perf_fix;\n"
+        "   fprintf(stderr, \"[ArcXe RCC] BTP+BTI keying; legacy RT-change flush=%u\\n\",\n"
+        "           (unsigned)device->rt_change_needs_flush);\n"
+        "#endif",
+        "ARCXE_FIXED_BTP_BTI_RCC",
+    )
     replace_once(
         anv_pdev,
         "#include <xf86drm.h>",

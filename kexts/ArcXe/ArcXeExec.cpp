@@ -898,7 +898,11 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
     }
 
-    /* 1. Pre-batch CS Preparser Disable + Privileged CS_DEBUG_MODE2 Guard + Cache & TLB Invalidate */
+    /* 1. Pre-batch CS Preparser Disable + CS_DEBUG_MODE2 Guard + Read Cache Invalidate.
+     * Page-table updates already finish synchronous MMIO invalidation of every
+     * active engine in vmBindBo/allocGgttAndBind before returning success.
+     * Do not also request a PIPE_CONTROL TLB invalidate on every submission.
+     * Xe likewise sets that bit only for jobs with ring_ops_flush_tlb. */
     ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(true));
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
         /* Preserve absolute constant-buffer addressing on MTL. Do not inject
@@ -908,7 +912,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT));
 
         uint32_t pcFlags0 = ARC_PC0_L3_RO_CACHE_INVALIDATE;
-        uint32_t pcFlags1 = ARC_PC_CS_STALL | ARC_PC_TLB_INVALIDATE |
+        uint32_t pcFlags1 = ARC_PC_CS_STALL |
                             ARC_PC_CMD_CACHE_INVALIDATE | ARC_PC_INST_CACHE_INVALIDATE |
                             ARC_PC_TEX_CACHE_INVALIDATE | ARC_PC_VF_CACHE_INVALIDATE |
                             ARC_PC_CONST_CACHE_INVALIDATE | ARC_PC_STATE_CACHE_INVALIDATE |
@@ -942,7 +946,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
         /*
          * 3a. Wa_14016712196: separate depth-only flush, matching xe_ring_ops.c.
-         * The following main flush carries Wa_1409600907's depth stall.
+         * Wa_1409600907's additional depth stall is only for IP12.00..12.50,
+         * not MTL12.70..12.74 (xe_wa_oob.rules).
          * Do not add a post-sync write to this preliminary packet.
          */
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
@@ -952,12 +957,12 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
-        /* 3b. Match Xe's HDC + Tile + RT + Depth + DC flush with CS/Depth stall.
+        /* 3b. Match Xe's MTL HDC + Tile + RT + Depth + DC flush with CS stall.
          * Pixel-scoreboard stall belongs to BTI changes, not this fence flush. */
         const uint32_t flush1 = ARC_PC_CS_STALL |
                                 ARC_PC_FLUSH_ENABLE | ARC_PC_DC_FLUSH_ENABLE |
                                 ARC_PC_TILE_CACHE_FLUSH | ARC_PC_RT_CACHE_FLUSH |
-                                ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL;
+                                ARC_PC_DEPTH_CACHE_FLUSH;
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6) | ARC_PC0_HDC_PIPELINE_FLUSH);
         ringEmitDword(q, flush1);
         ringEmitDword(q, 0u);

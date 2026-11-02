@@ -92,7 +92,8 @@ static void check(uint16_t engine, uint32_t initialTail) {
         }
         if (h == (ARC_GFX_OP_PIPE_CONTROL(6) | ARC_PC0_L3_RO_CACHE_INVALIDATE)) {
             ++invalidates;
-            assert(ring[pos/4+1] & ARC_PC_TLB_INVALIDATE);
+            // Checked synchronous MMIO invalidation owns page-table updates.
+            assert(!(ring[pos/4+1] & ARC_PC_TLB_INVALIDATE));
             assert(ring[pos/4+1] & ARC_PC_CS_STALL);
             assert(ring[pos/4+1] & ARC_PC_QW_WRITE);
             assert(ring[pos/4+1] & ARC_PC_GLOBAL_GTT);
@@ -112,6 +113,8 @@ static void check(uint16_t engine, uint32_t initialTail) {
             assert(pos == q.submitBatchStart && pos+12 == q.submitBatchEnd);
             assert((ring[pos/4+1] | (uint64_t(ring[pos/4+2]) << 32)) == batch);
         }
+        if ((h & 0xffff0000u) == 0x7a000000u)
+            assert(!(ring[pos/4+1] & ARC_PC_DEPTH_STALL)); // WA excludes MTL
         pos += n*4;
     }
     assert(markers == 3 && fences == (engine == kArcXeEngineClassCopy ? 1u : 0u));

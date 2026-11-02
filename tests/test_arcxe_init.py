@@ -85,7 +85,7 @@ static void checkInit(uint32_t selector, bool wake, bool render, bool idle) {
     } else assert(s.writes.empty());
     assert(q.isIdleKernelCtx == idle && q.holdsForceWake == wake);
     assert(q.initRingTail == q.ringTail && !(q.ringTail & 7));
-    unsigned debug=0, tuning=0;
+    unsigned debug=0, tuning=0, rcc=0;
     for (uint32_t i=0; i<q.initRingTail/4;) {
         const auto h=ring[i];
         if ((h >> 23) == 0x22) {
@@ -97,13 +97,16 @@ static void checkInit(uint32_t selector, bool wake, bool render, bool idle) {
                 if (ring[i+j] == ARC_REG_XEHP_L3SQCREG5) {
                     assert(ring[i+j+1] == 0x0020007f); ++tuning;
                 }
+                if (ring[i+j] == ARC_REG_COMMON_SLICE_CHICKEN3) {
+                    assert(ring[i+j+1] == 0x20002000u); ++rcc;
+                }
             }
             i+=words;
         } else if ((h >> 29) == 3) i+=(h & 0xff)+2;
         else { assert(h == ARC_MI_NOOP || h == (ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE)); ++i; }
         assert(i <= q.initRingTail/4);
     }
-    assert(debug == (render ? 1u:0u) && tuning == debug);
+    assert(debug == (render ? 1u:0u) && tuning == debug && rcc == debug);
 }
 int main() {
     ArcXeService s; ArcBo hwsp;
