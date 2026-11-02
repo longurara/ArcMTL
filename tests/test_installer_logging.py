@@ -110,6 +110,27 @@ class InstallerLoggingTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0 if all(results) else 1, result.stderr)
                     self.assertIn(f"CONFIG={expected}", result.stdout)
 
+    def test_boundary_diagnostics_never_promote_baseline_result(self):
+        start = SCRIPT.index('# Run after ALL baseline GPU tests')
+        block = SCRIPT[start:SCRIPT.index('stamp_host_deps() {', start)]
+        for baseline, diag_status, available in itertools.product((0, 1), repeat=3):
+            with self.subTest(baseline=baseline, diag_status=diag_status, available=available):
+                runnable = '/bin/bash' if available else '/no-such-arc-test'
+                code = block.replace('-x /usr/local/bin/vk_offscreen_test', f'-x {runnable}')
+                code = code.replace('/usr/local/bin/vk_offscreen_test', 'arc_test_vk')
+                prelude = (
+                    f'VK_OK={baseline}\n'
+                    'arc_test_vk() { echo "CALLED probes=$ARC_VK_BOUNDARY_PROBES"; '
+                    f'return {diag_status}; }}\n'
+                )
+                result = subprocess.run(
+                    [BASH, '-s'], input=prelude + code + '\necho "FINAL_VK_OK=$VK_OK"\n',
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'FINAL_VK_OK={baseline}', result.stdout)
+                self.assertEqual('CALLED probes=1' in result.stdout, baseline == 0 and bool(available))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -269,7 +269,7 @@ if [ -x /usr/local/bin/arc_probe ]; then
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
     echo "--- [Test B1] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
-    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp,bat,pc" \
+    if ARC_VK_BOUNDARY_PROBES=0 INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp,bat,pc" \
         VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
         VK_OK=1
         echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
@@ -298,6 +298,19 @@ if (kmutil showloaded --list-only 2>/dev/null || kextstat 2>/dev/null) | grep -q
         /usr/local/bin/mtl_offscreen_test \
             && echo "[OK] Metal 3 end-to-end render & compute verification PASSED!" \
             || echo "[WARN] mtl_offscreen_test returned non-zero"
+    fi
+fi
+
+# Run after ALL baseline GPU tests, so extra submissions cannot change their result.
+# This is a new process after a failure/reset, not a controlled fresh-boot comparison.
+# A diagnostic PASS must never promote VK_OK or bypass the acceleration guard.
+if [ "$VK_OK" -eq 0 ] && [ -x /usr/local/bin/vk_offscreen_test ]; then
+    echo "--- [Diagnostic B-boundary] Separate run after baseline tests; does not count as acceptance ---"
+    if ARC_VK_BOUNDARY_PROBES=1 INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp,bat,pc" \
+        VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
+        echo "[DIAG] Boundary run completed; baseline VK_OK remains $VK_OK"
+    else
+        echo "[DIAG] Boundary run failed; inspect last BOUNDARY BEGIN/SUBMITTED/PASS marker"
     fi
 fi
 

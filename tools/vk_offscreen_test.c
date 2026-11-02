@@ -17,6 +17,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "vk_boundary_probe.h"
+
 #define CHECK_VK(expr)                                                                  \
     do {                                                                                \
         VkResult _r = (expr);                                                           \
@@ -114,10 +116,13 @@ static const char *pick_icd_path(int argc, char **argv)
 int main(int argc, char **argv)
 {
     const char *icd_path = pick_icd_path(argc, argv);
+    const char *probe_env = getenv("ARC_VK_BOUNDARY_PROBES");
+    const int boundary_probes = probe_env && strcmp(probe_env, "1") == 0;
 
     printf("==================================================================\n");
     printf(" Stage 2: Mesa ANV Vulkan 1.3 Offscreen GPU Test (macOS 15+)\n");
     printf(" ICD: %s\n", icd_path);
+    printf(" Mode: %s\n", boundary_probes ? "boundary diagnostics (not baseline acceptance)" : "baseline");
     printf("==================================================================\n");
 
     void *lib = dlopen(icd_path, RTLD_NOW | RTLD_LOCAL);
@@ -404,6 +409,14 @@ int main(int argc, char **argv)
     VkCommandBuffer cmds[7] = { VK_NULL_HANDLE };
     CHECK_VK(pvkAllocateCommandBuffers(dev, &cbai, cmds));
 
+    /* Allocate diagnostics separately: baseline command-buffer allocation stays identical. */
+    VkCommandBuffer probe_cmds[2] = { VK_NULL_HANDLE };
+    if (boundary_probes) {
+        VkCommandBufferAllocateInfo probe_ai = cbai;
+        probe_ai.commandBufferCount = 2;
+        CHECK_VK(pvkAllocateCommandBuffers(dev, &probe_ai, probe_cmds));
+    }
+
     VkCommandBufferBeginInfo cbbi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -414,6 +427,14 @@ int main(int argc, char **argv)
     };
     VkFence fence = VK_NULL_HANDLE;
     CHECK_VK(pvkCreateFence(dev, &fci, NULL, &fence));
+    const ArcVkBoundaryProbe boundary = {
+        .dev = dev, .queue = queue, .fence = fence, .src = src_buf, .dst = buf,
+        .offset = buf_size - sizeof(uint32_t),
+        .src_word = &src_words[total_words - 1], .dst_word = &words[total_words - 1],
+        .begin = pvkBeginCommandBuffer, .copy = pvkCmdCopyBuffer,
+        .barrier = pvkCmdPipelineBarrier, .end = pvkEndCommandBuffer,
+        .reset = pvkResetFences, .submit = pvkQueueSubmit, .wait = pvkWaitForFences,
+    };
 
     /* Subtest B1: vkCmdCopyBuffer (64 KiB) */
     VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = buf_size };
@@ -654,6 +675,11 @@ int main(int argc, char **argv)
         printf("  [PASS B3] Verified %u / %u rendered BGRA8 pixels == 0x%08x!\n",
                img_pixels, img_pixels, words[0]);
     }
+
+    /* Last word is outside the B3/B4 64x64 image readback region. */
+    if (boundary_probes && arc_vk_boundary_probe(&boundary, probe_cmds[0],
+                                                "after-B3", 0xB3007D55u))
+        return 20;
 
     /*
      * Subtest B4: Multi-Batch Full 3D Graphics Pipeline (WindowServer CoreDisplay Reproducer)
@@ -1041,6 +1067,12 @@ int main(int argc, char **argv)
                                   0, 0, NULL, 0, NULL, 1, &to_sample);
         }
         CHECK_VK(pvkEndCommandBuffer(cmds[3]));
+        if (boundary_probes && arc_vk_boundary_probe(&boundary, probe_cmds[1],
+                                                    "before-B4-upload", 0xB4007D55u))
+            return 21;
+        /* The boundary probe uses the same fence; B4 needs it unsignaled again. */
+        if (boundary_probes)
+            CHECK_VK(pvkResetFences(dev, 1, &fence));
         {
             VkSubmitInfo up_si = {
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
