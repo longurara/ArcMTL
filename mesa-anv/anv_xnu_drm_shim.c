@@ -39,6 +39,11 @@
 __attribute__((constructor))
 static void arc_xnu_shim_init_env(void)
 {
+    /* ArcXe sets BTP+BTI RCC keying in every render LRC. Mesa's upstream
+     * anv_state_cache_perf_fix option defaults false (only vkd3d opts in).
+     * Set the Darwin default before instance drirc parsing; preserve an
+     * explicit anv_state_cache_perf_fix=false for legacy-flush comparison. */
+    setenv("anv_state_cache_perf_fix", "true", 0);
     /*
      * Default Mesa ANV's TBIMR (Tile-Based Immediate Mode Renderer, driconf 'intel_tbimr') off on
      * Direct Execlist unless ARCMTL_TBIMR=1 is explicitly exported. On >=2560x1600 framebuffers

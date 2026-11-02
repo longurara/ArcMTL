@@ -29,9 +29,25 @@ with tempfile.TemporaryDirectory(prefix='arc-rcc-patch-') as directory:
 HARNESS = r'''
 #include <cassert>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
 struct Device { bool rt_change_needs_flush; };
 struct Instance { struct { struct { bool state_cache_perf_fix; } perf; } drirc; };
+static std::map<std::string,std::string> env;
+static const char *fake_getenv(const char *key) {
+    auto it=env.find(key); return it == env.end() ? nullptr : it->second.c_str();
+}
+static int fake_setenv(const char *key, const char *value, int overwrite) {
+    if (overwrite || !env.count(key)) env[key]=value;
+    return 0;
+}
 '''
+shim = (ROOT / 'mesa-anv/anv_xnu_drm_shim.c').read_text(encoding='utf-8')
+begin = shim.index('static void arc_xnu_shim_init_env(void)')
+constructor = shim[begin:shim.index('\n/* ===', begin)]
+HARNESS += ('\n#define getenv fake_getenv\n#define setenv fake_setenv\n' + constructor +
+            '\n#undef getenv\n#undef setenv\n')
 prefix = r'''(bool enabled, bool platform_supports_btp_bit_rcc) {
     Device dev{}; Device *device=&dev;
     Instance inst{}; Instance *instance=&inst;
@@ -42,6 +58,15 @@ body = ('#undef __APPLE__\nbool linux_policy' + prefix + body + suffix +
         '#define __APPLE__ 1\nbool darwin_policy' + prefix + body + suffix)
 CASES = r'''
 int main() {
+    arc_xnu_shim_init_env();
+    assert(env["anv_state_cache_perf_fix"] == "true");
+    assert(!darwin_policy(env["anv_state_cache_perf_fix"] == "true", false));
+    assert(env["intel_tbimr"] == "false");
+    for (const char *value : {"false", "true"}) {
+        env["anv_state_cache_perf_fix"] = value;
+        arc_xnu_shim_init_env();
+        assert(env["anv_state_cache_perf_fix"] == value); // preserve user override
+    }
     for (int opt=0; opt<2; ++opt) for (int capability=0; capability<2; ++capability) {
         assert(linux_policy(opt,capability) == (!opt || !capability));
         assert(darwin_policy(opt,capability) == !opt);
