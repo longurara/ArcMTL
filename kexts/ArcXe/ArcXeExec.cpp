@@ -153,9 +153,9 @@ bool ArcXeService::initEngines()
 
     /* Allocate 4KB Global HWSP in GGTT for RCS0 (Render+Compute) and BCS0 (Copy/Blitter) */
     fRcsHwspBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
-                                ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+                                ARC_MTL_PAT_IDX_WB_2WAY_COH, true);
     fBcsHwspBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
-                                ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+                                ARC_MTL_PAT_IDX_WB_2WAY_COH, true);
     if (!fRcsHwspBo || !fBcsHwspBo) {
         AXELOG("initEngines: failed to allocate engine HWSPs");
         return false;
@@ -284,7 +284,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     const uint32_t totalSize  = ctxImgOff + ctxImgSize;
 
     ArcBo *lrcBo = createKernelBo(totalSize, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
-                                  ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+                                  ARC_MTL_PAT_IDX_WB_2WAY_COH, true);
     if (!lrcBo || !lrcBo->kernMap) {
         if (lrcBo) releaseBo(lrcBo);
         return nullptr;
@@ -297,7 +297,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
      * satisfy (*q->seqnoCpu >= seqno) on multi-batch submissions.
      */
     ArcBo *fenceBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT | ARCXE_GEM_FLAG_SCANOUT,
-                                    ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
+                                    ARC_MTL_PAT_IDX_WB_2WAY_COH, true);
     if (!fenceBo || !fenceBo->kernMap) {
         if (fenceBo) releaseBo(fenceBo);
         releaseBo(lrcBo);
@@ -537,19 +537,22 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(RCS0): BIT(4) CONSTANT_BUFFERAddressOffsetDisable | BIT(6) */
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT);
 
-        if (!isIdleKernelCtx) {
-            for (const auto &st : kXeHpgSvgState) {
-                q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
-                for (uint16_t z = 1; z < st.numDw; z++) {
-                    q->ringCpu[initDw++] = 0u;
-                }
+        /*
+         * Wa_14019789679: Every RCS0 LRC (both user queues and fRcsIdleQueue) must initialize
+         * SVG 3DSTATE headers on its initial RESTORE_INHIBIT=1 run so hardware Context-Save
+         * writes valid 3DSTATE command headers instead of zeroed MI_NOOP dwords into LRC memory.
+         */
+        for (const auto &st : kXeHpgSvgState) {
+            q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
+            for (uint16_t z = 1; z < st.numDw; z++) {
+                q->ringCpu[initDw++] = 0u;
             }
-            /* Non-zero default 3DSTATE_DRAWING_RECTANGLE = {0, 0}..{65535, 65535} (matches Mesa ANV init_render_queue_state) */
-            q->ringCpu[initDw++] = ARC_GFXPIPE_3D_CMD(0x1, 0x00) | 2u;
-            q->ringCpu[initDw++] = 0u;
-            q->ringCpu[initDw++] = 0xFFFFFFFFu;
-            q->ringCpu[initDw++] = 0u;
         }
+        /* Non-zero default 3DSTATE_DRAWING_RECTANGLE = {0, 0}..{65535, 65535} (matches Mesa ANV init_render_queue_state) */
+        q->ringCpu[initDw++] = ARC_GFXPIPE_3D_CMD(0x1, 0x00) | 2u;
+        q->ringCpu[initDw++] = 0u;
+        q->ringCpu[initDw++] = 0xFFFFFFFFu;
+        q->ringCpu[initDw++] = 0u;
     } else {
         /* BCS0 context-saved BLIT_CCTL default UC MOCS (Linux xe_hw_engine.c:352-360) */
         q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
@@ -580,9 +583,9 @@ void ArcXeService::destroyExecQueue(ArcExecQueue *q)
         IOLockLock(fEngineLock);
         if (fLastRcsQueue == q || fLastBcsQueue == q) {
             /*
-             * Park the hardware engine onto its permanent kernel idle LRC BEFORE freeing q->lrcBo's
-             * GGTT range, so CURRENT_LRCA never points at freed/reallocated GGTT memory.
-             */
+            * Park the hardware engine onto its permanent kernel idle LRC BEFORE freeing q->lrcBo's
+            * GGTT range, so CURRENT_LRCA never points at freed/reallocated GGTT memory.
+            */
             if (forceWakeGet()) {
                 (void)parkEngineOnIdleContextLocked(q->mmioBase, q);
                 forceWakePut();
@@ -634,9 +637,9 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         IODelay(5);
     }
 
-    /* Evict any CPU cachelines of prevQueue's context header before hardware Context-Saves prevQueue */
-    if (prevQueue && prevQueue->ctxRegsCpu) {
-        clflushRange(prevQueue->ctxRegsCpu, 0x140);
+    /* Evict any CPU cachelines of prevQueue's LRC before hardware Context-Saves prevQueue */
+    if (prevQueue && prevQueue->lrcBo && prevQueue->ringCpu) {
+        clflushRange(prevQueue->ringCpu, prevQueue->lrcBo->size);
     }
 
     const uint64_t idleSeq = ++idleQ->lastSubmittedSeqno;
@@ -656,14 +659,14 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         ringEmitDword(idleQ, ARC_MI_NOOP);
     }
 
-    if (idleQ->hasSavedHwState) {
-        idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
-            ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH) |
-            ARC_MASKED_DISABLE(ARC_CTX_CTRL_RESTORE_INHIBIT);
-    }
+    /*
+     * Keep RESTORE_INHIBIT permanently enabled on the kernel idle parking context so parking
+     * CURRENT_LRCA on queue teardown never restores dummy state onto RCS0/BCS0.
+     */
+    idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+        ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
     idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
-    clflushRange(idleQ->ringCpu, idleQ->ringSize);
-    clflushRange(idleQ->ctxRegsCpu, 0x140);
+    clflushRange(idleQ->ringCpu, idleQ->lrcBo->size);
 
     /* Kernel idle context always uses SW_CTX_ID = 0 (Linux xe_execlist.c: port->lrc) */
     const uint64_t idleDesc = (uint64_t)(idleQ->pphwspGgttAddr & ~0xFFFu)
@@ -694,8 +697,8 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
 
     if (parkedOk) {
         if (prevQueue) {
-            if (prevQueue->ctxRegsCpu) {
-                clflushRange(prevQueue->ctxRegsCpu, 0x140);
+            if (prevQueue->lrcBo && prevQueue->ringCpu) {
+                clflushRange(prevQueue->ringCpu, prevQueue->lrcBo->size);
             }
             prevQueue->isLoadedOnHw    = false;
             prevQueue->hasSavedHwState = true;
@@ -761,13 +764,15 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     }
 
     /*
-     * Direct Execlist Multi-Submission & Context Save/Restore Lifecycle (Linux xe_execlist.c:88-125):
+     * Direct Execlist Multi-Submission & Lite-Restore / Context-Switch Lifecycle (Linux xe_execlist.c:88-115):
      * 1. Wait for any in-flight batch on this physical engine (including prior async batches on the
-     *    same queue, such as Mesa ANV's init_render_queue_state) to complete in dedicated fenceBo.
-     * 2. If an active user context is sitting on CURRENT_LRCA, park the engine onto the permanent
-     *    kernel idle context (SW_CTX_ID = 0) so hardware Context-Saves all 52 KiB of 3D pipeline
-     *    state + CTX_RING_HEAD to DRAM before we append the next batch and full-restore with a
-     *    fresh SW_CTX_ID (1..0x7FFF).
+     *    same queue, such as Mesa ANV's init_render_queue_state) to complete in dedicated fenceBo,
+     *    and wait for trailing ring instructions (MI_USER_INTERRUPT / MI_ARB_CHECK) to retire to HEAD == TAIL.
+     * 2. If the same queue `q` is already active on the engine (`lastQ == q && q->isLoadedOnHw`),
+     *    keep `q->swCtxId` unchanged and submit an Execlist Lite Restore (`RING_TAIL` update without
+     *    52 KiB 3D Context Save/Restore, preserving live 3D/Compute pipeline state across batches).
+     * 3. If switching between two different user queues (`lastQ != q`), allocate a fresh `swCtxId`
+     *    and submit `q` directly so hardware Context-Saves `lastQ` into `lastQ->lrcBo` and Context-Restores `q`.
      */
     ArcExecQueue *idleQ  = (q->mmioBase == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
     ArcExecQueue *&lastQ = (q->mmioBase == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
@@ -778,18 +783,27 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
             IODelay(5);
         }
         const bool prevDone = (*prevQ->seqnoCpu >= prevTarget);
-        const bool parked   = prevDone ? parkEngineOnIdleContextLocked(q->mmioBase, prevQ) : false;
-        if (!prevDone || !parked) {
+        if (prevDone) {
+            /* Ensure trailing MI_USER_INTERRUPT / MI_ARB_ENABLE / MI_ARB_CHECK retired to HEAD == TAIL */
+            for (uint32_t us = 0; us < 10000u; us += 5u) {
+                if (rd32(ARC_RING_HEAD(q->mmioBase)) == rd32(ARC_RING_TAIL(q->mmioBase)))
+                    break;
+                IODelay(5);
+            }
+            /* If switching to a different queue, evict prevQ's LRC cachelines before HW Context-Saves prevQ */
+            if (prevQ != q && prevQ->lrcBo && prevQ->ringCpu) {
+                clflushRange(prevQ->ringCpu, prevQ->lrcBo->size);
+            }
+        } else {
             ArcXeWaitQueueOut snap = {};
             uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
             readEngineDiagMmio(this, q->mmioBase, &snap);
             readRcsSubunitDiag(this, q->mmioBase, dbg2, geomId, scId, sampId, rowId);
-            AXELOG("submitBatch predecessor stall (prevQ=%u target=%llu cur=%llu parked=%d): "
+            AXELOG("submitBatch predecessor stall (prevQ=%u target=%llu cur=%llu): "
                    "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
                    "ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x DBG2=0x%08x "
                    "GEOM=0x%08x SC=0x%08x SAMP=0x%08x ROW=0x%08x MI_MODE=0x%08x -> resetting engine",
                    prevQ->queueId, (unsigned long long)prevTarget, (unsigned long long)(*prevQ->seqnoCpu),
-                   parked ? 1 : 0,
                    snap.engine_status_hi, snap.engine_status, snap.current_lrca,
                    snap.ring_head, snap.ring_tail, snap.ring_start, snap.ring_ctl,
                    snap.acthd_hi, snap.acthd_lo, snap.ipehr, snap.esr, snap.instdone, dbg2,
@@ -873,19 +887,25 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     ringEmitDword(q, (uint32_t)(batchGpuVa & 0xFFFFFFFFULL));
     ringEmitDword(q, (uint32_t)(batchGpuVa >> 32));
 
-    /* 3. Post-batch Non-Preemptible Cache Flush + Fence Seqno Write to GGTT PPHWSP (xe_ring_ops.c:489-500) */
+    /* 3. Post-batch Non-Preemptible Cache Flush + Fence Seqno Write to GGTT fenceBo (xe_ring_ops.c:489-500) */
     ringEmitDword(q, ARC_MI_ARB_ON_OFF | ARC_MI_ARB_DISABLE);
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
-        /* 3a. Wa_14016712196 (Xe-LPG 12.70..12.74): dummy depth-cache flush PIPE_CONTROL before main flush */
+        /*
+         * 3a. Wa_14016712196 + Wa_1409600907 (Xe-LPG 12.70..12.74):
+         * Depth Cache Flush MUST always be paired with Depth Stall + CS Stall so Scan Converter
+         * (XEHPG_SC_INSTDONE bit 0) drains cleanly before the main render-target/tile flush.
+         */
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
-        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH);
+        ringEmitDword(q, ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL |
+                         ARC_PC_CS_STALL | ARC_PC_GLOBAL_GTT | ARC_PC_QW_WRITE);
         ringEmitDword(q, invalScratchGgtt);
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
-        /* 3b. Quiesce & flush 3D/Compute caches (HDC + Tile + RT + Depth + DC) */
-        const uint32_t flush1 = ARC_PC_CS_STALL | ARC_PC_FLUSH_ENABLE | ARC_PC_DC_FLUSH_ENABLE |
+        /* 3b. Quiesce & flush 3D/Compute caches (HDC + Tile + RT + Depth + DC + Scoreboard) */
+        const uint32_t flush1 = ARC_PC_CS_STALL | ARC_PC_STALL_AT_SCOREBOARD |
+                                ARC_PC_FLUSH_ENABLE | ARC_PC_DC_FLUSH_ENABLE |
                                 ARC_PC_TILE_CACHE_FLUSH | ARC_PC_RT_CACHE_FLUSH |
                                 ARC_PC_DEPTH_CACHE_FLUSH | ARC_PC_DEPTH_STALL;
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6) | ARC_PC0_HDC_PIPELINE_FLUSH);
@@ -895,7 +915,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, 0u);
         ringEmitDword(q, 0u);
 
-        /* 3c. Post-sync 64-bit seqno write into GGTT PPHWSP (PIPE_CONTROL_GLOBAL_GTT_IVB in dw1!) */
+        /* 3c. Post-sync 64-bit seqno write into GGTT fenceBo (PIPE_CONTROL_GLOBAL_GTT_IVB in dw1!) */
         ringEmitDword(q, ARC_GFX_OP_PIPE_CONTROL(6));
         ringEmitDword(q, ARC_PC_GLOBAL_GTT | ARC_PC_QW_WRITE | ARC_PC_FLUSH_ENABLE | ARC_PC_CS_STALL);
         ringEmitDword(q, q->seqnoGgttAddr);
@@ -930,41 +950,76 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, ARC_MI_NOOP); /* Keep ring tail 8-byte aligned */
     }
 
-    /* Update LRC context image tail and coherent root PML4 descriptor before kicking ELSP */
-    const uint64_t pdp0Desc = arcEncodePpgttPde(q->pml4Phys);
-    if (q->hasSavedHwState) {
-        q->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
-            ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH) |
-            ARC_MASKED_DISABLE(ARC_CTX_CTRL_RESTORE_INHIBIT);
-    }
     q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
-    q->ctxRegsCpu[ARC_CTX_PDP0_UDW_VAL]  = (uint32_t)(pdp0Desc >> 32);
-    q->ctxRegsCpu[ARC_CTX_PDP0_LDW_VAL]  = (uint32_t)(pdp0Desc & 0xFFFFFFFFULL);
-    clflushRange(q->ringCpu, q->ringSize);
-    clflushRange(q->ctxRegsCpu, 0x140);
 
-    /* Allocate fresh non-zero SW_CTX_ID (1..0x7FFF) for this Execlist run (Linux xe_execlist.c:99-111) */
-    uint32_t nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
-    if (nextCtxId == 0u) {
-        nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
-        if (nextCtxId == 0u) nextCtxId = 1u;
-    }
-    q->swCtxId = nextCtxId;
+    if (lastQ == q && q->isLoadedOnHw) {
+        /*
+         * Hardware Execlist Lite Restore (Linux xe_execlist.c:99-110):
+         * Same context is already active on CURRENT_LRCA. Keep q->swCtxId unchanged, flush ring +
+         * context header, update RING_TAIL, and reload ELSP so CS advances RING_TAIL in-place
+         * without any 52 KiB 3D Context Save/Restore.
+         */
+        clflushRange(q->ringCpu, q->ringSize);
+        clflushRange(q->ctxRegsCpu, 0x140);
+        wr32(ARC_RING_TAIL(q->mmioBase), q->ringTail);
 
-    /* Build 64-bit Xe-LPG LRC Descriptor (LRCA points to PPHWSP at [31:12]) */
-    const uint64_t lrcDesc = (uint64_t)(q->pphwspGgttAddr & ~0xFFFu)
-                           | ARC_LRC_DESC_VALID
-                           | ARC_LRC_DESC_LEGACY_64B_PPGTT
-                           | ARC_LRC_DESC_PRIVILEGE_PPGTT
-                           | ((uint64_t)q->swCtxId << ARC_LRC_DESC_XEHP_SW_CTX_SHIFT);
+        const uint64_t lrcDesc = (uint64_t)(q->pphwspGgttAddr & ~0xFFFu)
+                               | ARC_LRC_DESC_VALID
+                               | ARC_LRC_DESC_LEGACY_64B_PPGTT
+                               | ARC_LRC_DESC_PRIVILEGE_PPGTT
+                               | ((uint64_t)q->swCtxId << ARC_LRC_DESC_XEHP_SW_CTX_SHIFT);
 
-    wr32(ARC_RING_EXECLIST_SQ_LO(q->mmioBase), (uint32_t)(lrcDesc & 0xFFFFFFFFULL));
-    wr32(ARC_RING_EXECLIST_SQ_HI(q->mmioBase), (uint32_t)(lrcDesc >> 32));
-    wr32(ARC_RING_EXECLIST_CONTROL(q->mmioBase), ARC_EL_CTRL_LOAD);
-    (void)rd32(ARC_RING_EXECLIST_STATUS_LO(q->mmioBase));
-    if (idleQ && idleQ->isLoadedOnHw) {
-        idleQ->isLoadedOnHw    = false;
-        idleQ->hasSavedHwState = true;
+        wr32(ARC_RING_EXECLIST_SQ_LO(q->mmioBase), (uint32_t)(lrcDesc & 0xFFFFFFFFULL));
+        wr32(ARC_RING_EXECLIST_SQ_HI(q->mmioBase), (uint32_t)(lrcDesc >> 32));
+        wr32(ARC_RING_EXECLIST_CONTROL(q->mmioBase), ARC_EL_CTRL_LOAD);
+        (void)rd32(ARC_RING_EXECLIST_STATUS_LO(q->mmioBase));
+    } else {
+        /*
+         * Full Context Load / Context Switch between distinct queues (Linux xe_execlist.c:99-110):
+         * Hardware automatically clears RESTORE_INHIBIT in CTX_CONTEXT_CONTROL when Context-Saving
+         * a queue, so never clobber reg[0x03..0x05] from the CPU when hasSavedHwState is true.
+         */
+        ArcExecQueue *switchedOutQ = (lastQ && lastQ != q) ? lastQ : nullptr;
+        if (!q->hasSavedHwState) {
+            const uint64_t pdp0Desc = arcEncodePpgttPde(q->pml4Phys);
+            q->ctxRegsCpu[ARC_CTX_PDP0_UDW_VAL] = (uint32_t)(pdp0Desc >> 32);
+            q->ctxRegsCpu[ARC_CTX_PDP0_LDW_VAL] = (uint32_t)(pdp0Desc & 0xFFFFFFFFULL);
+        }
+        clflushRange(q->ringCpu, q->lrcBo->size);
+
+        uint32_t nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
+        if (nextCtxId == 0u) {
+            nextCtxId = static_cast<uint32_t>(OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&fNextSwCtxId))) & 0x7FFFu;
+            if (nextCtxId == 0u) nextCtxId = 1u;
+        }
+        q->swCtxId = nextCtxId;
+
+        const uint64_t lrcDesc = (uint64_t)(q->pphwspGgttAddr & ~0xFFFu)
+                               | ARC_LRC_DESC_VALID
+                               | ARC_LRC_DESC_LEGACY_64B_PPGTT
+                               | ARC_LRC_DESC_PRIVILEGE_PPGTT
+                               | ((uint64_t)q->swCtxId << ARC_LRC_DESC_XEHP_SW_CTX_SHIFT);
+
+        wr32(ARC_RING_EXECLIST_SQ_LO(q->mmioBase), (uint32_t)(lrcDesc & 0xFFFFFFFFULL));
+        wr32(ARC_RING_EXECLIST_SQ_HI(q->mmioBase), (uint32_t)(lrcDesc >> 32));
+        wr32(ARC_RING_EXECLIST_CONTROL(q->mmioBase), ARC_EL_CTRL_LOAD);
+        (void)rd32(ARC_RING_EXECLIST_STATUS_LO(q->mmioBase));
+
+        if (switchedOutQ) {
+            for (uint32_t us = 0; us < 10000u; us += 5u) {
+                if ((rd32(ARC_RING_CURRENT_LRCA(q->mmioBase)) & ~0xFFFu) == (q->pphwspGgttAddr & ~0xFFFu))
+                    break;
+                IODelay(5);
+            }
+            if (switchedOutQ->lrcBo && switchedOutQ->ringCpu) {
+                clflushRange(switchedOutQ->ringCpu, switchedOutQ->lrcBo->size);
+            }
+            switchedOutQ->isLoadedOnHw    = false;
+            switchedOutQ->hasSavedHwState = true;
+        }
+        if (idleQ && idleQ->isLoadedOnHw) {
+            idleQ->isLoadedOnHw = false;
+        }
     }
     q->isLoadedOnHw = true;
     lastQ = q;
