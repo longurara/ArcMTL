@@ -155,7 +155,6 @@ public:
     uint64_t                    fGgttUsableSize     = 0;
     uint32_t                    fGgttWriteCount     = 0;
     ArcBo                      *fScratchPageBo      = nullptr;
-    ArcBo                      *fNullPageBo         = nullptr;
     ArcPtPage                  *fScratchPt          = nullptr;
     ArcPtPage                  *fScratchPd          = nullptr;
     ArcPtPage                  *fScratchPdp         = nullptr;

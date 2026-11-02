@@ -34,7 +34,7 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
                                   uint8_t *cpu_ptr, uint64_t base_va,
                                   uint16_t engine_class, const char *engine_name,
                                   uint32_t batch_off, uint32_t target_off,
-                                  uint64_t magic)
+                                  uint64_t magic, uint64_t null_va)
 {
     const uint64_t batch1_va = base_va + batch_off;
     const uint64_t batch2_va = base_va + batch_off + 0x100u;
@@ -46,6 +46,15 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
     /* Batch #1 at +0x000: write magic1 */
     uint32_t *cs1 = (uint32_t *)(cpu_ptr + batch_off);
     uint32_t idx = 0;
+    /* Write poison to a NULL mapping, then retire this batch before reading it
+     * in batch #2. A writable shared zero page fails this regression test. */
+    if (null_va) {
+        cs1[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
+        cs1[idx++] = (uint32_t)null_va;
+        cs1[idx++] = (uint32_t)(null_va >> 32);
+        cs1[idx++] = 0xBAADF00Du;
+        cs1[idx++] = 0xDEADBEEFu;
+    }
     cs1[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
     cs1[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
     cs1[idx++] = (uint32_t)(target_va >> 32);
@@ -58,11 +67,21 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
     /* Batch #2 at +0x100: write final magic on the SAME ExecQueue (verifies LRC Save/Restore) */
     uint32_t *cs2 = (uint32_t *)(cpu_ptr + batch_off + 0x100u);
     idx = 0;
-    cs2[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
-    cs2[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
-    cs2[idx++] = (uint32_t)(target_va >> 32);
-    cs2[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
-    cs2[idx++] = (uint32_t)(magic >> 32);
+    if (null_va) {
+        for (uint32_t d = 0; d < 2; ++d) {
+            cs2[idx++] = (0x2Eu << 23) | 3u; /* MI_COPY_MEM_MEM, 5 DW, PPGTT both ends */
+            cs2[idx++] = (uint32_t)(target_va + d * 4u);
+            cs2[idx++] = (uint32_t)((target_va + d * 4u) >> 32);
+            cs2[idx++] = (uint32_t)(null_va + d * 4u);
+            cs2[idx++] = (uint32_t)((null_va + d * 4u) >> 32);
+        }
+    } else {
+        cs2[idx++] = ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_QWORD_LEN;
+        cs2[idx++] = (uint32_t)(target_va & 0xFFFFFFFFULL);
+        cs2[idx++] = (uint32_t)(target_va >> 32);
+        cs2[idx++] = (uint32_t)(magic & 0xFFFFFFFFULL);
+        cs2[idx++] = (uint32_t)(magic >> 32);
+    }
     cs2[idx++] = ARC_MI_NOOP;
     cs2[idx++] = ARC_MI_BATCH_BUFFER_END;
     cs2[idx++] = ARC_MI_NOOP;
@@ -86,7 +105,7 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
            engine_name, queue_id, q_out.ggtt_lrc_addr);
 
     const uint64_t batches[2]  = { batch1_va, batch2_va };
-    const uint64_t expected[2] = { magic1,    magic     };
+    const uint64_t expected[2] = { magic1, null_va ? 0 : magic };
     bool ok = true;
 
     for (uint32_t pass = 0; pass < 2; pass++) {
@@ -286,19 +305,44 @@ int main(int argc, char **argv)
     printf("  [4/4] Executing live PPGTT MI_STORE_DATA_IMM batches on BCS0 & RCS0...\n");
     const bool bcs_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
                                               kArcXeEngineClassCopy, "BCS0",
-                                              0x0000u, 0x1000u, 0xB2C7D550155BC500ULL);
+                                              0x0000u, 0x1000u, 0xB2C7D550155BC500ULL, 0);
     const bool rcs_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
                                               kArcXeEngineClassRender, "RCS0",
-                                              0x2000u, 0x3000u, 0xA2C7D550155CAFE0ULL);
+                                              0x2000u, 0x3000u, 0xA2C7D550155CAFE0ULL, 0);
 
-    if (bcs_ok && rcs_ok) {
+    bool null_ok = false;
+    if (rcs_ok) {
+        printf("\n--- NULL PPGTT: writes discarded, reads zero after fence completion ---\n");
+        null_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
+                                        kArcXeEngineClassRender, "RCS0 scratch NULL",
+                                        0x2000u, 0x3000u, 0xABCDEF1234567890ULL, 0x200000000ULL);
+        /* Exercise shared 2 MiB NULL PT and individual 4 KiB NULL PTE paths. */
+        for (unsigned n = 0; null_ok && n < 2; ++n) {
+            memset(&bind_in, 0, sizeof(bind_in));
+            bind_in.vm_id = vm_id;
+            bind_in.op = kArcXeVmBindOpMapNull;
+            bind_in.gpu_va = 0x300000000ULL + n * 0x400000ULL;
+            bind_in.range_size = n ? 4096 : 0x200000;
+            bind_in.pat_index = ARC_MTL_PAT_IDX_WB_NONCOH;
+            out_sz = 0;
+            null_ok = call_struct(conn, kArcXeMethodVmBind, &bind_in, sizeof(bind_in), NULL, &out_sz) == 0;
+            if (null_ok)
+                null_ok = run_engine_smoke_test(conn, vm_id, cpu_ptr, base_va,
+                                                kArcXeEngineClassRender,
+                                                n ? "RCS0 explicit NULL 4K" : "RCS0 explicit NULL 2M",
+                                                0x2000u, 0x3000u, 0xABCDEF1234567890ULL, bind_in.gpu_va);
+        }
+        printf("  [%s] NULL PPGTT zero-read/write-discard semantics\n", null_ok ? "PASS" : "FAIL");
+    }
+
+    if (bcs_ok && rcs_ok && null_ok) {
         printf("\n[PASS] Stage 1 PASSED: Intel Arc Xe-LPG BCS0 & RCS0 executed 48-bit PPGTT batches & wrote coherent UMA!\n");
-    } else if (rcs_ok) {
+    } else if (rcs_ok && null_ok) {
         printf("\n[PASS] Stage 1 PASSED (RCS0 OK, BCS0=%d): Intel Arc Xe-LPG RCS0 executed 48-bit PPGTT batch!\n",
                bcs_ok ? 1 : 0);
     } else {
-        fprintf(stderr, "\n[FAIL] Stage 1 FAILED (BCS0=%d, RCS0=%d): GPU timeout or UMA readback mismatch!\n",
-                bcs_ok ? 1 : 0, rcs_ok ? 1 : 0);
+        fprintf(stderr, "\n[FAIL] Stage 1 FAILED (BCS0=%d, RCS0=%d, NULL=%d): GPU timeout or UMA readback mismatch!\n",
+                bcs_ok ? 1 : 0, rcs_ok ? 1 : 0, null_ok ? 1 : 0);
         rc = 11;
     }
 

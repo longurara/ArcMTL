@@ -33,33 +33,30 @@ bool ArcXeService::initGgtt()
     if (!fGgttLock) return false;
 
     /*
-     * Allocate dedicated 4 KiB physical scratch & null pages:
-     *   - fScratchPageBo: backs unmapped GGTT slots AND the full 48-bit PPGTT SCRATCH_PAGE
-     *     hierarchy (required by Mesa ANV on Graphics IP < 20 for out-of-BO EU/VF/Sampler/SBA prefetch).
-     *   - fNullPageBo: dedicated zeroed 4 KiB page (0x00000000 = MI_NOOP) backing DRM_XE_VM_BIND_FLAG_NULL
-     *     (Mesa ANV's 8 GiB null_initialized_heap used for batch_bo_pool CS prefetch isolation; Xe-LPG
-     *     12.71 has no hardware PTE BIT(9) NULL support, which only arrived in Xe2 IP >= 20).
+     * GGTT holes need a real scratch page. PPGTT scratch and explicit NULL
+     * mappings instead use native NULL PTEs: reads return zero, writes are
+     * discarded. Xe-LPG supports bit 9 (Linux xe_vm.c:xelp_pte_encode_vma,
+     * xe_pt.c:__xe_pt_empty_pte, including Linux v6.8 before Xe2 support).
+     * A writable shared zero page is not equivalent: one stray GPU write can
+     * poison every hole and Mesa's entire null-initialized batch heap.
      */
     fScratchPageBo = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT, ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
-    fNullPageBo    = createKernelBo(4096, ARCXE_GEM_FLAG_CPU_WB_COHERENT, ARC_MTL_PAT_IDX_WB_1WAY_COH, true);
-    if (!fScratchPageBo || !fScratchPageBo->kernMap || !fNullPageBo || !fNullPageBo->kernMap) {
-        AXELOG("initGgtt: failed to allocate scratch/null pages");
+    if (!fScratchPageBo || !fScratchPageBo->kernMap) {
+        AXELOG("initGgtt: failed to allocate GGTT scratch page");
         teardownGgtt();
         return false;
     }
     arcClflushRange(reinterpret_cast<const void *>(fScratchPageBo->kernMap->getVirtualAddress()), 4096);
-    arcClflushRange(reinterpret_cast<const void *>(fNullPageBo->kernMap->getVirtualAddress()), 4096);
 
     const uint64_t scratchPhys = fScratchPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-    const uint64_t nullPhys    = fNullPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-    if (!scratchPhys || !nullPhys) {
-        AXELOG("initGgtt: invalid scratch/null physical segment");
+    if (!scratchPhys) {
+        AXELOG("initGgtt: invalid GGTT scratch physical segment");
         teardownGgtt();
         return false;
     }
 
-    fScratchLeafPte = arcEncodePpgttPte(scratchPhys, ARC_MTL_PAT_IDX_WB_1WAY_COH, /*readWrite=*/true, /*nullPage=*/false);
-    fNullLeafPte    = arcEncodePpgttPte(nullPhys,    ARC_MTL_PAT_IDX_WB_1WAY_COH, /*readWrite=*/true, /*nullPage=*/false);
+    fScratchLeafPte = arcEncodePpgttPte(0, ARC_MTL_PAT_IDX_WB_1WAY_COH, true, true);
+    fNullLeafPte    = arcEncodePpgttPte(0, ARC_MTL_PAT_IDX_WB_NONCOH, true, true);
 
     fScratchPt  = allocPtPage(fScratchLeafPte);
     fScratchPd  = fScratchPt  ? allocPtPage(arcEncodePpgttPde(fScratchPt->physAddr)) : nullptr;
@@ -101,10 +98,10 @@ bool ArcXeService::initGgtt()
         return false;
     }
 
-    AXELOG("GGTT online: usable VA [0x%llx .. 0x%x) (%llu MiB), PPGTT scratch=0x%llx null=0x%llx",
+    AXELOG("GGTT online: usable VA [0x%llx .. 0x%x) (%llu MiB), native NULL PPGTT scratch=0x%llx null=0x%llx",
            (unsigned long long)fGgttUsableStart, ARC_GUC_GGTT_TOP,
            (unsigned long long)(fGgttUsableSize >> 20),
-           (unsigned long long)scratchPhys, (unsigned long long)nullPhys);
+           (unsigned long long)fScratchLeafPte, (unsigned long long)fNullLeafPte);
     return true;
 }
 
@@ -131,10 +128,6 @@ void ArcXeService::teardownGgtt()
     if (fScratchPt)  { freePtTree(fScratchPt, 0);  fScratchPt  = nullptr; }
     fScratchLeafPte = 0;
     fNullLeafPte    = 0;
-    if (fNullPageBo) {
-        releaseBo(fNullPageBo);
-        fNullPageBo = nullptr;
-    }
     if (fScratchPageBo) {
         releaseBo(fScratchPageBo);
         fScratchPageBo = nullptr;
@@ -500,9 +493,6 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
     const uint64_t scratchPhys = fScratchPageBo
         ? fScratchPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone)
         : 0;
-    const uint64_t nullPhys = fNullPageBo
-        ? fNullPageBo->memDesc->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone)
-        : scratchPhys;
     const uint64_t scratchPdPde = fScratchPd ? arcEncodePpgttPde(fScratchPd->physAddr) : 0ULL;
     const uint64_t scratchPtPde = fScratchPt ? arcEncodePpgttPde(fScratchPt->physAddr) : 0ULL;
     const uint64_t nullPtPde    = fNullPt    ? arcEncodePpgttPde(fNullPt->physAddr)    : scratchPtPde;
@@ -580,7 +570,7 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
             ArcPtPage *pd = pdp->children[idx2];
 
             /* Fast 2 MiB shared fNullPt bind for Mesa ANV's 8 GiB null_initialized_heap */
-            if (isNull && !pd->children[idx1] && fNullPt &&
+            if (isNull && patIndex == ARC_MTL_PAT_IDX_WB_NONCOH && !pd->children[idx1] && fNullPt &&
                 (va & 0x1FFFFFULL) == 0ULL && (chunkBytes - sub) >= 0x200000ULL) {
                 if (pd->entries[idx1] != nullPtPde) {
                     pd->entries[idx1] = nullPtPde;
@@ -601,10 +591,10 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
             }
             ArcPtPage *pt = pd->children[idx1];
 
-            /* Xe-LPG 12.71 (< Xe2 IP 20) does NOT have hardware PTE BIT(9) NULL; map null binds to zeroed fNullPageBo */
-            const uint64_t targetPhys = isNull ? nullPhys : (physPage + sub);
+            /* Native NULL mappings must not alias writable system RAM. */
+            const uint64_t targetPhys = isNull ? 0 : (physPage + sub);
             const bool rwPte = isNull ? true : (!bo || !bo->readOnly);
-            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, rwPte, /*nullPage=*/false);
+            pt->entries[idx0] = arcEncodePpgttPte(targetPhys, patIndex, rwPte, isNull);
             arcClflushEntry(&pt->entries[idx0]);
         }
 

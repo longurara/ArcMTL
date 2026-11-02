@@ -269,7 +269,7 @@ if [ -x /usr/local/bin/arc_probe ]; then
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
     echo "--- [Test B1] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
-    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp" \
+    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp,bat,pc" \
         VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
         VK_OK=1
         echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
@@ -280,7 +280,7 @@ if [ -x /usr/local/bin/vk_offscreen_test ]; then
 fi
 if [ -x /usr/local/bin/mtl_offscreen_test ]; then
     echo "--- [Test B2] mtl_offscreen_test --verify-bundle (CoreDisplay default.metallib + Live 2560x1600 3D GPUPass & Submit-Ahead) ---"
-    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp" \
+    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp,bat,pc" \
         /usr/local/bin/mtl_offscreen_test --verify-bundle "$GB/ArcMTLDriver.bundle" --with-vk; then
         BUNDLE_OK=1
     else
