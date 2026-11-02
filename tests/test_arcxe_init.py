@@ -44,6 +44,7 @@ struct ArcXeService {
     bool wake = true, checkingSteering = false;
     std::map<uint32_t, uint32_t> regs;
     std::vector<std::pair<uint32_t, uint32_t>> writes;
+    std::map<uint32_t, uint32_t> dss[8];
     uint32_t rd32(uint32_t r) {
         if (checkingSteering && (r == ARC_REG_MTL_MCR_SELECTOR || r == ARC_REG_XEHP_L3SQCREG5))
             assert(locks == 1);
@@ -52,6 +53,15 @@ struct ArcXeService {
     void wr32(uint32_t r, uint32_t v) {
         if (checkingSteering && r == ARC_REG_MTL_MCR_SELECTOR) assert(locks == 1);
         regs[r]=v; writes.emplace_back(r,v);
+        if (r==ARC_REG_SAMPLER_MODE || r==ARC_REG_ROW_CHICKEN2 ||
+            r==ARC_REG_ROW_CHICKEN3 || r==ARC_REG_XEHP_HDC_CHICKEN0 ||
+            r==ARC_REG_XEHP_PSS_CHICKEN || r==ARC_REG_COMMON_SLICE_CHICKEN3) {
+            const uint32_t selector=regs[ARC_REG_MTL_MCR_SELECTOR];
+            unsigned selected=((selector>>8)&31)*4+(selector&15);
+            for (unsigned i=0; i<8; ++i)
+                if ((selector & ARC_MCR_MULTICAST) || i==selected)
+                    dss[i][r]=(dss[i][r] & ~(v>>16)) | (v & (v>>16));
+        }
     }
     bool forceWakeGet() { return wake; }
     void armEngineHw(uint32_t, ArcBo *);
@@ -77,11 +87,11 @@ static void checkInit(uint32_t selector, bool wake, bool render, bool idle) {
     uint32_t ring[4096]={}, ctx[128]={};
     ArcExecQueue q={}; q.ringCpu=ring; q.ctxRegsCpu=ctx;
     s.init(&q, render, idle);
-    assert(locks == 0 && s.regs[ARC_REG_MTL_MCR_SELECTOR] == selector);
+    assert(locks == 0 && s.regs[ARC_REG_MTL_MCR_SELECTOR] == ((wake && render) ? selector | ARC_MCR_MULTICAST : selector));
     if (wake && render) {
         assert(s.writes.size() == 2);
-        assert(s.writes[0].first == ARC_REG_MTL_MCR_SELECTOR && s.writes[0].second == 0);
-        assert(s.writes[1].first == ARC_REG_MTL_MCR_SELECTOR && s.writes[1].second == selector);
+        assert(s.writes[0].first == ARC_REG_MTL_MCR_SELECTOR && s.writes[0].second == ARC_MCR_MULTICAST);
+        assert(s.writes[1].first == ARC_REG_MTL_MCR_SELECTOR && s.writes[1].second == (selector | ARC_MCR_MULTICAST));
     } else assert(s.writes.empty());
     assert(q.isIdleKernelCtx == idle && q.holdsForceWake == wake);
     assert(q.initRingTail == q.ringTail && !(q.ringTail & 7));
@@ -114,6 +124,18 @@ int main() {
     checkDebugWrites(s,1);
     s.applyXeLpgWorkarounds();
     checkDebugWrites(s,2);
+    // Previously only instance0 received these mandatory workarounds.
+    for (unsigned i=0; i<8; ++i) {
+        assert(s.dss[i][ARC_REG_SAMPLER_MODE] & ARC_INDIRECT_STATE_BASE_ADDR_OVERRIDE);
+        assert(s.dss[i][ARC_REG_ROW_CHICKEN2] & ARC_DISABLE_TDL_SVHS_GATING);
+        assert(s.dss[i][ARC_REG_ROW_CHICKEN3] & ARC_DIS_FIX_EOT1_FLUSH);
+        assert(s.dss[i][ARC_REG_XEHP_HDC_CHICKEN0] & ARC_DIS_ATOMIC_CHAIN_TYPED_WRITES);
+        assert(s.dss[i][ARC_REG_XEHP_PSS_CHICKEN] & ARC_FD_END_COLLECT);
+        assert(s.dss[i][ARC_REG_COMMON_SLICE_CHICKEN3] & ARC_DISABLE_STATE_CACHE_PERF_FIX);
+    }
+    for (uint32_t selector : {ARC_REG_MTL_MCR_SELECTOR, ARC_REG_SF_MCR_SELECTOR,
+                              ARC_REG_MCR_SELECTOR, ARC_REG_GAM_MCR_SELECTOR})
+        assert(s.regs[selector] & ARC_MCR_MULTICAST);
     for (uint32_t selector : {0u, 0x80000000u, 0x80000102u})
         for (bool wake : {false,true})
             for (bool render : {false,true})

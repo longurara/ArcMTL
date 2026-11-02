@@ -58,13 +58,20 @@ struct ArcXeService {
     uint32_t fNextSwCtxId=1;
     int wakes=0, resets=0;
     mutable unsigned loads=0, faultReads=0;
+    uint32_t fGeomDssMask=0x89, fComputeDssMask=0;
     mutable std::map<uint32_t,uint32_t> regs;
     // 0 success, 1 no idle fence, 2 wrong LRCA, 3 idle ring not drained.
     int mode=0;
     uint32_t rd32(uint32_t reg) const {
         if (reg==ARC_REG_XEHP_RING_FAULT || reg==ARC_REG_XEHP_FAULT_TLB_DATA0 ||
             reg==ARC_REG_XEHP_FAULT_TLB_DATA1) {
-            assert(regs[ARC_REG_MTL_MCR_SELECTOR]==0); ++faultReads;
+            assert(regs[ARC_REG_MTL_MCR_SELECTOR]==ARC_MCR_MULTICAST); ++faultReads;
+        }
+        if (reg==ARC_REG_SAMPLER_MODE || reg==ARC_REG_ROW_CHICKEN2 ||
+            reg==ARC_REG_ROW_CHICKEN3 || reg==ARC_REG_XEHP_HDC_CHICKEN0 ||
+            reg==ARC_REG_SAMPLER_INSTDONE || reg==ARC_REG_ROW_INSTDONE) {
+            assert(regs[ARC_REG_MTL_MCR_SELECTOR] & ARC_MCR_MULTICAST);
+            return regs[reg]+(regs[ARC_REG_MTL_MCR_SELECTOR]&0x1f0f);
         }
         return regs[reg];
     }
@@ -248,9 +255,19 @@ int main() {
     captureTimeoutDetail(&f.svc,&f.prev,snap,&d,&f.idle);
     assert(!d.ring_count); // unknown/mismatched active ring: never fabricate bytes
     snap.current_lrca=f.prev.pphwspGgttAddr; snap.ring_start=f.prev.ringGgttAddr;
+    assert(d.mcr.version==1 && d.mcr.enabled_dss==0x89 && d.mcr.count==3);
+    assert(d.mcr.selector==0x80000102);
+    for (unsigned i=0; i<3; ++i) {
+        unsigned expected=i==0 ? 0 : i==1 ? 3 : 0x103;
+        assert(d.mcr.samples[i].steering==expected);
+        assert(d.mcr.samples[i].row_chicken2==expected);
+        assert(d.mcr.samples[i].row_chicken3==expected);
+        assert(d.mcr.samples[i].hdc_chicken0==expected);
+        assert(d.mcr.samples[i].sampler_mode==expected);
+    }
     f.prev.mmioBase=ARC_BLT_RING_BASE;
     captureTimeoutDetail(&f.svc,&f.prev,snap,&d);
-    assert(d.valid && !d.hw.version);
+    assert(d.valid && !d.hw.version && !d.mcr.version);
     f.prev.ringCpu=nullptr; f.prev.ctxRegsCpu=nullptr;
     captureTimeoutDetail(&f.svc,&f.prev,snap,&d);
     assert(d.valid && !d.ring_count && !d.context_control);

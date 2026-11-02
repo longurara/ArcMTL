@@ -1461,7 +1461,7 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                     fprintf(stderr, " %08x", d->ring_dw[i]);
                     if ((i & 3u) == 3u || i + 1u == count) fputc('\n', stderr);
                 }
-                if (out_sz >= sizeof(response) && d->hw.version == 1) {
+                if (out_sz >= ARCXE_SYNCOBJ_WAIT_V2_SIZE && d->hw.version == 1) {
                     const struct ArcXeTimeoutHwState *h = &d->hw;
                     fprintf(stderr, "  [ArcXe HW STATE] primary instance: CMD_CCTL=%08x GFX_MODE=%08x CS_CHICKEN1=%08x L3ALLOC=%08x L3SQCREG5=%08x SAMPLER_MODE=%08x RCC=%08x PSS=%08x SC_EXTRA=%08x SC_EXTRA2=%08x\n",
                             h->cmd_cctl, h->gfx_mode, h->cs_chicken1, h->l3_alloc,
@@ -1470,6 +1470,17 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                     fprintf(stderr, "  [ArcXe CACHE ATTR] PAT=%08x,%08x,%08x,%08x,%08x MOCS1=%08x MOCS9=%08x LNCF0=%08x LNCF4=%08x\n",
                             h->pat[0], h->pat[1], h->pat[2], h->pat[3], h->pat[4],
                             h->mocs1, h->mocs9, h->lncf0, h->lncf4);
+                }
+            }
+            if (out_sz >= sizeof(response) && response.detail.mcr.version == 1) {
+                const struct ArcXeTimeoutMcrState *m = &response.detail.mcr;
+                fprintf(stderr, "  [ArcXe MCR] selector=%08x enabled_dss=%08x count=%u\n",
+                        m->selector, m->enabled_dss, m->count);
+                for (uint32_t i = 0; i < m->count && i < 8; ++i) {
+                    const struct ArcXeTimeoutDssSample *v = &m->samples[i];
+                    fprintf(stderr, "    [ArcXe DSS] steering=%03x SAMPLER=%08x ROW2=%08x ROW3=%08x HDC0=%08x SAMP_DONE=%08x ROW_DONE=%08x\n",
+                            v->steering, v->sampler_mode, v->row_chicken2, v->row_chicken3,
+                            v->hdc_chicken0, v->sampler_instdone, v->row_instdone);
                 }
             }
             dump_timeout_batch(ap->fd, ((uint64_t)out.diag.acthd_hi << 32) | out.diag.acthd_lo);

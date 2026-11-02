@@ -511,14 +511,14 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     if (q->holdsForceWake) {
         if (isRcs) {
             /* Serialize temporary steering with reset/diagnostic MMIO and
-             * restore the exact selector instead of clobbering its group and
-             * instance fields. Reads themselves are always unicast. */
+             * restore its group/instance fields while keeping multicast writes
+             * enabled. Reads themselves are always unicast. */
             IOLockLock(fEngineLock);
             const uint32_t savedMcrSelector = rd32(ARC_REG_MTL_MCR_SELECTOR);
-            wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
+            wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
             (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
             l3sqcreg5Val = (rd32(ARC_REG_XEHP_L3SQCREG5) & ~ARC_L3_PWM_TIMER_INIT_VAL_MASK) | ARC_L3_PWM_TIMER_INIT_7F;
-            wr32(ARC_REG_MTL_MCR_SELECTOR, savedMcrSelector);
+            wr32(ARC_REG_MTL_MCR_SELECTOR, savedMcrSelector | ARC_MCR_MULTICAST);
             (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
             IOLockUnlock(fEngineLock);
         } else if (base == ARC_BLT_RING_BASE) {
@@ -786,17 +786,20 @@ static inline void readRcsSubunitDiag(const ArcXeService *svc, uint32_t b,
         outGeom = outSc = outSamp = outRow = 0u;
         return;
     }
-    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
-    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  0u);
-    svc->wr32(ARC_REG_MCR_SELECTOR,     0u);
+    const uint32_t mtl = svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+    const uint32_t sf = svc->rd32(ARC_REG_SF_MCR_SELECTOR);
+    const uint32_t legacy = svc->rd32(ARC_REG_MCR_SELECTOR);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
     outGeom = svc->rd32(ARC_REG_XEHPG_INSTDONE_GEOM_SVG);
     outSc   = svc->rd32(ARC_REG_XEHPG_SC_INSTDONE);
     outSamp = svc->rd32(ARC_REG_SAMPLER_INSTDONE);
     outRow  = svc->rd32(ARC_REG_ROW_INSTDONE);
-    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
-    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
-    svc->wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, mtl | ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_SF_MCR_SELECTOR,  sf | ARC_MCR_MULTICAST);
+    svc->wr32(ARC_REG_MCR_SELECTOR,     legacy | ARC_MCR_MULTICAST);
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
 }
 
@@ -1123,7 +1126,7 @@ static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
     if (!d) return;
     bzero(d, sizeof(*d));
     const uint32_t selector = svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
-    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, 0u); /* primary GAM aggregates faults */
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST); /* primary GAM aggregates faults */
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
     d->fault_reg = svc->rd32(ARC_REG_XEHP_RING_FAULT);
     d->fault_data0 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA0);
@@ -1146,8 +1149,27 @@ static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
         h.lncf0 = svc->rd32(ARC_REG_LNCFCMOCS(0));
         h.lncf4 = svc->rd32(ARC_REG_LNCFCMOCS(4));
         h.version = 1;
+        auto &m = d->mcr;
+        m.version = 1;
+        m.selector = selector;
+        m.enabled_dss = svc->fGeomDssMask | svc->fComputeDssMask;
+        /* MTL has four DSS per steering group, up to eight enabled DSS.
+         * Only sample DSS-steered registers here; slice/L3 banks have other layouts. */
+        for (uint32_t dss = 0; dss < 8; ++dss) {
+            if (!(m.enabled_dss & (1u << dss))) continue;
+            auto &sample = m.samples[m.count++];
+            sample.steering = ((dss / 4u) << 8) | (dss % 4u);
+            svc->wr32(ARC_REG_MTL_MCR_SELECTOR, sample.steering | ARC_MCR_MULTICAST);
+            (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
+            sample.sampler_mode = svc->rd32(ARC_REG_SAMPLER_MODE);
+            sample.row_chicken2 = svc->rd32(ARC_REG_ROW_CHICKEN2);
+            sample.row_chicken3 = svc->rd32(ARC_REG_ROW_CHICKEN3);
+            sample.hdc_chicken0 = svc->rd32(ARC_REG_XEHP_HDC_CHICKEN0);
+            sample.sampler_instdone = svc->rd32(ARC_REG_SAMPLER_INSTDONE);
+            sample.row_instdone = svc->rd32(ARC_REG_ROW_INSTDONE);
+        }
     }
-    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, selector);
+    svc->wr32(ARC_REG_MTL_MCR_SELECTOR, selector | ARC_MCR_MULTICAST);
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
     /* HEAD describes the active LRCA, which may still be the parking context.
      * Never index the waiting user's ring with an unrelated hardware HEAD. */

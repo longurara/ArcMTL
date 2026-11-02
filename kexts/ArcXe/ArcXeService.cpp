@@ -253,10 +253,12 @@ void ArcXeService::applyXeLpgWorkarounds()
      * (Linux drivers/gpu/drm/xe/xe_wa.c, xe_tuning.c & xe_hw_engine.c).
      * Must be applied with forcewake held and re-applied after any GRDOM_RENDER reset.
      */
-    wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
-    wr32(ARC_REG_SF_MCR_SELECTOR,  0u);
-    wr32(ARC_REG_MCR_SELECTOR,     0u);
-    wr32(ARC_REG_GAM_MCR_SELECTOR, 0u);
+    /* Replicated workaround registers must reach every enabled instance.
+     * Reads remain unicast even with MULTICAST set (xe_gt_mcr.c). */
+    wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+    wr32(ARC_REG_SF_MCR_SELECTOR,  ARC_MCR_MULTICAST);
+    wr32(ARC_REG_MCR_SELECTOR,     ARC_MCR_MULTICAST);
+    wr32(ARC_REG_GAM_MCR_SELECTOR, ARC_MCR_MULTICAST);
     (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
 
     const uint32_t compMod   = rd32(ARC_REG_COMP_MOD_CTRL);
