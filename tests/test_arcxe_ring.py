@@ -53,7 +53,7 @@ static void check(uint16_t engine, uint32_t initialTail) {
     const uint32_t length = (q.ringTail-start) & (size-1);
     assert(length > 0 && length <= 256);
     std::vector<Packet> packets;
-    unsigned markers=0, fences=0, invalidates=0;
+    unsigned markers=0, fences=0, invalidates=0, debugWrites=0;
     for (uint32_t pos=start; pos<start+length;) {
         const uint32_t h=ring[pos/4];
         uint32_t n=1;
@@ -68,6 +68,13 @@ static void check(uint16_t engine, uint32_t initialTail) {
                     h == (ARC_MI_ARB_ON_OFF | ARC_MI_ARB_ENABLE) || h == ARC_MI_ARB_CHECK);
         assert(pos+n*4 <= size && pos+n*4 <= start+length); // no packet wraps
         packets.push_back({pos,h,n});
+        if ((h >> 23) == 0x22) {
+            assert(n == 3 && (h & ARC_MI_LRI_CS_MMIO));
+            assert(ring[pos/4+1] == 0x0d8);
+            // Bit 4 is required by ANV. Bit 6's WA is only for IP12.00..12.10.
+            assert(ring[pos/4+2] == 0x00100010u);
+            ++debugWrites;
+        }
         if ((h >> 23) == 0x20) {
             assert(n == 5 && (h & ARC_MI_SDI_USE_GGTT));
             const uint32_t addr=ring[pos/4+1];
@@ -109,6 +116,7 @@ static void check(uint16_t engine, uint32_t initialTail) {
     }
     assert(markers == 3 && fences == 1);
     assert(invalidates == (engine == kArcXeEngineClassCopy ? 0u : 1u));
+    assert(debugWrites == invalidates);
     assert(q.submitFlushEnd > q.submitBatchEnd);
     // Fence post-sync must follow cache flushes, never diagnostic writes.
     if (invalidates) {

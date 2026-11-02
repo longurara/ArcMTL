@@ -64,7 +64,7 @@ void ArcXeService::armEngineHw(uint32_t base, ArcBo *hwsp)
          * Program privileged RCS0 registers required by Mesa ANV genX_init_state.c (which Intel CS
          * drops as NO-OPs when ANV emits them inside non-privileged PPGTT user batches):
          *   - CS_DEBUG_MODE2 BIT(4) (CONSTANT_BUFFERAddressOffsetDisable): 3DSTATE_CONSTANT_* takes 48-bit PPGTT VAs!
-         *   - CS_DEBUG_MODE2 BIT(6) (Wa_18022495364: Global instruction/state cache invalidate)
+         * Wa_18022495364 / BIT(6) is for IP 12.00..12.10, not Meteor Lake.
          */
         wr32(ARC_REG_CS_CHICKEN1, ARC_MASKED_DISABLE(ARC_CS_PREEMPT_3D_OBJECT_LEVEL));
         wr32(ARC_REG_FF_MODE2,    ARC_FF_MODE2_ANV_TIMERS);
@@ -434,7 +434,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
      * Initial Ring Setup for Xe-LPG RCS0 (Linux drivers/gpu/drm/xe/xe_lrc.c & xe_wa.c):
      *   1. MI_ARB_ON_OFF(ENABLE)
      *   2. LRI(COMMON_SLICE_CHICKEN3, DISABLE_STATE_CACHE_PERF_FIX) — requested by Mesa ANV on Xe
-     *   3. LRI_CS_MMIO(CS_DEBUG_MODE2, INSTRUCTION_STATE_CACHE_INV) — Wa_18022495364
+     *   3. LRI_CS_MMIO(CS_DEBUG_MODE2, CONSTANT_BUFFER_OFFSET_DISABLE)
      *   4. Zeroed 3DSTATE_MESH_CONTROL — Wa_14019789679 (initial run uses RESTORE_INHIBIT=1)
      */
     static const struct { uint32_t instr; uint16_t numDw; } kXeHpgSvgState[] = {
@@ -496,11 +496,17 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
     uint32_t blitCctlVal  = (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1);
     if (q->holdsForceWake) {
         if (isRcs) {
+            /* Serialize temporary steering with reset/diagnostic MMIO and
+             * restore the exact selector instead of clobbering its group and
+             * instance fields. Reads themselves are always unicast. */
+            IOLockLock(fEngineLock);
+            const uint32_t savedMcrSelector = rd32(ARC_REG_MTL_MCR_SELECTOR);
             wr32(ARC_REG_MTL_MCR_SELECTOR, 0u);
             (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
             l3sqcreg5Val = (rd32(ARC_REG_XEHP_L3SQCREG5) & ~ARC_L3_PWM_TIMER_INIT_VAL_MASK) | ARC_L3_PWM_TIMER_INIT_7F;
-            wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST);
+            wr32(ARC_REG_MTL_MCR_SELECTOR, savedMcrSelector);
             (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+            IOLockUnlock(fEngineLock);
         } else if (base == ARC_BLT_RING_BASE) {
             blitCctlVal = (rd32(ARC_RING_BLIT_CCTL(base)) & ~0x7E7Eu) |
                           (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1);
@@ -518,7 +524,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
          *   - Wa_18019271663 (CACHE_MODE_1.MSAA_OPTIMIZATION_REDUC_DIS)
          *   - Wa_14019877138 (XEHP_PSS_CHICKEN.FD_END_COLLECT — Pixel Scoreboard Fragment-Done!)
          *   - Tuning: L3 cache (XEHP_L3SQCREG5 = 0x7F)
-         *   - CONSTANT_BUFFERAddressOffsetDisable (CS_DEBUG_MODE2 BIT(4)) + Wa_18022495364 (BIT(6))
+         *   - CONSTANT_BUFFERAddressOffsetDisable (CS_DEBUG_MODE2 BIT(4))
          */
         q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(7u);
         q->ringCpu[initDw++] = ARC_REG_COMMON_SLICE_CHICKEN3;
@@ -537,7 +543,7 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         q->ringCpu[initDw++] = ARC_MASKED_DISABLE(ARC_CS_PREEMPT_3D_OBJECT_LEVEL);
 
         q->ringCpu[initDw++] = ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO;
-        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(RCS0): BIT(4) CONSTANT_BUFFERAddressOffsetDisable | BIT(6) */
+        q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(RCS0): BIT(4) CONSTANT_BUFFERAddressOffsetDisable */
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT);
 
         /*
@@ -895,7 +901,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
     /* 1. Pre-batch CS Preparser Disable + Privileged CS_DEBUG_MODE2 Guard + Cache & TLB Invalidate */
     ringEmitDword(q, ARC_MI_PREPARSER_DISABLE(true));
     if (q->engineClass == kArcXeEngineClassRender || q->engineClass == kArcXeEngineClassCompute) {
-        /* Guarantee CONSTANT_BUFFERAddressOffsetDisable (BIT(4)) + Wa_18022495364 (BIT(6)) before every 3D/Compute PPGTT batch */
+        /* Preserve absolute constant-buffer addressing on MTL. Do not inject
+         * the IP 12.00..12.10 state-cache workaround (BIT(6)) here. */
         ringEmitDword(q, ARC_MI_LOAD_REGISTER_IMM(1u) | ARC_MI_LRI_CS_MMIO);
         ringEmitDword(q, 0x0D8u);
         ringEmitDword(q, ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT));

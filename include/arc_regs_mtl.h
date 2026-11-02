@@ -272,10 +272,11 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define   ARC_RESET_CTL_CAT_ERROR           (1u << 2)
 #define   ARC_RESET_CTL_READY_TO_RESET      (1u << 1)
 #define   ARC_RESET_CTL_REQUEST_RESET       (1u << 0)
-#define ARC_RING_CS_DEBUG_MODE2(base)       ((base) + 0x0D8u) /* Masked: CONSTANT_BUFFERAddressOffsetDisable + Wa_18022495364 */
+#define ARC_RING_CS_DEBUG_MODE2(base)       ((base) + 0x0D8u) /* Masked: CONSTANT_BUFFERAddressOffsetDisable */
 #define   ARC_CONSTANT_BUFFER_OFFSET_DISABLE (1u << 4)        /* 3DSTATE_CONSTANT_* uses 48-bit PPGTT VA (ANV gfx125_init_device_state) */
-#define   ARC_INSTRUCTION_STATE_CACHE_INV   (1u << 6)
-#define   ARC_CS_DEBUG_MODE2_RCS_DEFAULT    (ARC_CONSTANT_BUFFER_OFFSET_DISABLE | ARC_INSTRUCTION_STATE_CACHE_INV)
+/* Wa_18022495364 (bit 6) is scoped to IP 12.00..12.10 in xe_wa_oob.rules
+ * and i915 gen12_emit_indirect_ctx_rcs. It must NOT be enabled on MTL 12.7x. */
+#define   ARC_CS_DEBUG_MODE2_RCS_DEFAULT    ARC_CONSTANT_BUFFER_OFFSET_DISABLE
 #define ARC_RING_BLIT_CCTL(base)            ((base) + 0x204u) /* Non-masked: [14:9]=dst MOCS, [6:1]=src MOCS */
 #define ARC_RING_EXECLIST_STATUS_LO(base)   ((base) + 0x234u)
 #define ARC_RING_EXECLIST_STATUS_HI(base)   ((base) + 0x238u)
