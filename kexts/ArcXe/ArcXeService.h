@@ -215,13 +215,14 @@ public:
     void programMtlPatTable();
     void programMtlMocsTable();
     void applyXeLpgWorkarounds();
-    void invalidateGlobalTlb();
+    bool invalidateGlobalTlb(bool engineLockHeld = false);
 
     /* Memory & Page Table Subsystem (ArcXeMemory.cpp) */
     bool initGgtt();
     void teardownGgtt();
     bool allocGgttAndBind(IOMemoryDescriptor *md, uint64_t size, uint16_t patIndex,
-                          uint32_t *outGgttOffset, uint32_t *outGgttSize);
+                          uint32_t *outGgttOffset, uint32_t *outGgttSize,
+                          bool engineLockHeld = false);
     void freeGgttRange(uint32_t ggttOffset, uint32_t ggttSize);
 
     ArcBo *createKernelBo(uint64_t size, uint32_t flags, uint16_t patIndex, bool mapInKernel);

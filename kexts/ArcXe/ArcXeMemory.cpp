@@ -147,7 +147,8 @@ void ArcXeService::teardownGgtt()
 }
 
 bool ArcXeService::allocGgttAndBind(IOMemoryDescriptor *md, uint64_t size, uint16_t patIndex,
-                                    uint32_t *outGgttOffset, uint32_t *outGgttSize)
+                                    uint32_t *outGgttOffset, uint32_t *outGgttSize,
+                                    bool engineLockHeld)
 {
     if (!md || !size || !fGgttAlloc || !fGsmPtes) return false;
     const uint32_t alignedSize = (uint32_t)((size + 0xFFFULL) & ~0xFFFULL);
@@ -187,7 +188,10 @@ bool ArcXeService::allocGgttAndBind(IOMemoryDescriptor *md, uint64_t size, uint1
     (void)rd32(ARC_REG_GMD_ID); /* Posting read */
     IOLockUnlock(fGgttLock);
 
-    invalidateGlobalTlb();
+    if (!invalidateGlobalTlb(engineLockHeld)) {
+        freeGgttRange(ggttBase, alignedSize);
+        return false;
+    }
     *outGgttOffset = ggttBase;
     *outGgttSize   = alignedSize;
     return true;
@@ -610,6 +614,5 @@ bool ArcXeService::vmBindBo(ArcVm *vm, uint64_t gpuVa, ArcBo *bo, uint64_t boOff
     __asm__ __volatile__("mfence" ::: "memory");
     IOLockUnlock(vm->lock);
 
-    invalidateGlobalTlb();
-    return true;
+    return invalidateGlobalTlb();
 }

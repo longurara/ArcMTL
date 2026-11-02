@@ -34,6 +34,8 @@ jobs:
           python3 tests/test_arcxe_wait.py
           python3 tests/test_arcxe_ring.py
           python3 tests/test_arcxe_init.py
+          python3 tests/test_arcxe_tlb.py
+          python3 tests/test_arcxe_batch_dump.py
           python3 plugin/adapt_arc_plugin.py --self-test
 
       - name: Build Kernel Extensions (ArcXe, ArcFB + ArcAccel for macOS 26 & macOS 15)

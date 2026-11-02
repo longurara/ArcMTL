@@ -83,11 +83,13 @@ struct ArcMmapRecord {
 
 struct ArcVmBindRecord {
     bool     in_use;
+    bool     dump_valid;
     int      fd;
     uint32_t vm_id;
     uint32_t gem_handle;
     uint64_t gpu_va;
     uint64_t range_size;
+    uint64_t bo_offset;
 };
 
 static pthread_mutex_t      g_arc_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -609,7 +611,19 @@ static int handle_xe_device_query(struct ArcFdSession *s, struct drm_xe_device_q
  * 4. VM_BIND Record Helpers (for DRM_XE_VM_BIND_OP_UNMAP_ALL)
  * ============================================================================ */
 
-static void record_vm_bind_locked(int fd, uint32_t vm_id, uint32_t gem_handle, uint64_t gpu_va, uint64_t range_size)
+/* Conservatively disable diagnostics for overlapping replacements/partial unmaps.
+ * Keep the cleanup records: a partial unmap need not remove the entire BO. */
+static void invalidate_bind_dump_locked(int fd, uint32_t vm_id, uint64_t va, uint64_t size)
+{
+    for (int i = 0; i < ARC_MAX_BIND_RECORDS; ++i) {
+        struct ArcVmBindRecord *b = &g_binds[i];
+        if (!b->in_use || b->fd != fd || b->vm_id != vm_id || !size) continue;
+        if (va >= b->gpu_va ? va - b->gpu_va < b->range_size : b->gpu_va - va < size)
+            b->dump_valid = false;
+    }
+}
+
+static void record_vm_bind_locked(int fd, uint32_t vm_id, uint32_t gem_handle, uint64_t gpu_va, uint64_t range_size, uint64_t bo_offset)
 {
     if (!gem_handle || !range_size) return;
     int empty = -1;
@@ -618,6 +632,8 @@ static void record_vm_bind_locked(int fd, uint32_t vm_id, uint32_t gem_handle, u
             g_binds[i].vm_id == vm_id && g_binds[i].gem_handle == gem_handle &&
             g_binds[i].gpu_va == gpu_va) {
             g_binds[i].range_size = range_size;
+            g_binds[i].bo_offset = bo_offset;
+            g_binds[i].dump_valid = true;
             return;
         }
         if (!g_binds[i].in_use && empty < 0)
@@ -630,6 +646,67 @@ static void record_vm_bind_locked(int fd, uint32_t vm_id, uint32_t gem_handle, u
         g_binds[empty].gem_handle = gem_handle;
         g_binds[empty].gpu_va     = gpu_va;
         g_binds[empty].range_size = range_size;
+        g_binds[empty].bo_offset = bo_offset;
+        g_binds[empty].dump_valid = true;
+    }
+}
+
+/* Caller holds g_arc_lock, including while copying CPU-mapped command bytes.
+ * ACTHD has no VM id in this ABI: refuse ambiguous addresses across VMs.
+ * This is only a bounded snapshot, not a command-boundary decoder. */
+static unsigned snapshot_batch_locked(int fd, uint64_t acthd, uint32_t words[48], uint64_t *start)
+{
+    const uint64_t va = acthd & 0x0000fffffffffffcULL;
+    const struct ArcVmBindRecord *b = NULL;
+    for (int i = 0; i < ARC_MAX_BIND_RECORDS; ++i) {
+        const struct ArcVmBindRecord *candidate = &g_binds[i];
+        if (!candidate->in_use || candidate->fd != fd || va < candidate->gpu_va ||
+            va - candidate->gpu_va >= candidate->range_size) continue;
+        if (b || !candidate->dump_valid) return 0;
+        b = candidate;
+    }
+    if (!b) return 0;
+    const uint64_t delta = va - b->gpu_va;
+    if (b->bo_offset > UINT64_MAX - delta) return 0;
+    const uint64_t offset = b->bo_offset + delta;
+    for (int i = 0; i < ARC_MAX_MMAPS; ++i) {
+        const struct ArcMmapRecord *m = &g_mmaps[i];
+        if (!m->in_use || m->fd != fd || m->gem_handle != b->gem_handle) continue;
+        const uint64_t map_offset = (uintptr_t)m->user_ptr - (uintptr_t)m->base_addr;
+        if (offset < map_offset || offset - map_offset >= m->mapped_len) continue;
+        const uint64_t pos = offset - map_offset;
+        uint64_t before = delta < pos ? delta : pos;
+        if (before > 64) before = 64;
+        before &= ~3ULL;
+        uint64_t after = b->range_size - delta;
+        if (after > m->mapped_len - pos) after = m->mapped_len - pos;
+        if (after > 128) after = 128;
+        if (after < 4) return 0;
+        const unsigned count = (unsigned)((before + after) / 4);
+        memcpy(words, (const char *)m->user_ptr + pos - before, count * 4);
+        *start = va - before;
+        return count;
+    }
+    return 0;
+}
+
+static void dump_timeout_batch(int fd, uint64_t acthd)
+{
+    uint32_t words[48];
+    uint64_t start = 0;
+    pthread_mutex_lock(&g_arc_lock);
+    const unsigned count = snapshot_batch_locked(fd, acthd, words, &start);
+    pthread_mutex_unlock(&g_arc_lock);
+    if (!count) {
+        fprintf(stderr, "  [ArcXe BATCH DWORDS] ACTHD has no unambiguous CPU-mapped PPGTT range\n");
+        return;
+    }
+    fprintf(stderr, "  [ArcXe BATCH DWORDS] bounded snapshot around ACTHD; command boundaries not inferred\n");
+    for (unsigned i = 0; i < count; i += 4) {
+        fprintf(stderr, "    %012llx:", (unsigned long long)(start + i * 4));
+        for (unsigned j = i; j < count && j < i + 4; ++j)
+            fprintf(stderr, " %08x", words[j]);
+        fprintf(stderr, "\n");
     }
 }
 
@@ -748,6 +825,11 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
     case DRM_IOCTL_XE_VM_DESTROY: {
         struct drm_xe_vm_destroy *vd = (struct drm_xe_vm_destroy *)arg;
         struct ArcXeVmDestroyIn in = { .vm_id = vd->vm_id };
+        pthread_mutex_lock(&g_arc_lock);
+        for (int r = 0; r < ARC_MAX_BIND_RECORDS; ++r)
+            if (g_binds[r].in_use && g_binds[r].fd == fd && g_binds[r].vm_id == vd->vm_id)
+                g_binds[r].dump_valid = false;
+        pthread_mutex_unlock(&g_arc_lock);
         IOConnectCallStructMethod(s->connect, kArcXeMethodVmDestroy, &in, sizeof(in), NULL, NULL);
         return 0;
     }
@@ -766,25 +848,31 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
 
             /* Handle DRM_XE_VM_BIND_OP_UNMAP_ALL using recorded (vm_id, gem_handle) mappings */
             if (b->op == DRM_XE_VM_BIND_OP_UNMAP_ALL) {
-                struct ArcVmBindRecord to_unmap[16];
-                int n_unmap = 0;
-                pthread_mutex_lock(&g_arc_lock);
-                for (int r = 0; r < ARC_MAX_BIND_RECORDS && n_unmap < 16; r++) {
-                    if (g_binds[r].in_use && g_binds[r].fd == fd &&
-                        g_binds[r].vm_id == vb->vm_id && g_binds[r].gem_handle == b->obj) {
-                        to_unmap[n_unmap++] = g_binds[r];
-                        g_binds[r].in_use = false;
-                    }
-                }
-                pthread_mutex_unlock(&g_arc_lock);
-
-                for (int u = 0; u < n_unmap; u++) {
+                for (int r = 0; r < ARC_MAX_BIND_RECORDS; ++r) {
+                    pthread_mutex_lock(&g_arc_lock);
+                    const struct ArcVmBindRecord entry = g_binds[r];
+                    pthread_mutex_unlock(&g_arc_lock);
+                    if (!entry.in_use || entry.fd != fd || entry.vm_id != vb->vm_id ||
+                        entry.gem_handle != b->obj) continue;
                     struct ArcXeVmBindIn uin = {0};
                     uin.vm_id      = vb->vm_id;
                     uin.op         = kArcXeVmBindOpUnmap;
-                    uin.gpu_va     = to_unmap[u].gpu_va;
-                    uin.range_size = to_unmap[u].range_size;
-                    IOConnectCallStructMethod(s->connect, kArcXeMethodVmBind, &uin, sizeof(uin), NULL, NULL);
+                    uin.gpu_va     = entry.gpu_va;
+                    uin.range_size = entry.range_size;
+                    pthread_mutex_lock(&g_arc_lock);
+                    invalidate_bind_dump_locked(fd, vb->vm_id, entry.gpu_va, entry.range_size);
+                    pthread_mutex_unlock(&g_arc_lock);
+                    if (IOConnectCallStructMethod(s->connect, kArcXeMethodVmBind,
+                                                  &uin, sizeof(uin), NULL, NULL) != KERN_SUCCESS) {
+                        errno = EIO;
+                        return -1; /* Never signal successful bind completion on failure. */
+                    }
+                    pthread_mutex_lock(&g_arc_lock);
+                    if (g_binds[r].in_use && g_binds[r].fd == entry.fd &&
+                        g_binds[r].vm_id == entry.vm_id && g_binds[r].gem_handle == entry.gem_handle &&
+                        g_binds[r].gpu_va == entry.gpu_va && g_binds[r].range_size == entry.range_size)
+                        g_binds[r].in_use = false;
+                    pthread_mutex_unlock(&g_arc_lock);
                 }
                 continue;
             }
@@ -827,6 +915,9 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
                 pthread_mutex_unlock(&g_arc_lock);
             }
 
+            pthread_mutex_lock(&g_arc_lock);
+            invalidate_bind_dump_locked(fd, vb->vm_id, b->addr, b->range);
+            pthread_mutex_unlock(&g_arc_lock);
             kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodVmBind,
                                                          &in, sizeof(in), NULL, NULL);
             if (kr != KERN_SUCCESS) {
@@ -834,11 +925,10 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
                 return -1;
             }
 
-            if (in.op == kArcXeVmBindOpMap && b->obj != 0) {
-                pthread_mutex_lock(&g_arc_lock);
-                record_vm_bind_locked(fd, vb->vm_id, b->obj, b->addr, b->range);
-                pthread_mutex_unlock(&g_arc_lock);
-            }
+            pthread_mutex_lock(&g_arc_lock);
+            if (in.op == kArcXeVmBindOpMap && b->obj != 0)
+                record_vm_bind_locked(fd, vb->vm_id, b->obj, b->addr, b->range, b->obj_offset);
+            pthread_mutex_unlock(&g_arc_lock);
         }
 
         /* Ensure out-syncs are signaled even if batch only had UNMAP_ALL / PREFETCH */
@@ -1196,6 +1286,7 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                         !!(out.progress_flags & ARCXE_PROGRESS_INVALIDATED),
                         !!(out.progress_flags & ARCXE_PROGRESS_BEFORE_BB),
                         !!(out.progress_flags & ARCXE_PROGRESS_RETURNED));
+            dump_timeout_batch(ap->fd, ((uint64_t)out.diag.acthd_hi << 32) | out.diag.acthd_lo);
         }
         errno = ETIME;
         return -ETIME;

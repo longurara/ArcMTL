@@ -292,19 +292,46 @@ void ArcXeService::applyXeLpgWorkarounds()
     (void)rd32(ARC_REG_SAMPLER_MODE);
 }
 
-void ArcXeService::invalidateGlobalTlb()
+bool ArcXeService::invalidateGlobalTlb(bool engineLockHeld)
 {
-    if (!forceWakeGet()) return;
-    /* Gen12.50+ / Xe-LPG per-domain TLB invalidation registers (Linux i915 intel_tlb.c) + legacy GTCR */
-    static const uint32_t kTlbRegs[] = { 0x00CED8u, 0x00CF04u, 0x00CEECu, ARC_REG_GTCR };
-    for (uint32_t reg : kTlbRegs)
-        wr32(reg, ARC_GTCR_INVALIDATE);
-    for (uint32_t us = 0; us < 2000; us += 10) {
-        if ((rd32(0x00CED8u) & 1u) == 0 && (rd32(ARC_REG_GTCR) & ARC_GTCR_INVALIDATE) == 0)
-            break;
-        IODelay(10);
+    /* Serialise request AND completion with engine reset and MCR steering.
+     * Scanout pinning already owns this lock; do not recursively acquire it. */
+    const bool takeLock = fEngineLock && !engineLockHeld;
+    if (takeLock) IOLockLock(fEngineLock);
+    if (!forceWakeGet()) {
+        if (takeLock) IOLockUnlock(fEngineLock);
+        return false;
     }
+    const uint32_t savedSelector = rd32(ARC_REG_MTL_MCR_SELECTOR);
+    wr32(ARC_REG_MTL_MCR_SELECTOR, ARC_MCR_MULTICAST); /* primary (0,0) read, broadcast writes */
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
+    /* i915 intel_engine_init_tlb_invalidation / intel_tlb.c: only the active
+     * physical engines. Compute queues use RCS here; standalone CCS and GuC
+     * are not running. OA invalidation is a pre-MTL platform workaround. */
+    const uint32_t regs[] = { ARC_REG_GFX_TLB_INV_CR, ARC_REG_BLT_TLB_INV_CR };
+    const bool active[] = { fRcsHwspBo != nullptr, fBcsHwspBo != nullptr };
+    for (unsigned i = 0; i < 2; ++i)
+        if (active[i]) wr32(regs[i], ARC_TLB_INVALIDATE);
+    bool ok = true;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!active[i]) continue;
+        uint32_t value = 0;
+        unsigned us = 0;
+        for (; us < 4000; us += 10) {
+            value = rd32(regs[i]);
+            if ((value & ARC_TLB_INVALIDATE) == 0) break;
+            IODelay(10);
+        }
+        if (us == 4000) {
+            AXELOG("TLB invalidate timeout reg=0x%x value=0x%x", regs[i], value);
+            ok = false;
+        }
+    }
+    wr32(ARC_REG_MTL_MCR_SELECTOR, savedSelector);
+    (void)rd32(ARC_REG_MTL_MCR_SELECTOR);
     forceWakePut();
+    if (takeLock) IOLockUnlock(fEngineLock);
+    return ok;
 }
 
 /* ============================================================================
@@ -419,7 +446,12 @@ bool ArcXeService::start(IOService *provider)
         return false;
     }
 
-    invalidateGlobalTlb();
+    if (!invalidateGlobalTlb()) {
+        teardownEngines();
+        teardownGgtt();
+        forceWakePut();
+        return false;
+    }
     forceWakePut();
 
     /* Publish discovery properties on both ArcXeService and parent IOPCIDevice */
@@ -635,7 +667,8 @@ IOReturn ArcXeService::callPlatformFunction(const OSSymbol *functionName, bool w
             /* 3. Wire IOSurface pages & bind Display scanout surface into GGTT with WT non-coherent scanout PAT */
             const bool prepOk = (md->prepare() == kIOReturnSuccess);
             uint32_t ggttOff = 0, ggttSz = 0;
-            if (!allocGgttAndBind(md, req->size, ARC_MTL_PAT_IDX_WT_NONCOH, &ggttOff, &ggttSz)) {
+            if (!allocGgttAndBind(md, req->size, ARC_MTL_PAT_IDX_WT_NONCOH, &ggttOff, &ggttSz,
+                                 /*engineLockHeld=*/true)) {
                 if (prepOk)
                     md->complete();
                 req->status = -1;

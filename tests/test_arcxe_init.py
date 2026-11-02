@@ -17,7 +17,7 @@ queue = header[start:header.index("\n};", start) + 3]
 start = source.index("void ArcXeService::armEngineHw(")
 arm = source[start:source.index("\nbool ArcXeService::resetEngineHw", start)]
 start = service.index("void ArcXeService::applyXeLpgWorkarounds(")
-workarounds = service[start:service.index("\nvoid ArcXeService::invalidateGlobalTlb", start)]
+workarounds = service[start:service.index("\nbool ArcXeService::invalidateGlobalTlb", start)]
 start = source.index("    static const struct { uint32_t instr; uint16_t numDw; } kXeHpgSvgState[]")
 init = source[start:source.index("    /* Flush all 76 KiB", start)]
 

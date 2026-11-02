@@ -114,7 +114,7 @@ static void check(uint16_t engine, uint32_t initialTail) {
         }
         pos += n*4;
     }
-    assert(markers == 3 && fences == 1);
+    assert(markers == 3 && fences == (engine == kArcXeEngineClassCopy ? 1u : 0u));
     assert(invalidates == (engine == kArcXeEngineClassCopy ? 0u : 1u));
     assert(debugWrites == invalidates);
     assert(q.submitFlushEnd > q.submitBatchEnd);
@@ -124,7 +124,7 @@ static void check(uint16_t engine, uint32_t initialTail) {
         assert(ring[off] == ARC_GFX_OP_PIPE_CONTROL(6));
         assert(ring[off+2] == q.seqnoGgttAddr);
         assert((ring[off+4] | (uint64_t(ring[off+5]) << 32)) == seq);
-        assert(length == 248);
+        assert(length == 232);
     }
 }
 int main() {

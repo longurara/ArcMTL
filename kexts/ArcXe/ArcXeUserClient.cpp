@@ -538,7 +538,7 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
         if (!ok)
             return kIOReturnVMError;
 
-        /* VM_BIND completes synchronously in CPU page tables + GTCR TLB invalidate, so signal out-syncs immediately */
+        /* Signal only after page tables and all active engines' TLB invalidations completed. */
         if (in->num_syncs > 0) {
             IOLockLock(fClientLock);
             const uint32_t n = (in->num_syncs <= ARCXE_MAX_SYNCS_PER_OP) ? in->num_syncs : ARCXE_MAX_SYNCS_PER_OP;

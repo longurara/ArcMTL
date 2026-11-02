@@ -974,12 +974,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         ringEmitDword(q, (uint32_t)(seqno & 0xFFFFFFFFULL));
         ringEmitDword(q, (uint32_t)(seqno >> 32));
 
-        /* 3d. Serialized CS GGTT QWORD store of seqno */
-        ringEmitDword(q, ARC_MI_STORE_DATA_IMM | ARC_MI_SDI_USE_GGTT | ARC_MI_SDI_QWORD_LEN);
-        ringEmitDword(q, q->seqnoGgttAddr);
-        ringEmitDword(q, 0u);
-        ringEmitDword(q, (uint32_t)(seqno & 0xFFFFFFFFULL));
-        ringEmitDword(q, (uint32_t)(seqno >> 32));
+        /* PIPE_CONTROL is the sole RCS completion writer, as in xe_ring_ops.
+         * An extra MI store must not independently signal this fence. */
     } else {
         /* Blitter engine: 4-dword MI_FLUSH_DW write-cache flush + 64-bit GGTT seqno store */
         ringEmitDword(q, ARC_MI_FLUSH_DW | ARC_MI_FLUSH_DW_OP_STOREDW | ARC_MI_FLUSH_DW_IMM_LEN);
