@@ -399,9 +399,9 @@ int main(int argc, char **argv)
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 6,
+        .commandBufferCount = 7,
     };
-    VkCommandBuffer cmds[6] = { VK_NULL_HANDLE };
+    VkCommandBuffer cmds[7] = { VK_NULL_HANDLE };
     CHECK_VK(pvkAllocateCommandBuffers(dev, &cbai, cmds));
 
     VkCommandBufferBeginInfo cbbi = {
@@ -993,18 +993,64 @@ int main(int argc, char **argv)
         };
         pvkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
 
-        VkQueryPool b4_qp = VK_NULL_HANDLE;
-        if (qfs[qfam].timestampValidBits > 0 && pvkCreateQueryPool) {
-            VkQueryPoolCreateInfo qp_ci = {
-                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                .queryCount = 6,
-            };
-            CHECK_VK(pvkCreateQueryPool(dev, &qp_ci, NULL, &b4_qp));
-        }
-
-        printf("  [B4/4] Submitting 3 consecutive 3D Draw batches (UNIFORM_BUFFER_DYNAMIC + 64-bit BDA=0x%" PRIx64 " + PushConst + Sampled OPTIMAL)...\n",
+        printf("  [B4/4] Submitting 4x4 OPTIMAL texture upload + 3 consecutive 3D Draw batches (UNIFORM_BUFFER_DYNAMIC + 64-bit BDA=0x%" PRIx64 " + PushConst + Sampled OPTIMAL)...\n",
                (uint64_t)bda_base);
+
+        /* B4.0: Upload 4x4 optimal-tiled sampled texture in its own transfer batch (matches nvmtl_vk_image_write) */
+        CHECK_VK(pvkResetFences(dev, 1, &fence));
+        CHECK_VK(pvkBeginCommandBuffer(cmds[3], &cbbi));
+        {
+            VkImageMemoryBarrier to_dst = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = tex_img,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+            };
+            pvkCmdPipelineBarrier(cmds[3],
+                                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  0, 0, NULL, 0, NULL, 1, &to_dst);
+            VkBufferImageCopy tex_bic = {
+                .bufferOffset = 256,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .imageOffset = { 0, 0, 0 },
+                .imageExtent = { 4, 4, 1 },
+            };
+            pvkCmdCopyBufferToImage(cmds[3], bda_buf, tex_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tex_bic);
+            VkImageMemoryBarrier to_sample = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = tex_img,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+            };
+            pvkCmdPipelineBarrier(cmds[3],
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                  0, 0, NULL, 0, NULL, 1, &to_sample);
+        }
+        CHECK_VK(pvkEndCommandBuffer(cmds[3]));
+        {
+            VkSubmitInfo up_si = {
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &cmds[3],
+            };
+            CHECK_VK(pvkQueueSubmit(queue, 1, &up_si, fence));
+            CHECK_VK(pvkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL));
+            printf("  [PASS B4.0] Uploaded 4x4 Optimal-Tiled Sampled BGRA8 texture on RCS0\n");
+        }
 
         for (uint32_t b = 0; b < 3; b++) {
             for (uint32_t i = 0; i < img_pixels; i++) {
@@ -1012,55 +1058,8 @@ int main(int argc, char **argv)
             }
             CHECK_VK(pvkResetFences(dev, 1, &fence));
 
-            VkCommandBuffer cmd = cmds[3 + b];
+            VkCommandBuffer cmd = cmds[4 + b];
             CHECK_VK(pvkBeginCommandBuffer(cmd, &cbbi));
-
-            if (b4_qp) {
-                pvkCmdResetQueryPool(cmd, b4_qp, b * 2u, 2u);
-                pvkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, b4_qp, b * 2u);
-            }
-
-            if (b == 0) {
-                VkImageMemoryBarrier to_dst = {
-                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask = 0,
-                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = tex_img,
-                    .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-                };
-                pvkCmdPipelineBarrier(cmd,
-                                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                      0, 0, NULL, 0, NULL, 1, &to_dst);
-                VkBufferImageCopy tex_bic = {
-                    .bufferOffset = 256,
-                    .bufferRowLength = 0,
-                    .bufferImageHeight = 0,
-                    .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                    .imageOffset = { 0, 0, 0 },
-                    .imageExtent = { 4, 4, 1 },
-                };
-                pvkCmdCopyBufferToImage(cmd, bda_buf, tex_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tex_bic);
-                VkImageMemoryBarrier to_sample = {
-                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-                    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = tex_img,
-                    .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
-                };
-                pvkCmdPipelineBarrier(cmd,
-                                      VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                      0, 0, NULL, 0, NULL, 1, &to_sample);
-            }
 
             VkClearValue b4_clear = {
                 .color = { .float32 = { 4.0f / 255.0f, 8.0f / 255.0f, 12.0f / 255.0f, 1.0f } }
@@ -1095,9 +1094,6 @@ int main(int argc, char **argv)
                                   0, 0, NULL, 0, NULL, 1, &img_bar);
             pvkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &bic);
 
-            if (b4_qp) {
-                pvkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b4_qp, b * 2u + 1u);
-            }
             CHECK_VK(pvkEndCommandBuffer(cmd));
 
             VkSubmitInfo b4_si = {
@@ -1107,13 +1103,6 @@ int main(int argc, char **argv)
             };
             CHECK_VK(pvkQueueSubmit(queue, 1, &b4_si, fence));
             CHECK_VK(pvkWaitForFences(dev, 1, &fence, VK_TRUE, 3000000000ULL));
-
-            uint64_t ts_pair[2] = { 0, 0 };
-            if (b4_qp) {
-                CHECK_VK(pvkGetQueryPoolResults(dev, b4_qp, b * 2u, 2u,
-                                                sizeof(ts_pair), ts_pair, sizeof(uint64_t),
-                                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            }
 
             uint32_t batch_bad = 0;
             for (uint32_t i = 0; i < img_pixels; i++) {
@@ -1136,12 +1125,11 @@ int main(int argc, char **argv)
             }
             b4_mismatches += batch_bad;
             if (batch_bad == 0) {
-                printf("  [PASS B4.%u] Batch #%u 3D Draw verified (%u px == 0x%08x, dyn_off=%u, gpu_ts=%" PRIu64 "..%" PRIu64 ")\n",
-                       b + 1u, b + 1u, img_pixels, words[0], dyn_off, ts_pair[0], ts_pair[1]);
+                printf("  [PASS B4.%u] Batch #%u 3D Draw verified (%u px == 0x%08x, dyn_off=%u)\n",
+                       b + 1u, b + 1u, img_pixels, words[0], dyn_off);
             }
         }
 
-        if (b4_qp) pvkDestroyQueryPool(dev, b4_qp, NULL);
         pvkDestroyDescriptorPool(dev, b4_dpool, NULL);
         pvkDestroyPipeline(dev, b4_pipe, NULL);
         pvkDestroyPipelineLayout(dev, b4_pl, NULL);

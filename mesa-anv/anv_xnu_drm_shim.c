@@ -1175,6 +1175,21 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
     if (IOConnectCallStructMethod(conn, kArcXeMethodSyncobjWait, &in, sizeof(in), &out, &out_sz) != KERN_SUCCESS)
         return -EIO;
     if (out.timed_out) {
+        if (out.diag.timed_out) {
+            fprintf(stderr,
+                    "  [ArcXe GPU TIMEOUT] completed=%llu EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x "
+                    "START=0x%08x CTL=0x%08x ACTHD=0x%08x_%08x IPEHR=0x%08x ESR=0x%08x INSTDONE=0x%08x "
+                    "DBG2=0x%08x GEOM=0x%08x SC=0x%08x SAMP=0x%08x ROW=0x%08x MI_MODE=0x%08x\n",
+                    (unsigned long long)out.diag.completed_seqno,
+                    out.diag.engine_status_hi, out.diag.engine_status,
+                    out.diag.current_lrca,
+                    out.diag.ring_head, out.diag.ring_tail,
+                    out.diag.ring_start, out.diag.ring_ctl,
+                    out.diag.acthd_hi, out.diag.acthd_lo,
+                    out.diag.ipehr, out.diag.esr, out.diag.instdone,
+                    out.dbg2, out.geom_instdone, out.sc_instdone,
+                    out.sampler_instdone, out.row_instdone, out.diag.mi_mode);
+        }
         errno = ETIME;
         return -ETIME;
     }

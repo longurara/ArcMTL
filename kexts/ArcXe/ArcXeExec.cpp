@@ -198,7 +198,7 @@ bool ArcXeService::initEngines()
         AXELOG("initEngines: failed to allocate kernel idle VM");
         return false;
     }
-    fRcsIdleQueue = createExecQueue(fKernelIdleVm, kArcXeEngineClassRender, 0, 16384);
+    fRcsIdleQueue = createExecQueue(fKernelIdleVm, kArcXeEngineClassRender, 0, 16384, true);
     if (!fRcsIdleQueue) {
         AXELOG("initEngines: failed to allocate RCS0 kernel idle LRC");
         return false;
@@ -211,7 +211,7 @@ bool ArcXeService::initEngines()
     }
 
     if (fBcsHwspBo) {
-        fBcsIdleQueue = createExecQueue(fKernelIdleVm, kArcXeEngineClassCopy, 0, 16384);
+        fBcsIdleQueue = createExecQueue(fKernelIdleVm, kArcXeEngineClassCopy, 0, 16384, true);
         if (fBcsIdleQueue) {
             fBcsIdleQueue->swCtxId         = 0u;
             fBcsIdleQueue->isIdleKernelCtx = true;
@@ -260,7 +260,8 @@ static inline void clflushRange(volatile const void *ptr, size_t bytes)
 }
 
 ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
-                                            uint16_t engineInstance, uint32_t ringSize)
+                                            uint16_t engineInstance, uint32_t ringSize,
+                                            bool isIdleKernelCtx)
 {
     if (!vm || !vm->pml4) return nullptr;
     ArcBo *hwsp = nullptr;
@@ -483,10 +484,10 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         { ARC_GFXPIPE_3D_CMD(0x0, 0x7B), 10 }, /* 3DSTATE_MESH_SHADER_DATA */
         { ARC_GFXPIPE_3D_CMD(0x0, 0x7F),  3 }, /* 3DSTATE_URB_ALLOC_MESH */
         { ARC_GFXPIPE_3D_CMD(0x0, 0x7A),  8 }, /* 3DSTATE_MESH_SHADER */
-        { ARC_GFXPIPE_3D_CMD(0x1, 0x00),  4 }, /* 3DSTATE_DRAWING_RECTANGLE */
     };
 
-    q->holdsForceWake = forceWakeGet();
+    q->isIdleKernelCtx = isIdleKernelCtx;
+    q->holdsForceWake  = forceWakeGet();
 
     uint32_t l3sqcreg5Val = 0x00200000u | ARC_L3_PWM_TIMER_INIT_7F;
     uint32_t blitCctlVal  = (ARC_MTL_MOCS_UC_INDEX << 9) | (ARC_MTL_MOCS_UC_INDEX << 1);
@@ -536,11 +537,18 @@ ArcExecQueue *ArcXeService::createExecQueue(ArcVm *vm, uint16_t engineClass,
         q->ringCpu[initDw++] = 0x0D8u; /* CS_DEBUG_MODE2(RCS0): BIT(4) CONSTANT_BUFFERAddressOffsetDisable | BIT(6) */
         q->ringCpu[initDw++] = ARC_MASKED_ENABLE(ARC_CS_DEBUG_MODE2_RCS_DEFAULT);
 
-        for (const auto &st : kXeHpgSvgState) {
-            q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
-            for (uint16_t z = 1; z < st.numDw; z++) {
-                q->ringCpu[initDw++] = 0u;
+        if (!isIdleKernelCtx) {
+            for (const auto &st : kXeHpgSvgState) {
+                q->ringCpu[initDw++] = st.instr | (uint32_t)(st.numDw - 2u);
+                for (uint16_t z = 1; z < st.numDw; z++) {
+                    q->ringCpu[initDw++] = 0u;
+                }
             }
+            /* Non-zero default 3DSTATE_DRAWING_RECTANGLE = {0, 0}..{65535, 65535} (matches Mesa ANV init_render_queue_state) */
+            q->ringCpu[initDw++] = ARC_GFXPIPE_3D_CMD(0x1, 0x00) | 2u;
+            q->ringCpu[initDw++] = 0u;
+            q->ringCpu[initDw++] = 0xFFFFFFFFu;
+            q->ringCpu[initDw++] = 0u;
         }
     } else {
         /* BCS0 context-saved BLIT_CCTL default UC MOCS (Linux xe_hw_engine.c:352-360) */
@@ -792,6 +800,10 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
             if (hwsp) {
                 (void)resetEngineHw(q->mmioBase, hwsp);
             }
+            if (prevQ->seqnoCpu) {
+                *prevQ->seqnoCpu = prevQ->lastSubmittedSeqno;
+                clflushRange(prevQ->seqnoCpu, 64);
+            }
             prevQ->isLoadedOnHw    = false;
             prevQ->hasSavedHwState = false;
             if (prevQ->ctxRegsCpu) {
@@ -800,6 +812,18 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
                 prevQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = prevQ->ringTail;
                 prevQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = prevQ->ringTail;
                 clflushRange(prevQ->ctxRegsCpu, 0x140);
+            }
+            if (idleQ) {
+                idleQ->isLoadedOnHw    = false;
+                idleQ->hasSavedHwState = false;
+                idleQ->ringTail        = idleQ->initRingTail;
+                if (idleQ->ctxRegsCpu) {
+                    idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+                        ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
+                    idleQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = 0u;
+                    idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
+                    clflushRange(idleQ->ctxRegsCpu, 0x140);
+                }
             }
             lastQ = nullptr;
         }
@@ -956,7 +980,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
 IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                       uint64_t *outCompleted, bool *outTimedOut,
                                       ArcXeWaitQueueOut *outDiag,
-                                      bool resetOnTimeout)
+                                      bool resetOnTimeout,
+                                      uint32_t *outSubunitDiag5)
 {
     if (!q || !q->seqnoCpu) return kIOReturnBadArgument;
     if (targetSeqno == 0) targetSeqno = q->lastSubmittedSeqno;
@@ -1017,6 +1042,13 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                 uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
                 readEngineDiagMmio(this, b, &snap);
                 readRcsSubunitDiag(this, b, dbg2, geomId, scId, sampId, rowId);
+                if (outSubunitDiag5) {
+                    outSubunitDiag5[0] = dbg2;
+                    outSubunitDiag5[1] = geomId;
+                    outSubunitDiag5[2] = scId;
+                    outSubunitDiag5[3] = sampId;
+                    outSubunitDiag5[4] = rowId;
+                }
                 if (resetOnTimeout) {
                     AXELOG("waitQueueSeqno TIMEOUT (q=%u target=%llu cur=%llu): "
                            "EL_STATUS=0x%08x_%08x LRCA=0x%08x HEAD=0x%x TAIL=0x%x START=0x%08x CTL=0x%08x "
@@ -1036,6 +1068,10 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                     if (hwsp) {
                         (void)resetEngineHw(b, hwsp);
                     }
+                    if (q->seqnoCpu) {
+                        *q->seqnoCpu = q->lastSubmittedSeqno;
+                        clflushRange(q->seqnoCpu, 64);
+                    }
                     q->isLoadedOnHw    = false;
                     q->hasSavedHwState = false;
                     if (q->ctxRegsCpu) {
@@ -1044,6 +1080,23 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                         q->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = q->ringTail;
                         q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
                         clflushRange(q->ctxRegsCpu, 0x140);
+                    }
+                    ArcExecQueue *idleQ  = (b == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
+                    ArcExecQueue *&lastQ = (b == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
+                    if (idleQ) {
+                        idleQ->isLoadedOnHw    = false;
+                        idleQ->hasSavedHwState = false;
+                        idleQ->ringTail        = idleQ->initRingTail;
+                        if (idleQ->ctxRegsCpu) {
+                            idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+                                ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
+                            idleQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = 0u;
+                            idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
+                            clflushRange(idleQ->ctxRegsCpu, 0x140);
+                        }
+                    }
+                    if (lastQ == q) {
+                        lastQ = nullptr;
                     }
                 }
                 forceWakePut();

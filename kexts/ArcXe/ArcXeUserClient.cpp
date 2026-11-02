@@ -849,8 +849,14 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
                 if (maxWaitNs >= 100000000ULL && pendingQ) {
                     uint64_t done = 0;
                     bool to = false;
+                    uint32_t subDiag[5] = {};
                     fOwner->waitQueueSeqno(pendingQ, pendingSeq, 0ULL, &done, &to,
-                                           nullptr, /*resetOnTimeout=*/true);
+                                           &out->diag, /*resetOnTimeout=*/true, subDiag);
+                    out->dbg2             = subDiag[0];
+                    out->geom_instdone    = subDiag[1];
+                    out->sc_instdone      = subDiag[2];
+                    out->sampler_instdone = subDiag[3];
+                    out->row_instdone     = subDiag[4];
                 }
                 out->timed_out = 1;
                 args->structureOutputSize = sizeof(*out);

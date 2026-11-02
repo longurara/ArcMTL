@@ -291,6 +291,13 @@ struct ArcXeSyncobjWaitIn {
 struct ArcXeSyncobjWaitOut {
     uint32_t first_signaled;
     uint32_t timed_out;
+    struct ArcXeWaitQueueOut diag;
+    uint32_t dbg2;
+    uint32_t geom_instdone;
+    uint32_t sc_instdone;
+    uint32_t sampler_instdone;
+    uint32_t row_instdone;
+    uint32_t pad0;
 };
 
 struct ArcXeSyncobjSignalResetIn {

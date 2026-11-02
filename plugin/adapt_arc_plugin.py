@@ -408,8 +408,9 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
 
             IOSurfaceLock(srcSurf, kIOSurfaceLockReadOnly, NULL);
             void *roBase = IOSurfaceGetBaseAddress(srcSurf);
-            int upRc = nvmtl_vk_image_write_host(&vq, &srcImg, roBase, sbpr, IOSurfaceGetAllocSize(srcSurf), &srcHostCache);
-            if (upRc != 0) upRc = nvmtl_vk_image_write(&vq, &srcImg, roBase, sbpr);
+            int upRc = nvmtl_vk_image_write(&vq, &srcImg, roBase, sbpr);
+            if (upRc != 0) upRc = nvmtl_vk_image_write_host(&vq, &srcImg, roBase, sbpr, IOSurfaceGetAllocSize(srcSurf), &srcHostCache);
+            nvmtl_vk_image_upload_barrier(&srcImg);
             if (upRc != 0) {
                 IOSurfaceUnlock(srcSurf, kIOSurfaceLockReadOnly, NULL);
                 nvmtl_vk_host_pages_drop(&srcHostCache);
@@ -421,10 +422,11 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
                 if (haveGpPipe) nvmtl_vk_pipeline_destroy(&gpPipe);
                 nvmtl_vk_image_destroy(&srcImg);
                 nvmtl_vk_buffer_destroy(&vbuf);
-                fprintf(stderr, "  [FAIL] nvmtl_vk_image_write_host(256x256 IOSurface -> VkImage) failed!\\n");
+                fprintf(stderr, "  [FAIL] nvmtl_vk_image_write(256x256 IOSurface -> VkImage) failed!\\n");
                 return 13;
             }
             IOSurfaceUnlock(srcSurf, kIOSurfaceLockReadOnly, NULL);
+            printf("  [OK] Uploaded 256x256 BGRA8 IOSurface -> Optimal VkImage on RCS0\\n");
 
             nvk_sampler samp;
             memset(&samp, 0, sizeof(samp));
@@ -530,10 +532,10 @@ int arcmtl_self_test_metallib(const char *metallib_path, int test_vk_pipelines)
             IOSurfaceLock(dstSurf, 0, NULL);
             uint8_t *dstBytes = (uint8_t *)IOSurfaceGetBaseAddress(dstSurf);
             memset(dstBytes, 0x11, (size_t)dbpr * dh);
-            int rdRc = nvmtl_vk_image_read_host(&vq, &dstImg, dstBytes, dbpr, IOSurfaceGetAllocSize(dstSurf), &dstHostCache);
+            int rdRc = nvmtl_vk_image_read(&vq, &dstImg, dstBytes, dbpr);
             if (rdRc != 0) {
-                fprintf(stderr, "  [WARN] nvmtl_vk_image_read_host returned %d, testing nvmtl_vk_image_read fallback\\n", rdRc);
-                rdRc = nvmtl_vk_image_read(&vq, &dstImg, dstBytes, dbpr);
+                fprintf(stderr, "  [WARN] nvmtl_vk_image_read returned %d, testing nvmtl_vk_image_read_host fallback\\n", rdRc);
+                rdRc = nvmtl_vk_image_read_host(&vq, &dstImg, dstBytes, dbpr, IOSurfaceGetAllocSize(dstSurf), &dstHostCache);
             }
             const size_t coords[3][2] = { { 0, 0 }, { 1280, 800 }, { 2559, 1599 } };
             int pxBad = (rdRc != 0) ? 1 : 0;
@@ -808,6 +810,51 @@ def transform_vk_c(text: str) -> str:
         1,
     )
 
+    # 7. CRITICAL XE-LPG WA_1607156449 / WA_18040903259 FIX:
+    # Do NOT emit top-of-pipe pvkCmdResetQueryPool + pvkCmdWriteTimestamp at the start of nvmtl_vk_cmd_begin
+    # on Intel 0x8086! At the start of a new VkCommandBuffer, Mesa ANV's cmd_buffer->state.current_pipeline
+    # is UINT32_MAX (unknown), whereas a preceding BLORP compute/copy batch left RCS0 hardware in GPGPU mode.
+    # Emitting CmdResetQueryPool before PIPELINE_SELECT emits back-to-back PIPE_CONTROL(WriteImmediateData)
+    # without the mandatory Wa_1607156449 / Wa_18040903259 antecedent CS_STALL PIPE_CONTROL, hanging RCS0!
+    ts_begin_anchor = "if (pvkGetCalibratedTimestampsEXT && g_timestamp_bits) {"
+    if ts_begin_anchor not in text:
+        raise RuntimeError("Failed to locate timing_pool block in nvmtl_vk_cmd_begin in nvmtl_vk.c")
+    text = text.replace(
+        ts_begin_anchor,
+        "if (nvmtl_vk_vendor() != 0x8086 && pvkGetCalibratedTimestampsEXT && g_timestamp_bits) {",
+        1,
+    )
+
+    # 8. Fast-fail GPU wait budget on Intel 0x8086 (3s slice, 3s give_up instead of 10-minute loop):
+    budget_anchor = '    const char *me = getprogname();\n    cached = (me && strcmp(me, "WindowServer") == 0) ? 5000 : 60000;'
+    if budget_anchor in text:
+        text = text.replace(
+            budget_anchor,
+            '    const char *ea = getenv("ARCMTL_FLUSH_TIMEOUT_MS");\n'
+            '    if (ea && atol(ea) > 0) { cached = atol(ea); return cached; }\n'
+            '    if (nvmtl_vk_vendor() == 0x8086) { cached = 1500; return cached; }\n'
+            '    const char *me = getprogname();\n'
+            '    cached = (me && strcmp(me, "WindowServer") == 0) ? 5000 : 60000;',
+            1,
+        )
+    give_up_anchor = "    const long give_up_ms = budget_ms * 10;"
+    if give_up_anchor in text:
+        text = text.replace(
+            give_up_anchor,
+            "    const long give_up_ms = (nvmtl_vk_vendor() == 0x8086) ? (budget_ms * 2) : (budget_ms * 10);",
+            1,
+        )
+
+    # 9. Default nvmtl_async_surface_upload to synchronous (0) on Intel Arc UMA (matching WindowServer)
+    async_up_anchor = 'on = e ? e[0] == \'1\' : !(me && !strcmp(me, "WindowServer"));'
+    if async_up_anchor in text:
+        text = text.replace(
+            async_up_anchor,
+            'const char *ea = getenv("ARCMTL_ASYNC_SURFACE_UPLOAD"); '
+            'on = ea ? ea[0] == \'1\' : (nvmtl_vk_vendor() == 0x8086 ? 0 : (e ? e[0] == \'1\' : !(me && !strcmp(me, "WindowServer"))));',
+            1,
+        )
+
     return text
 
 
@@ -907,6 +954,8 @@ def run_self_test() -> None:
         'h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;\n'
         'snprintf(dir, sizeof dir, "%snvmtl-mesa", ucd);\n'
         '    if (freev_out) *freev_out = freev;\n'
+        '    if (pvkGetCalibratedTimestampsEXT && g_timestamp_bits) {\n'
+        '    const long give_up_ms = budget_ms * 10;\n'
     )
     out_vk = transform_vk_c(transform_common(sample_vk))
     assert "return 0x8086;" in out_vk
@@ -917,6 +966,8 @@ def run_self_test() -> None:
     assert 'CFSTR("ArcAccelHeadless")' in out_vk
     assert '"%sarcmtl-mesa"' in out_vk
     assert "if (nvmtl_vk_vendor() == 0x8086) gate = 0;" in out_vk
+    assert "if (nvmtl_vk_vendor() != 0x8086 && pvkGetCalibratedTimestampsEXT && g_timestamp_bits)" in out_vk
+    assert "const long give_up_ms = (nvmtl_vk_vendor() == 0x8086) ? (budget_ms * 2) : (budget_ms * 10);" in out_vk
 
     sample_obj = (
         '__attribute__((constructor)) static void nvmtl_conf_knobs(void)\n{\n    unsetenv("NVMTL_X");\n}\n'

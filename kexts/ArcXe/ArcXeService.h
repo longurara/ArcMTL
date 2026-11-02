@@ -236,14 +236,16 @@ public:
     void armEngineHw(uint32_t base, ArcBo *hwsp);
     bool resetEngineHw(uint32_t base, ArcBo *hwsp);
     uint32_t engineMmioBase(uint16_t engineClass, uint16_t engineInstance, ArcBo **outHwsp) const;
-    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance, uint32_t ringSize);
+    ArcExecQueue *createExecQueue(ArcVm *vm, uint16_t engineClass, uint16_t engineInstance, uint32_t ringSize,
+                                  bool isIdleKernelCtx = false);
     void          destroyExecQueue(ArcExecQueue *q);
     bool          parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *prevQueue);
     IOReturn      submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_t *outSeqno);
     IOReturn      waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uint64_t timeoutNs,
                                  uint64_t *outCompleted, bool *outTimedOut,
                                  ArcXeWaitQueueOut *outDiag = nullptr,
-                                 bool resetOnTimeout = true);
+                                 bool resetOnTimeout = true,
+                                 uint32_t *outSubunitDiag5 = nullptr);
     bool          tryLoadGucFirmwareFromDisk(const char *fwPath);
     static void   gucLoaderThreadEntry(void *arg, wait_result_t);
 
