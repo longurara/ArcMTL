@@ -27,6 +27,11 @@ jobs:
           xcodebuild -version
           xcrun --show-sdk-path
 
+      - name: Validate installer logging and acceleration safety guard
+        run: |
+          bash -n package/install_opencore_userspace.sh
+          python3 tests/test_installer_logging.py
+
       - name: Build Kernel Extensions (ArcXe, ArcFB + ArcAccel for macOS 26 & macOS 15)
         run: |
           chmod +x kexts/*/build.sh build/*.sh scripts/*.sh package/*.sh

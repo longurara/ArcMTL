@@ -956,12 +956,13 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         /*
          * Hardware Execlist Lite Restore (Linux xe_execlist.c:99-110):
          * Same context is already active on CURRENT_LRCA. Keep q->swCtxId unchanged, flush ring +
-         * context header, update RING_TAIL, and reload ELSP so CS advances RING_TAIL in-place
+         * context header, and reload ELSP so CS takes RING_TAIL from the LRC image
          * without any 52 KiB 3D Context Save/Restore.
          */
         clflushRange(q->ringCpu, q->ringSize);
         clflushRange(q->ctxRegsCpu, 0x140);
-        wr32(ARC_RING_TAIL(q->mmioBase), q->ringTail);
+        /* Publish the new tail only through EL_CTRL_LOAD, as xe_execlist does.
+         * A direct MMIO tail write can start execution before that reload. */
 
         const uint64_t lrcDesc = (uint64_t)(q->pphwspGgttAddr & ~0xFFFu)
                                | ARC_LRC_DESC_VALID

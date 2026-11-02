@@ -25,11 +25,115 @@ die() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODE="${1:-}"
+if [ "$(uname -s)" != "Darwin" ]; then
+    die "Must be run inside macOS."
+fi
+if [ "$(id -u)" -ne 0 ]; then
+    die "Run with sudo: sudo bash $0 $MODE"
+fi
+
+# Start logging before extraction so packaging/startup failures are captured too.
+# Use a private temporary file; do not follow a pre-existing /var/tmp symlink as root.
+RAW_LOG="$(mktemp /var/tmp/arcmtl_install.XXXXXX)"
+ESP_LOG_DIR=""
+find_log_esp() {
+    local candidate
+    for candidate in "$SCRIPT_DIR/.." /Volumes/OPENCORE /Volumes/EFI /Volumes/ESP; do
+        if [ -d "$candidate/EFI/OC" ] && [ -w "$candidate" ]; then
+            ESP_LOG_DIR="$(cd "$candidate" && pwd)"
+            return 0
+        fi
+    done
+    return 1
+}
+if ! find_log_esp; then
+    diskutil mount OPENCORE >/dev/null 2>&1 || true
+    find_log_esp || true
+fi
+exec 3>&1 4>&2
+# Only tee to the local disk: a missing/full ESP must not break the installer pipe.
+exec > >(tee "$RAW_LOG") 2>&1
+LOG_PID=$!
 TMP_EXTRACT=""
 cleanup() {
+    local status=$?
+    trap - EXIT
+    set +e
+    echo ""
+    echo "--- ArcMTL kernel log (last 5 minutes, last 60 lines) ---"
+    /usr/bin/log show --last 5m --style compact --predicate \
+        'eventMessage CONTAINS "ArcXe" OR eventMessage CONTAINS "ArcFB" OR eventMessage CONTAINS "ArcAccel" OR eventMessage CONTAINS "ArcMTL"' \
+        2>&1 | tail -n 60
     [ -z "$TMP_EXTRACT" ] || rm -rf "$TMP_EXTRACT"
+    echo "[diag] Installer exit status: $status"
+    # Close both writers and drain tee before exporting; otherwise the RTF can
+    # miss the final failure message or kernel diagnostics.
+    exec 1>&3 2>&4 3>&- 4>&-
+    wait "$LOG_PID" || echo "[WARN] Log capture was incomplete."
+    if mv -f "$RAW_LOG" /var/tmp/arcmtl_install.log; then
+        RAW_LOG=/var/tmp/arcmtl_install.log
+    fi
+    echo "[*] Installer log: $RAW_LOG"
+    if [ -n "$ESP_LOG_DIR" ] && [ -d "$ESP_LOG_DIR/EFI/OC" ]; then
+        if cp -f "$RAW_LOG" "$ESP_LOG_DIR/arcmtl_debug.log"; then
+            echo "[*] Plain-text log: $ESP_LOG_DIR/arcmtl_debug.log"
+        else
+            echo "[WARN] Could not save the log to ESP; use $RAW_LOG."
+        fi
+        if python3 - "$RAW_LOG" "$ESP_LOG_DIR/log.rtf" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+source, target = map(Path, sys.argv[1:])
+text = source.read_text(encoding="utf-8", errors="replace")
+parts = [r"{\rtf1\ansi\ansicpg1252\deff0{\fonttbl{\f0 Menlo;}}\f0\fs18\uc1 "]
+for char in text:
+    if char in "\\{}":
+        parts.append("\\" + char)
+    elif char == "\n":
+        parts.append("\\par\n")
+    elif char == "\t":
+        parts.append(r"\tab ")
+    elif char == "\r":
+        continue
+    elif 32 <= ord(char) < 127:
+        parts.append(char)
+    else:
+        # RTF uses signed UTF-16 code units, including surrogate pairs.
+        encoded = char.encode("utf-16-le")
+        for offset in range(0, len(encoded), 2):
+            unit = int.from_bytes(encoded[offset:offset + 2], "little", signed=True)
+            parts.append("\\u%d?" % unit)
+parts.append("}")
+fd, temporary = tempfile.mkstemp(prefix=".arcmtl-log-", dir=target.parent)
+try:
+    with os.fdopen(fd, "w", encoding="ascii", newline="\n") as output:
+        output.write("".join(parts))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, target)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+        then
+            echo "[*] RTF log: $ESP_LOG_DIR/log.rtf"
+        else
+            echo "[WARN] RTF export failed; the plain-text log is available at $RAW_LOG."
+        fi
+        sync
+    else
+        echo "[WARN] No writable OpenCore ESP found; log saved locally at $RAW_LOG."
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+echo "[*] ArcMTL run started: $(date '+%Y-%m-%d %H:%M:%S %z') (mode: ${MODE:-userspace})"
 
 if [ -d "$SCRIPT_DIR/out" ]; then
     OUT="$SCRIPT_DIR/out"
@@ -51,15 +155,6 @@ elif [ -f "$SCRIPT_DIR/ArcMTL-macos26-15-x86_64.tar.gz" ]; then
     fi
 else
     die "Cannot locate out/ directory or ArcMTL-macos26-15-x86_64.tar.gz next to script."
-fi
-
-MODE="${1:-}"
-
-if [ "$(uname -s)" != "Darwin" ]; then
-    die "Must be run inside macOS."
-fi
-if [ "$(id -u)" -ne 0 ]; then
-    die "Run with sudo: sudo bash $0 $MODE"
 fi
 
 OS_VER="$(sw_vers -productVersion)"
@@ -174,7 +269,8 @@ if [ -x /usr/local/bin/arc_probe ]; then
 fi
 if [ -x /usr/local/bin/vk_offscreen_test ]; then
     echo "--- [Test B1] vk_offscreen_test (Mesa 26.2.6 ANV Vulkan 1.3 Offscreen GPU Test) ---"
-    if VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
+    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp" \
+        VK_ICD_FILENAMES=/Library/GPUBundles/arcmtl/intel_icd.json /usr/local/bin/vk_offscreen_test; then
         VK_OK=1
         echo "[OK] Mesa ANV Vulkan 1.3 offscreen GPU verification PASSED!"
     else
@@ -184,7 +280,8 @@ if [ -x /usr/local/bin/vk_offscreen_test ]; then
 fi
 if [ -x /usr/local/bin/mtl_offscreen_test ]; then
     echo "--- [Test B2] mtl_offscreen_test --verify-bundle (CoreDisplay default.metallib + Live 2560x1600 3D GPUPass & Submit-Ahead) ---"
-    if /usr/local/bin/mtl_offscreen_test --verify-bundle "$GB/ArcMTLDriver.bundle" --with-vk; then
+    if INTEL_DEBUG="${INTEL_DEBUG:+$INTEL_DEBUG,}blorp" \
+        /usr/local/bin/mtl_offscreen_test --verify-bundle "$GB/ArcMTLDriver.bundle" --with-vk; then
         BUNDLE_OK=1
     else
         echo "[WARN] ArcMTLDriver.bundle CoreDisplay / 2560x1600 3D verification returned non-zero"
@@ -456,13 +553,11 @@ print(f"[OK] Updated OpenCore config.plist [{effective_desc}]: arc_flags='{arc_f
 PY
 }
 
-FORCE_ARG="${2:-}"
-
 if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
     update_oc_config "safe-stage1"
 elif [ "$MODE" = "--enable-dual-metal" ]; then
     install_auxkc_arcfb_arcaccel
-    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; then
         update_oc_config "dual-metal"
     else
         echo ""
@@ -472,7 +567,7 @@ elif [ "$MODE" = "--enable-dual-metal" ]; then
     fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
     install_auxkc_arcfb_arcaccel
-    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; then
         update_oc_config "arc-desktop"
     else
         echo ""
@@ -488,7 +583,7 @@ echo " ArcMTL Setup COMPLETE!"
 if [ "$MODE" = "--disable-arc-accel" ] || [ "$MODE" = "--safe-stage1" ]; then
     echo " -> Reset OpenCore boot-args to safe Stage 1 (ArcXe only)."
 elif [ "$MODE" = "--enable-dual-metal" ]; then
-    if { [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; } || [ "$FORCE_ARG" = "--force" ]; then
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; then
         echo " -> Stage 1 (ArcXe BCS0+RCS0), Stage 2 (Mesa ANV Vulkan 1.3) & CoreDisplay SPIR-V/VkPipeline PASSED!"
         echo " -> Next: Run 'sudo reboot' to activate Dual-GPU Metal 3 (Intel Arc Display+Metal 3 + RTX 4070 Metal 3)!"
         echo " -> After reboot, verify both GPUs in Metal 3 via: /usr/local/bin/mtl_offscreen_test"
@@ -496,7 +591,11 @@ elif [ "$MODE" = "--enable-dual-metal" ]; then
         echo " -> SAFETY GUARD kept ArcAccel off so your desktop stays clean. Share the output above to debug!"
     fi
 elif [ "$MODE" = "--enable-arc-desktop" ]; then
-    echo " -> Next: Run 'sudo reboot' to boot full Intel Arc Metal 3 Desktop (ArcFB + ArcAccel)!"
+    if [ "$PROBE_OK" = "1" ] && [ "$VK_OK" = "1" ] && [ "$BUNDLE_OK" = "1" ]; then
+        echo " -> Next: Run 'sudo reboot' to boot full Intel Arc Metal 3 Desktop (ArcFB + ArcAccel)!"
+    else
+        echo " -> SAFETY GUARD kept ArcFB/ArcAccel off; see the saved installer log."
+    fi
 else
     echo " -> To activate Dual-GPU Metal 3 (Intel Arc + RTX 4070): sudo bash $0 --enable-dual-metal && sudo reboot"
     echo " -> To reset to Stage 1 safe mode anytime:               sudo bash $0 --disable-arc-accel && sudo reboot"

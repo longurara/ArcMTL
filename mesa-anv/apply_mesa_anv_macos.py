@@ -479,6 +479,52 @@ def main() -> None:
             newline="\n",
         )
 
+    # 10. The failing ArcXe path is a render copy from LINEAR into TILE4.
+    # Keep equal-sized, uncompressed color formats at their original bpb on
+    # Meteor Lake instead of redescribing a 32-bpb render target as 128-bpb.
+    # This is a bounded workaround pending on-device validation, not evidence
+    # that all 128-bpb TILE4 render targets are unsupported by the hardware.
+    blorp_blit = mesa / "src" / "intel" / "blorp" / "blorp_blit.c"
+    replace_once(
+        blorp_blit,
+        '#include "util/u_math.h"',
+        '#include "util/u_math.h"\n'
+        '#ifdef __APPLE__\n#include <stdio.h> /* ARCXE_BLORP_DIAGNOSTICS */\n#endif',
+        "ARCXE_BLORP_DIAGNOSTICS",
+    )
+    copy_scale_anchor = (
+        "   int copy_fmt_bpb = MIN2(src_fmtl->bpb * max_fmt_scale_src,\n"
+        "                           dst_fmtl->bpb * max_fmt_scale_dst);"
+    )
+    replace_once(
+        blorp_blit,
+        copy_scale_anchor,
+        "#ifdef __APPLE__\n"
+        "   /* ARCXE_MTL_LINEAR_TILE4_NATIVE_BPB: avoid format widening on\n"
+        "    * the render upload path that times out on ArcXe. Preserve the\n"
+        "    * existing compute/blitter, compressed and mixed-format paths.\n"
+        "    */\n"
+        "   if (intel_device_info_is_mtl(devinfo) &&\n"
+        "       !(batch->flags & (BLORP_BATCH_USE_COMPUTE | BLORP_BATCH_USE_BLITTER)) &&\n"
+        "       params.src.surf.tiling == ISL_TILING_LINEAR &&\n"
+        "       params.dst.surf.tiling == ISL_TILING_4 &&\n"
+        "       params.src.aux_usage == ISL_AUX_USAGE_NONE &&\n"
+        "       params.dst.aux_usage == ISL_AUX_USAGE_NONE &&\n"
+        "       !isl_surf_usage_is_depth_or_stencil(params.src.surf.usage) &&\n"
+        "       !isl_surf_usage_is_depth_or_stencil(params.dst.surf.usage) &&\n"
+        "       src_fmtl->bw == 1 && src_fmtl->bh == 1 &&\n"
+        "       dst_fmtl->bw == 1 && dst_fmtl->bh == 1 &&\n"
+        "       src_fmtl->bpb == 32 && dst_fmtl->bpb == 32) {\n"
+        "      if (INTEL_DEBUG(DEBUG_BLORP))\n"
+        "         fprintf(stderr, \"[ArcXe BLORP] LINEAR->TILE4 %ux%u: \"\n"
+        "              \"native 32-bpb render copy (scale %d/%d -> 1/1)\\n\",\n"
+        "              src_width, src_height, max_fmt_scale_src, max_fmt_scale_dst);\n"
+        "      max_fmt_scale_src = max_fmt_scale_dst = 1;\n"
+        "   }\n"
+        "#endif\n" + copy_scale_anchor,
+        "ARCXE_MTL_LINEAR_TILE4_NATIVE_BPB",
+    )
+
     print("Mesa 26.2 ANV Darwin/XNU patch applied successfully.")
 
 
