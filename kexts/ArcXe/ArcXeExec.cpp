@@ -1117,7 +1117,8 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
 
 /* Called under fEngineLock and forcewake, before resetting the engine. */
 static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
-                                 const ArcXeWaitQueueOut &snap, ArcXeTimeoutDetail *d)
+                                 const ArcXeWaitQueueOut &snap, ArcXeTimeoutDetail *d,
+                                 const ArcExecQueue *idle = nullptr)
 {
     if (!d) return;
     bzero(d, sizeof(*d));
@@ -1148,11 +1149,19 @@ static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
     }
     svc->wr32(ARC_REG_MTL_MCR_SELECTOR, selector);
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
-    if (q->ringCpu && q->ringSize >= 64u) {
-        d->ring_offset = (snap.ring_head - 32u) & (q->ringSize - 1u) & ~3u;
+    /* HEAD describes the active LRCA, which may still be the parking context.
+     * Never index the waiting user's ring with an unrelated hardware HEAD. */
+    const uint32_t lrca = snap.current_lrca & ~0xfffu;
+    const ArcExecQueue *active = nullptr;
+    if (lrca == q->pphwspGgttAddr && snap.ring_start == q->ringGgttAddr)
+        active = q;
+    else if (idle && lrca == idle->pphwspGgttAddr && snap.ring_start == idle->ringGgttAddr)
+        active = idle;
+    if (active && active->ringCpu && active->ringSize >= 64u) {
+        d->ring_offset = (snap.ring_head - 32u) & (active->ringSize - 1u) & ~3u;
         d->ring_count = 16;
         for (uint32_t i = 0; i < d->ring_count; ++i)
-            d->ring_dw[i] = q->ringCpu[((d->ring_offset + i * 4u) & (q->ringSize - 1u)) / 4u];
+            d->ring_dw[i] = active->ringCpu[((d->ring_offset + i * 4u) & (active->ringSize - 1u)) / 4u];
     }
     if (q->ctxRegsCpu) {
         d->context_control = q->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL];
@@ -1239,7 +1248,8 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                 uint32_t dbg2 = 0, geomId = 0, scId = 0, sampId = 0, rowId = 0;
                 readEngineDiagMmio(this, b, &snap);
                 readRcsSubunitDiag(this, b, dbg2, geomId, scId, sampId, rowId);
-                captureTimeoutDetail(this, q, snap, outDetail);
+                captureTimeoutDetail(this, q, snap, outDetail,
+                                     b == ARC_RENDER_RING_BASE ? fRcsIdleQueue : fBcsIdleQueue);
                 if (outProgress) {
                     *outProgress = ARCXE_PROGRESS_VALID |
                         (q->seqnoCpu[16] == targetSeqno ? ARCXE_PROGRESS_BEGIN : 0u) |

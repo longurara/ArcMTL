@@ -36,6 +36,7 @@ jobs:
           python3 tests/test_arcxe_wait_abi.py
           python3 tests/test_arcxe_trace.py
           python3 tests/test_arcxe_null.py
+          python3 tests/test_arcxe_cache.py
           python3 tests/test_arcxe_ring.py
           python3 tests/test_arcxe_init.py
           python3 tests/test_arcxe_tlb.py

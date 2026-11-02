@@ -258,19 +258,17 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             return kIOReturnBadArgument;
 
         uint32_t flags = in->flags;
-        uint16_t pat   = (in->pat_index < ARC_MTL_PAT_NUM_ENTRIES)
-                       ? in->pat_index : ARC_MTL_PAT_IDX_WB_2WAY_COH;
-        /*
-         * XNU UMA Coherency Rule:
-         * Non-scanout GEM BOs use kIOMemoryKernelUserShared and are mapped into owningTask via
-         * IOConnectMapMemory64(..., kIOMapAnywhere) with CPU Write-Back (WB) caching. On Meteor Lake
-         * Xe-LPG (has_llc = false), binding non-scanout BOs with PAT[0..2] (COH_NONE) causes GPU reads
-         * (batch buffers, state pools, shaders) and GPU writes (BLORP clears, render targets, UAVs)
-         * to bypass CPU IA WB caches. Promote all non-scanout user BOs to PAT[4] (2-Way Coherent WB).
-         */
-        if ((flags & ARCXE_GEM_FLAG_SCANOUT) == 0) {
-            flags = (flags & ~ARCXE_GEM_FLAG_CPU_WC) | ARCXE_GEM_FLAG_CPU_WB_COHERENT;
-            pat   = ARC_MTL_PAT_IDX_WB_2WAY_COH;
+        uint16_t pat = in->pat_index;
+        if (pat >= ARC_MTL_PAT_NUM_ENTRIES ||
+            ((flags & ARCXE_GEM_FLAG_CPU_WC) && (flags & ARCXE_GEM_FLAG_CPU_WB_COHERENT)))
+            return kIOReturnBadArgument;
+        /* clientMemoryForType maps WC BOs with kIOMapWriteCombineCache.
+         * Preserve that request, including non-scanout render/storage BOs.
+         * Default WB mappings need at least one-way coherency; retain PAT3/4. */
+        if (!(flags & ARCXE_GEM_FLAG_CPU_WC)) {
+            flags |= ARCXE_GEM_FLAG_CPU_WB_COHERENT;
+            if (pat < ARC_MTL_PAT_IDX_WB_1WAY_COH)
+                pat = ARC_MTL_PAT_IDX_WB_2WAY_COH;
         }
         ArcBo *bo = fOwner->createKernelBo(in->size, flags, pat, false);
         if (!bo)
@@ -487,8 +485,11 @@ IOReturn ArcXeUserClient::externalMethod(uint32_t selector, IOExternalMethodArgu
             bo = tempUserBo;
         }
 
-        /* Promote all non-scanout PPGTT binds to PAT[4] (2-Way Coherent WB) to match XNU CPU WB mappings */
-        if (!bo || (bo->flags & ARCXE_GEM_FLAG_SCANOUT) == 0) {
+        /* Only a real CPU WB mapping requires promotion. WC mappings retain
+         * Mesa's PAT choice; NULL has no CPU backing and must retain PAT0 so
+         * vmBindBo can use the shared NULL page table. */
+        if (bo && !(bo->flags & ARCXE_GEM_FLAG_CPU_WC) &&
+            pat < ARC_MTL_PAT_IDX_WB_1WAY_COH) {
             pat = ARC_MTL_PAT_IDX_WB_2WAY_COH;
         }
 

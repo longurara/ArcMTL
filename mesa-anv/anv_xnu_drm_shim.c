@@ -898,17 +898,18 @@ int arc_xnu_ioctl(int fd, unsigned long request, void *arg)
         struct ArcXeGemCreateIn in = {0};
         struct ArcXeGemCreateOut out = {0};
         in.size = gc->size;
-        if (gc->flags & DRM_XE_GEM_CREATE_FLAG_SCANOUT) {
-            in.flags     = ARCXE_GEM_FLAG_CPU_WC | ARCXE_GEM_FLAG_SCANOUT;
+        if (gc->cpu_caching == DRM_XE_GEM_CPU_CACHING_WC) {
+            in.flags     = ARCXE_GEM_FLAG_CPU_WC;
             in.pat_index = ARC_MTL_PAT_IDX_WT_NONCOH;
-        } else {
-            /*
-             * XNU UMA Coherency: user-mappable GEM BOs are mapped via IOConnectMapMemory64
-             * with CPU WB caching, so always pair non-scanout BOs with PAT[4] (2-Way Coherent WB).
-             */
+        } else if (gc->cpu_caching == DRM_XE_GEM_CPU_CACHING_WB) {
             in.flags     = ARCXE_GEM_FLAG_CPU_WB_COHERENT;
-            in.pat_index = ARC_MTL_PAT_IDX_WB_2WAY_COH;
+            in.pat_index = ARC_MTL_PAT_IDX_WB_1WAY_COH;
+        } else {
+            errno = EINVAL;
+            return -1;
         }
+        if (gc->flags & DRM_XE_GEM_CREATE_FLAG_SCANOUT)
+            in.flags |= ARCXE_GEM_FLAG_SCANOUT;
 
         size_t out_sz = sizeof(out);
         kern_return_t kr = IOConnectCallStructMethod(s->connect, kArcXeMethodGemCreate,
@@ -1453,8 +1454,8 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                 fprintf(stderr, "  [ArcXe CONTEXT] idle_parks=%u control=0x%08x head=0x%x tail=0x%x\n",
                         d->idle_park_count, d->context_control, d->context_head, d->context_tail);
                 const uint32_t count = d->ring_count <= 16u ? d->ring_count : 16u;
-                fprintf(stderr, "  [ArcXe RING DWORDS] start=0x%x count=%u (wraps at ring end)\n",
-                        d->ring_offset, count);
+                fprintf(stderr, "  [ArcXe RING DWORDS] active LRCA=0x%08x ring=0x%08x start=0x%x count=%u (wraps at ring end)\n",
+                        out.diag.current_lrca, out.diag.ring_start, d->ring_offset, count);
                 for (uint32_t i = 0; i < count; ++i) {
                     if (!(i & 3u)) fprintf(stderr, "    +%02x:", i * 4u);
                     fprintf(stderr, " %08x", d->ring_dw[i]);

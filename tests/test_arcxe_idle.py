@@ -225,6 +225,8 @@ int main() {
     f.prevContext[ARC_CTX_RING_TAIL_VAL]=0x333;
     f.prev.idleParkCount=9;
     ArcXeWaitQueueOut snap={}; snap.ring_head=0x200008;
+    f.prev.ringGgttAddr=0x60000; f.idle.ringGgttAddr=0x70000;
+    snap.current_lrca=f.prev.pphwspGgttAddr | 1u; snap.ring_start=f.prev.ringGgttAddr;
     ArcXeTimeoutDetail d={};
     captureTimeoutDetail(&f.svc,&f.prev,snap,nullptr);
     assert(!f.svc.faultReads);
@@ -236,6 +238,16 @@ int main() {
     assert(d.context_control==0x111 && d.context_head==0x222 && d.context_tail==0x333 && d.idle_park_count==9);
     assert(d.hw.version==1 && d.hw.l3_alloc==0x200 && d.hw.l3_sqcreg5==0xe0007f);
     for (unsigned i=0; i<5; ++i) assert(d.hw.pat[i]==i+10);
+    // A timeout during a context switch must dump the active idle ring.
+    for (unsigned i=0; i<64; ++i) f.ring[i]=0x1000+i;
+    snap.current_lrca=f.idle.pphwspGgttAddr | 1u; snap.ring_start=f.idle.ringGgttAddr;
+    captureTimeoutDetail(&f.svc,&f.prev,snap,&d,&f.idle);
+    assert(d.ring_count==16 && d.context_control==0x111);
+    for (unsigned i=0; i<16; ++i) assert(d.ring_dw[i]==0x1000+((58+i)%64));
+    snap.ring_start=0xdead000;
+    captureTimeoutDetail(&f.svc,&f.prev,snap,&d,&f.idle);
+    assert(!d.ring_count); // unknown/mismatched active ring: never fabricate bytes
+    snap.current_lrca=f.prev.pphwspGgttAddr; snap.ring_start=f.prev.ringGgttAddr;
     f.prev.mmioBase=ARC_BLT_RING_BASE;
     captureTimeoutDetail(&f.svc,&f.prev,snap,&d);
     assert(d.valid && !d.hw.version);

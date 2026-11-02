@@ -165,6 +165,54 @@ static bool run_engine_smoke_test(io_connect_t conn, uint32_t vm_id,
     return ok;
 }
 
+/* Verify the cache modes Mesa actually requests, using separate BOs/VMs so
+ * a failed run can be torn down without reusing its mappings. */
+static bool run_cache_smoke_test(io_connect_t conn, uint32_t flags, uint16_t pat,
+                                  const char *name)
+{
+    bool ok = false;
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t size = 0;
+    struct ArcXeGemCreateIn gi = { .size = 16384, .flags = flags, .pat_index = pat };
+    struct ArcXeGemCreateOut go = {0};
+    struct ArcXeVmCreateIn vi = {0};
+    struct ArcXeVmCreateOut vo = {0};
+    size_t z = sizeof(go);
+    if (call_struct(conn, kArcXeMethodGemCreate, &gi, sizeof(gi), &go, &z))
+        goto done;
+    if (IOConnectMapMemory64(conn, go.gem_handle, mach_task_self(),
+                            &addr, &size, kIOMapAnywhere) != KERN_SUCCESS || !addr || size < gi.size)
+        goto done;
+    memset((void *)(uintptr_t)addr, 0, (size_t)size);
+    z = sizeof(vo);
+    if (call_struct(conn, kArcXeMethodVmCreate, &vi, sizeof(vi), &vo, &z))
+        goto done;
+    struct ArcXeVmBindIn bi = { .vm_id = vo.vm_id, .op = kArcXeVmBindOpMap,
+        .gem_handle = go.gem_handle, .pat_index = pat,
+        .gpu_va = 0x100000000ULL, .range_size = go.actual_size };
+    z = 0;
+    if (call_struct(conn, kArcXeMethodVmBind, &bi, sizeof(bi), NULL, &z))
+        goto done;
+    ok = run_engine_smoke_test(conn, vo.vm_id, (uint8_t *)(uintptr_t)addr, bi.gpu_va,
+                              kArcXeEngineClassRender, name, 0x2000, 0x3000,
+                              0xCA4E1234567890ABULL, 0);
+done:
+    if (vo.vm_id) {
+        struct ArcXeVmDestroyIn dv = { .vm_id = vo.vm_id };
+        z = 0;
+        if (call_struct(conn, kArcXeMethodVmDestroy, &dv, sizeof(dv), NULL, &z)) ok = false;
+    }
+    if (addr && IOConnectUnmapMemory64(conn, go.gem_handle, mach_task_self(), addr) != KERN_SUCCESS)
+        ok = false;
+    if (go.gem_handle) {
+        struct ArcXeGemCloseIn cg = { .gem_handle = go.gem_handle };
+        z = 0;
+        if (call_struct(conn, kArcXeMethodGemClose, &cg, sizeof(cg), NULL, &z)) ok = false;
+    }
+    printf("  [%s] Mesa cache mapping %s (flags=0x%x PAT=%u)\n", ok ? "PASS" : "FAIL", name, flags, pat);
+    return ok;
+}
+
 int main(int argc, char **argv)
 {
     bool info_only = (argc > 1 && strcmp(argv[1], "--info-only") == 0);
@@ -335,14 +383,23 @@ int main(int argc, char **argv)
         printf("  [%s] NULL PPGTT zero-read/write-discard semantics\n", null_ok ? "PASS" : "FAIL");
     }
 
-    if (bcs_ok && rcs_ok && null_ok) {
+    bool cache_ok = false;
+    if (rcs_ok && null_ok) {
+        printf("\n--- Mesa CPU/GPU cache mapping tests ---\n");
+        cache_ok = run_cache_smoke_test(conn, ARCXE_GEM_FLAG_CPU_WB_COHERENT,
+                                       ARC_MTL_PAT_IDX_WB_1WAY_COH, "RCS0 WB/PAT3");
+        if (cache_ok)
+            cache_ok = run_cache_smoke_test(conn, ARCXE_GEM_FLAG_CPU_WC,
+                                           ARC_MTL_PAT_IDX_WT_NONCOH, "RCS0 WC/PAT1");
+    }
+    if (bcs_ok && rcs_ok && null_ok && cache_ok) {
         printf("\n[PASS] Stage 1 PASSED: Intel Arc Xe-LPG BCS0 & RCS0 executed 48-bit PPGTT batches & wrote coherent UMA!\n");
-    } else if (rcs_ok && null_ok) {
+    } else if (rcs_ok && null_ok && cache_ok) {
         printf("\n[PASS] Stage 1 PASSED (RCS0 OK, BCS0=%d): Intel Arc Xe-LPG RCS0 executed 48-bit PPGTT batch!\n",
                bcs_ok ? 1 : 0);
     } else {
-        fprintf(stderr, "\n[FAIL] Stage 1 FAILED (BCS0=%d, RCS0=%d, NULL=%d): GPU timeout or UMA readback mismatch!\n",
-                bcs_ok ? 1 : 0, rcs_ok ? 1 : 0, null_ok ? 1 : 0);
+        fprintf(stderr, "\n[FAIL] Stage 1 FAILED (BCS0=%d, RCS0=%d, NULL=%d, CACHE=%d): GPU timeout or UMA readback mismatch!\n",
+                bcs_ok ? 1 : 0, rcs_ok ? 1 : 0, null_ok ? 1 : 0, cache_ok ? 1 : 0);
         rc = 11;
     }
 

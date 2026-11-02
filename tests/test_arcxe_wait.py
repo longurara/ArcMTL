@@ -65,7 +65,7 @@ static void readRcsSubunitDiag(const ArcXeService *, uint32_t,
                              uint32_t &, uint32_t &, uint32_t &, uint32_t &, uint32_t &) {}
 static int capturedBeforeReset = -1;
 static void captureTimeoutDetail(const ArcXeService *, const ArcExecQueue *,
-                                 const ArcXeWaitQueueOut &, ArcXeTimeoutDetail *d) {
+                                 const ArcXeWaitQueueOut &, ArcXeTimeoutDetail *d, const ArcExecQueue *) {
     if (d) { d->valid=1; capturedBeforeReset=resets; }
 }
 '''
