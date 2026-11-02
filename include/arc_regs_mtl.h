@@ -385,6 +385,9 @@ static inline uint64_t arcEncodePpgttPde(uint64_t nextTablePhysAddr)
 #define ARC_REG_CHICKEN_RASTER_2            0x006208u /* Masked MCR (xe_gt_regs.h:130 / ANV genX_init_state.c:627) */
 #define   ARC_TBIMR_FAST_CLIP               (1u << 5)
 #define ARC_REG_FF_MODE2                    0x006604u /* Non-masked MCR (xe_gt_regs.h:147 / ANV: GS=224, TDS=4, HS=224) */
+#define ARC_REG_L3ALLOC                     0x00B134u /* MTL L3 allocation; Mesa gen125.xml */
+#define ARC_REG_SC_INSTDONE_EXTRA           0x007104u
+#define ARC_REG_SC_INSTDONE_EXTRA2          0x007108u
 #define   ARC_FF_MODE2_ANV_TIMERS           0xE004E000u
 #define ARC_REG_XEHPG_INSTDONE_GEOM_SVG     0x00666Cu /* Read-only MCR 3D Geometry/SVG INSTDONE */
 #define ARC_REG_CACHE_MODE_1                0x007004u /* Masked MCR */

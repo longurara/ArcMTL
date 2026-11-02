@@ -306,8 +306,18 @@ struct ArcXeSyncobjWaitOut {
     uint32_t progress_flags;          /* Former pad0: same ABI size/offset. Zero on older kernels. */
 };
 
-/* Optional tail of SyncobjWait output. The original 96-byte prefix is stable;
- * old callers request just that prefix, old kernels return just that prefix. */
+/* Optional tails of SyncobjWait output. Both the original 96-byte prefix and
+ * the first extended 200-byte reply remain stable. New callers request 280
+ * bytes; kernels negotiate the largest complete version that fits. */
+struct ArcXeTimeoutHwState {
+    uint32_t version;                 /* 1: primary MCR instance, before reset */
+    uint32_t cmd_cctl, gfx_mode, cs_chicken1;
+    uint32_t l3_alloc, l3_sqcreg5, sampler_mode, rcc, pss_chicken;
+    uint32_t sc_extra, sc_extra2;
+    uint32_t pat[5];
+    uint32_t mocs1, mocs9, lncf0, lncf4;
+};
+#define ARCXE_SYNCOBJ_WAIT_V1_SIZE 200u /* original extended reply */
 struct ArcXeTimeoutDetail {
     uint32_t valid;
     uint32_t fault_reg;
@@ -320,6 +330,7 @@ struct ArcXeTimeoutDetail {
     uint32_t context_head;
     uint32_t context_tail;
     uint32_t idle_park_count;
+    struct ArcXeTimeoutHwState hw;
 };
 struct ArcXeSyncobjWaitOutExtended {
     struct ArcXeSyncobjWaitOut base;

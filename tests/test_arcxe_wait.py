@@ -24,7 +24,8 @@ STUBS = r'''
 #include "arc_uapi.h"
 #include "arc_regs_mtl.h"
 static_assert(sizeof(ArcXeSyncobjWaitOut) == 96, "syncobj diagnostic ABI must stay compatible");
-static_assert(sizeof(ArcXeSyncobjWaitOutExtended) == 200, "extended ABI");
+static_assert(sizeof(ArcXeSyncobjWaitOutExtended) == 280, "extended ABI");
+static_assert(offsetof(ArcXeSyncobjWaitOutExtended, detail) + offsetof(ArcXeTimeoutDetail, hw) == 200, "v1 extended prefix");
 static_assert(offsetof(ArcXeSyncobjWaitOutExtended, detail) == 96, "legacy prefix");
 #define bzero(p, n) std::memset(p, 0, n)
 #define AXELOG(...) ((void)0)

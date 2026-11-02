@@ -1440,7 +1440,7 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                         !!(out.progress_flags & ARCXE_PROGRESS_INVALIDATED),
                         !!(out.progress_flags & ARCXE_PROGRESS_BEFORE_BB),
                         !!(out.progress_flags & ARCXE_PROGRESS_RETURNED));
-            if (out_sz >= sizeof(response) && response.detail.valid) {
+            if (out_sz >= ARCXE_SYNCOBJ_WAIT_V1_SIZE && response.detail.valid) {
                 const struct ArcXeTimeoutDetail *d = &response.detail;
                 fprintf(stderr, "  [ArcXe GPU FAULT] reg=0x%08x data0=0x%08x data1=0x%08x\n",
                         d->fault_reg, d->fault_data0, d->fault_data1);
@@ -1459,6 +1459,16 @@ static int arc_sync_timeline_wait(struct util_sync_provider *p, uint32_t *handle
                     if (!(i & 3u)) fprintf(stderr, "    +%02x:", i * 4u);
                     fprintf(stderr, " %08x", d->ring_dw[i]);
                     if ((i & 3u) == 3u || i + 1u == count) fputc('\n', stderr);
+                }
+                if (out_sz >= sizeof(response) && d->hw.version == 1) {
+                    const struct ArcXeTimeoutHwState *h = &d->hw;
+                    fprintf(stderr, "  [ArcXe HW STATE] primary instance: CMD_CCTL=%08x GFX_MODE=%08x CS_CHICKEN1=%08x L3ALLOC=%08x L3SQCREG5=%08x SAMPLER_MODE=%08x RCC=%08x PSS=%08x SC_EXTRA=%08x SC_EXTRA2=%08x\n",
+                            h->cmd_cctl, h->gfx_mode, h->cs_chicken1, h->l3_alloc,
+                            h->l3_sqcreg5, h->sampler_mode, h->rcc, h->pss_chicken,
+                            h->sc_extra, h->sc_extra2);
+                    fprintf(stderr, "  [ArcXe CACHE ATTR] PAT=%08x,%08x,%08x,%08x,%08x MOCS1=%08x MOCS9=%08x LNCF0=%08x LNCF4=%08x\n",
+                            h->pat[0], h->pat[1], h->pat[2], h->pat[3], h->pat[4],
+                            h->mocs1, h->mocs9, h->lncf0, h->lncf4);
                 }
             }
             dump_timeout_batch(ap->fd, ((uint64_t)out.diag.acthd_hi << 32) | out.diag.acthd_lo);

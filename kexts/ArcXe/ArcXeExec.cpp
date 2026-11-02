@@ -146,6 +146,10 @@ bool ArcXeService::resetEngineHw(uint32_t base, ArcBo *hwsp)
         applyXeLpgWorkarounds();
     }
     armEngineHw(base, hwsp);
+    /* A reset discards the idle image too. Rebuild it before any new user
+     * context runs, under the caller's engine lock and forcewake reference. */
+    if (resetOk && idleQ)
+        resetOk = parkEngineOnIdleContextLocked(base, nullptr);
     return resetOk;
 }
 
@@ -224,7 +228,17 @@ bool ArcXeService::initEngines()
             }
         }
     }
-    return true;
+    /* Bootstrap the parking contexts while the engines still have reset state.
+     * Their first RESTORE_INHIBIT run must not inherit a user's 3D state under
+     * the kernel idle VM. Later switches save/restore this initialized image. */
+    if (!forceWakeGet()) return false;
+    IOLockLock(fEngineLock);
+    const bool idleReady = parkEngineOnIdleContextLocked(ARC_RENDER_RING_BASE, nullptr) &&
+        (!fBcsIdleQueue || parkEngineOnIdleContextLocked(ARC_BLT_RING_BASE, nullptr));
+    IOLockUnlock(fEngineLock);
+    forceWakePut();
+    if (!idleReady) AXELOG("initEngines: kernel idle context bootstrap failed");
+    return idleReady;
 }
 
 void ArcXeService::teardownEngines()
@@ -687,12 +701,12 @@ bool ArcXeService::parkEngineOnIdleContextLocked(uint32_t base, ArcExecQueue *pr
         ringEmitDword(idleQ, ARC_MI_NOOP);
     }
 
-    /*
-     * Keep RESTORE_INHIBIT permanently enabled on the kernel idle parking context so parking
-     * CURRENT_LRCA on queue teardown never restores dummy state onto RCS0/BCS0.
-     */
-    idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
-        ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
+    /* Hardware clears RESTORE_INHIBIT when saving the initialized idle LRC.
+     * Preserve that image just as for user contexts. Forcing the bit on every
+     * park inherited the outgoing user's 3D state under a different PPGTT. */
+    if (!idleQ->hasSavedHwState)
+        idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
+            ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
     idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
     clflushRange(idleQ->ringCpu, idleQ->lrcBo->size);
 
@@ -874,18 +888,6 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
                 prevQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = prevQ->ringTail;
                 prevQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = prevQ->ringTail;
                 clflushRange(prevQ->ctxRegsCpu, 0x140);
-            }
-            if (idleQ) {
-                idleQ->isLoadedOnHw    = false;
-                idleQ->hasSavedHwState = false;
-                idleQ->ringTail        = idleQ->initRingTail;
-                if (idleQ->ctxRegsCpu) {
-                    idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
-                        ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
-                    idleQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = 0u;
-                    idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
-                    clflushRange(idleQ->ctxRegsCpu, 0x140);
-                }
             }
             lastQ = nullptr;
             if (!resetOk || q->faulted) {
@@ -1099,6 +1101,7 @@ IOReturn ArcXeService::submitBatch(ArcExecQueue *q, uint64_t batchGpuVa, uint64_
         }
         if (idleQ && idleQ->isLoadedOnHw) {
             idleQ->isLoadedOnHw = false;
+            idleQ->hasSavedHwState = true;
         }
     }
     q->isLoadedOnHw = true;
@@ -1124,6 +1127,25 @@ static void captureTimeoutDetail(const ArcXeService *svc, const ArcExecQueue *q,
     d->fault_reg = svc->rd32(ARC_REG_XEHP_RING_FAULT);
     d->fault_data0 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA0);
     d->fault_data1 = svc->rd32(ARC_REG_XEHP_FAULT_TLB_DATA1);
+    if (q->mmioBase == ARC_RENDER_RING_BASE) {
+        auto &h = d->hw;
+        h.cmd_cctl = svc->rd32(ARC_RING_CMD_CCTL(q->mmioBase));
+        h.gfx_mode = svc->rd32(ARC_RING_GFX_MODE(q->mmioBase));
+        h.cs_chicken1 = svc->rd32(ARC_REG_CS_CHICKEN1);
+        h.l3_alloc = svc->rd32(ARC_REG_L3ALLOC);
+        h.l3_sqcreg5 = svc->rd32(ARC_REG_XEHP_L3SQCREG5);
+        h.sampler_mode = svc->rd32(ARC_REG_SAMPLER_MODE);
+        h.rcc = svc->rd32(ARC_REG_COMMON_SLICE_CHICKEN3);
+        h.pss_chicken = svc->rd32(ARC_REG_XEHP_PSS_CHICKEN);
+        h.sc_extra = svc->rd32(ARC_REG_SC_INSTDONE_EXTRA);
+        h.sc_extra2 = svc->rd32(ARC_REG_SC_INSTDONE_EXTRA2);
+        for (uint32_t i = 0; i < 5; ++i) h.pat[i] = svc->rd32(ARC_REG_PAT_INDEX(i));
+        h.mocs1 = svc->rd32(ARC_REG_GLOBAL_MOCS(1));
+        h.mocs9 = svc->rd32(ARC_REG_GLOBAL_MOCS(9));
+        h.lncf0 = svc->rd32(ARC_REG_LNCFCMOCS(0));
+        h.lncf4 = svc->rd32(ARC_REG_LNCFCMOCS(4));
+        h.version = 1;
+    }
     svc->wr32(ARC_REG_MTL_MCR_SELECTOR, selector);
     (void)svc->rd32(ARC_REG_MTL_MCR_SELECTOR);
     if (q->ringCpu && q->ringSize >= 64u) {
@@ -1274,20 +1296,7 @@ IOReturn ArcXeService::waitQueueSeqno(ArcExecQueue *q, uint64_t targetSeqno, uin
                         q->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = q->ringTail;
                         clflushRange(q->ctxRegsCpu, 0x140);
                     }
-                    ArcExecQueue *idleQ  = (b == ARC_BLT_RING_BASE) ? fBcsIdleQueue : fRcsIdleQueue;
                     ArcExecQueue *&lastQ = (b == ARC_BLT_RING_BASE) ? fLastBcsQueue : fLastRcsQueue;
-                    if (idleQ) {
-                        idleQ->isLoadedOnHw    = false;
-                        idleQ->hasSavedHwState = false;
-                        idleQ->ringTail        = idleQ->initRingTail;
-                        if (idleQ->ctxRegsCpu) {
-                            idleQ->ctxRegsCpu[ARC_CTX_CONTEXT_CONTROL_VAL] =
-                                ARC_MASKED_ENABLE(ARC_CTX_CTRL_INHIBIT_SYN_SWITCH | ARC_CTX_CTRL_RESTORE_INHIBIT);
-                            idleQ->ctxRegsCpu[ARC_CTX_RING_HEAD_VAL] = 0u;
-                            idleQ->ctxRegsCpu[ARC_CTX_RING_TAIL_VAL] = idleQ->ringTail;
-                            clflushRange(idleQ->ctxRegsCpu, 0x140);
-                        }
-                    }
                     if (lastQ == q) {
                         lastQ = nullptr;
                     }
